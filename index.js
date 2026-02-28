@@ -20,7 +20,6 @@ const DB_CONFIG = {
   database : 'u966260443_facedetect'
 };
 
-
 const db = mysql.createConnection(DB_CONFIG);
 
 db.connect(err => {
@@ -417,12 +416,12 @@ td{padding:11px 16px;font-size:0.83rem;vertical-align:middle}
           <div class="r-cell"><div class="rv" id="rTimeOut">—</div><div class="rk" id="rTimeOutLabel">Time Out</div></div>
           <div class="r-cell">
             <div class="rv" id="rRegAcc">—</div>
-            <div class="rk" title="Consistency of face samples at registration time (same scale as Live Match)">Reg. Quality</div>
+            <div class="rk">Reg. Quality</div>
             <div class="conf-bar"><div class="conf-bar-fill" id="rRegAccBar" style="width:0%"></div></div>
           </div>
           <div class="r-cell">
             <div class="rv" id="rConf">—</div>
-            <div class="rk" title="How closely your current face matches the stored descriptor">Live Match</div>
+            <div class="rk">Live Match</div>
             <div class="conf-bar"><div class="conf-bar-fill" id="rConfBar" style="width:0%"></div></div>
           </div>
         </div>
@@ -554,13 +553,8 @@ async function capture(){
       ctx.fillStyle=col;ctx.font='bold 13px Space Grotesk,sans-serif';
       const confTxt = data.confidence!=null?' ('+data.confidence+'%)':'';
       ctx.fillText((data.status==='late'?'⏰ ':(data.status==='absent'?'❌ ':'✓ '))+data.name+confTxt,x*sx+4,y*sy-8);
-      let stMsg = (data.status==='late'?'⏰ Late':(data.status==='absent'?'❌ Absent':'✅ Present'))+': '+data.name+' at '+data.time_in;
-      if(data.confidence!=null){
-        stMsg+=' | Match: '+data.confidence+'%';
-        if(data.registered_accuracy!=null && data.confidence < data.registered_accuracy-15)
-          stMsg+=' ⚠ (improve lighting/angle)';
-      }
-      if(data.status==='late'&&data.expected_checkout) stMsg+=' | Out by: '+data.expected_checkout;
+      let stMsg = (data.status==='late'?'⏰ Late':(data.status==='absent'?'❌ Absent':'✅ Present'))+': '+data.name+' at '+data.time_in+(data.confidence!=null?' | Accuracy: '+data.confidence+'%':'');
+      if(data.status==='late'&&data.expected_checkout) stMsg+=' | Expected out: '+data.expected_checkout;
       setSt(stMsg, data.status==='absent'?'bad':(data.status==='late'?'pulse':'ok'));
       showResult({...data,mode:'checkin'});
       loadStats();loadTable();
@@ -1023,20 +1017,6 @@ function avgDesc(descs){
   return Array.from(avg);
 }
 
-// Euclidean distance between two float arrays (client-side)
-function euclidDist(a,b){
-  let s=0;for(let i=0;i<a.length;i++)s+=(a[i]-b[i])**2;return Math.sqrt(s);
-}
-
-// Registration quality: average match of each sample against the averaged descriptor.
-// Uses the SAME formula as server-side live match so both % values are directly comparable.
-function calcRegQuality(descs, avgD){
-  const THRESH=0.6;
-  const dists=descs.map(d=>euclidDist(Array.from(d),avgD));
-  const avgDist=dists.reduce((a,b)=>a+b,0)/dists.length;
-  return Math.round(Math.max(0,Math.min(100,(1-avgDist/THRESH)*100)));
-}
-
 async function registerFace(){
   const name=document.getElementById('inp_name').value.trim();
   const empid=document.getElementById('inp_empid').value.trim();
@@ -1047,55 +1027,51 @@ async function registerFace(){
   btn.disabled=true;btn.textContent='⏳ Capturing...';
   setSt('Capturing samples — hold still...','purple');
   const descs=[];
-
-  // Phase 1: collect all samples
+  const detScores=[];  // face detection confidence scores per sample
   for(let i=0;i<REG_SAMPLES;i++){
     pL.textContent='Sample '+(i+1)+'/'+REG_SAMPLES+' — hold still...';
-    pB.style.width=(i/REG_SAMPLES*90)+'%';
+    pB.style.width=(i/REG_SAMPLES*100)+'%';
     await new Promise(r=>setTimeout(r,400));
     let det=await detectFace();
     if(!det){await new Promise(r=>setTimeout(r,500));det=await detectFace();}
     if(det){
       descs.push(det.descriptor);
+      const score = det.detection.score || 0;
+      detScores.push(score);
       const{x,y,width,height}=det.detection.box;
       const sx=overlay.width/video.videoWidth,sy=overlay.height/video.videoHeight;
       ctx.clearRect(0,0,overlay.width,overlay.height);
       ctx.strokeStyle='#a78bfa';ctx.lineWidth=2;
       ctx.strokeRect(x*sx,y*sy,width*sx,height*sy);
-      ctx.fillStyle='#a78bfa';ctx.font='bold 12px Space Grotesk,monospace';
-      ctx.fillText('Sample '+(i+1)+' captured',x*sx+4,y*sy-8);
-      pL.textContent='Sample '+(i+1)+'/'+REG_SAMPLES+' — captured ✓';
+      // Show per-sample score on canvas
+      const pct=Math.round(score*100);
+      const col=pct>=85?'#34d399':pct>=65?'#fbbf24':'#fb923c';
+      ctx.fillStyle=col;ctx.font='bold 12px Space Grotesk,monospace';
+      ctx.fillText('Sample '+(i+1)+': '+pct+'%',x*sx+4,y*sy-8);
+      pL.textContent='Sample '+(i+1)+'/'+REG_SAMPLES+' — detected at '+pct+'%';
     } else {
-      pL.textContent='Sample '+(i+1)+'/'+REG_SAMPLES+' — not detected, skipping';
+      pL.textContent='Sample '+(i+1)+'/'+REG_SAMPLES+' — face not detected, skipping';
     }
   }
-
-  pB.style.width='95%';
+  pB.style.width='100%';
   if(!descs.length){
     toast('No face captured — try again','e');pL.textContent='No face detected — move closer and retry';
     setSt('No face detected','bad');btn.disabled=false;btn.textContent='📸 Capture & Register Face';pB.style.width='0';return;
   }
+  // Registration accuracy = average of detection confidence scores
+  const avgScore = detScores.reduce((a,b)=>a+b,0)/detScores.length;
+  const registration_accuracy = Math.round(avgScore*100);
 
-  // Phase 2: compute average descriptor
-  const averaged = avgDesc(descs);
-
-  // Phase 3: compute registration quality using SAME euclidean formula as live check-in
-  // Each sample is compared against the averaged descriptor — same as how check-in compares live face
-  const registration_accuracy = calcRegQuality(descs, averaged);
-  const qualColor = registration_accuracy>=85?'#34d399':registration_accuracy>=65?'#fbbf24':'#fb923c';
-
-  pB.style.width='100%';
   pL.textContent='Got '+descs.length+'/'+REG_SAMPLES+' samples | Reg. Quality: '+registration_accuracy+'% — saving...';
-  setSt('Reg. Quality: '+registration_accuracy+'% — saving...','purple');
-
   const res=await fetch('/api/register',{
     method:'POST',headers:{'Content-Type':'application/json'},
-    body:JSON.stringify({label:name,employee_id:empid,department:dept,descriptor:averaged,registration_accuracy})
+    body:JSON.stringify({label:name,employee_id:empid,department:dept,descriptor:avgDesc(descs),registration_accuracy})
   });
   const data=await res.json();
   ctx.clearRect(0,0,overlay.width,overlay.height);
   if(res.ok){
-    toast('✅ "'+name+'" registered! Reg. Quality: '+registration_accuracy+'%','s');
+    const accColor=registration_accuracy>=85?'#34d399':registration_accuracy>=65?'#fbbf24':'#fb923c';
+    toast('✅ "'+name+'" registered! Quality: '+registration_accuracy+'%','s');
     pL.textContent='✅ Registered: '+name+' | Quality: '+registration_accuracy+'%';
     setSt('✅ Registered: '+name+' | Reg. Quality: '+registration_accuracy+'%','ok');
     document.getElementById('inp_name').value='';
