@@ -20,9 +20,9 @@ app.use('/faceapi.js', (req, res) => res.sendFile(path.join(__dirname, 'public',
 const DB_CONFIG = {
   host     : 'localhost',
   port     : 3306,
-  user     : 'root',
-  password : '',
-  database : 'face_recognition'
+  user     : 'u966260443_facedetect',
+  password : 'Makelabs@123',
+  database : 'u966260443_facedetect'
 };
 
 const db = mysql.createConnection(DB_CONFIG);
