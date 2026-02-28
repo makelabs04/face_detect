@@ -18,7 +18,7 @@ app.use('/faceapi.js', (req, res) => res.sendFile(path.join(__dirname, 'public',
 // ⚠️  Change these to your MySQL credentials
 // Hostinger: get from hPanel → Databases → MySQL Databases
 const DB_CONFIG = {
-  host     : 'localhost',
+  host     : '127.0.0.1',
   user     : 'u966260443_facedetect',
   password : 'Makelabs@123',
   database : 'u966260443_facedetect'
