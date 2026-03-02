@@ -143,8 +143,8 @@ const OFFICE_START   = { h: 9,  m: 30 };
 const GRACE_MINUTES  = 10;
 const OFFICE_END     = { h: 18, m: 10 };
 const ABSENT_AFTER   = { h: 11, m: 0 };   // 11:00 AM → absent
-const THRESHOLD      = 0.6;
-const REGISTER_SAMPLES = 5;
+const THRESHOLD      = 0.5;
+const REGISTER_SAMPLES = 10;
 
 // Derived thresholds in total minutes
 const LATE_AFTER     = OFFICE_START.h * 60 + OFFICE_START.m + GRACE_MINUTES; // 580 = 9:40
@@ -517,8 +517,36 @@ async function init(){
 
 async function detectFace(){
   return faceapi
-    .detectSingleFace(video,new faceapi.SsdMobilenetv1Options({minConfidence:0.35}))
+    .detectSingleFace(video,new faceapi.SsdMobilenetv1Options({minConfidence:0.65}))
     .withFaceLandmarks().withFaceDescriptor();
+}
+
+// Draw circular face overlay + label above
+function drawFaceCircle(box, color, label, sx, sy){
+  const cx = (box.x + box.width/2)  * sx;
+  const cy = (box.y + box.height/2) * sy;
+  const r  = Math.max(box.width, box.height) * 0.60 * ((sx+sy)/2);
+  // Outer glow ring
+  ctx.beginPath(); ctx.arc(cx, cy, r+4, 0, Math.PI*2);
+  ctx.strokeStyle = color+'33'; ctx.lineWidth = 6; ctx.stroke();
+  // Main circle
+  ctx.beginPath(); ctx.arc(cx, cy, r, 0, Math.PI*2);
+  ctx.strokeStyle = color; ctx.lineWidth = 2.5; ctx.stroke();
+  // Fill tint
+  ctx.beginPath(); ctx.arc(cx, cy, r, 0, Math.PI*2);
+  ctx.save(); ctx.globalAlpha = 0.06; ctx.fillStyle = color; ctx.fill(); ctx.restore();
+  // Label above circle
+  if(label){
+    const txtY = cy - r - 10;
+    ctx.font = 'bold 13px Space Grotesk,sans-serif';
+    const tw = ctx.measureText(label).width;
+    ctx.save(); ctx.globalAlpha=0.75; ctx.fillStyle='#000';
+    ctx.beginPath(); ctx.roundRect(cx-tw/2-6, txtY-14, tw+12, 20, 5); ctx.fill();
+    ctx.restore();
+    ctx.fillStyle = color; ctx.textAlign='center';
+    ctx.fillText(label, cx, txtY); ctx.textAlign='left';
+  }
+  return {cx, cy, r};
 }
 
 // ── CHECK IN ──────────────────────────────────────────────────
@@ -530,9 +558,6 @@ async function capture(){
 
   const{x,y,width,height}=det.detection.box;
   const sx=overlay.width/video.videoWidth,sy=overlay.height/video.videoHeight;
-  ctx.strokeStyle='#4f8ef7';ctx.lineWidth=2.5;
-  ctx.strokeRect(x*sx,y*sy,width*sx,height*sy);
-  ctx.fillStyle='rgba(79,142,247,0.04)';ctx.fillRect(x*sx,y*sy,width*sx,height*sy);
 
   const res=await fetch('/api/attendance/mark',{
     method:'POST',headers:{'Content-Type':'application/json'},
@@ -542,17 +567,16 @@ async function capture(){
 
   if(data.success && data.recognized){
     if(data.already){
-      ctx.fillStyle='#4f8ef7';ctx.font='bold 13px Space Grotesk,sans-serif';
-      ctx.fillText(data.name+(data.confidence!=null?' '+data.confidence+'%':''),x*sx+4,y*sy-8);
+      const lbl = data.name+(data.confidence!=null?' '+data.confidence+'%':'');
+      drawFaceCircle({x,y,width,height},'#4f8ef7',lbl,sx,sy);
       setSt('Already checked in: '+data.name,'pulse');
       showResult({...data,mode:'already'});
       toast('⚠️ '+data.name+' already checked in today','w');
     }else{
       const col=data.status==='late'?'#fbbf24':(data.status==='absent'?'#f87171':'#34d399');
-      ctx.strokeStyle=col;ctx.strokeRect(x*sx,y*sy,width*sx,height*sy);
-      ctx.fillStyle=col;ctx.font='bold 13px Space Grotesk,sans-serif';
       const confTxt = data.confidence!=null?' ('+data.confidence+'%)':'';
-      ctx.fillText((data.status==='late'?'⏰ ':(data.status==='absent'?'❌ ':'✓ '))+data.name+confTxt,x*sx+4,y*sy-8);
+      const lbl = (data.status==='late'?'⏰ ':(data.status==='absent'?'❌ ':'✓ '))+data.name+confTxt;
+      drawFaceCircle({x,y,width,height},col,lbl,sx,sy);
       let stMsg = (data.status==='late'?'⏰ Late':(data.status==='absent'?'❌ Absent':'✅ Present'))+': '+data.name+' at '+data.time_in+(data.confidence!=null?' | Accuracy: '+data.confidence+'%':'');
       if(data.status==='late'&&data.expected_checkout) stMsg+=' | Expected out: '+data.expected_checkout;
       setSt(stMsg, data.status==='absent'?'bad':(data.status==='late'?'pulse':'ok'));
@@ -563,8 +587,7 @@ async function capture(){
       toast(toastMsg, data.status==='absent'?'e':(data.status==='late'?'w':'s'));
     }
   }else if(!data.recognized){
-    ctx.strokeStyle='#f87171';ctx.lineWidth=2.5;ctx.strokeRect(x*sx,y*sy,width*sx,height*sy);
-    ctx.fillStyle='#f87171';ctx.font='bold 13px Space Grotesk,sans-serif';ctx.fillText('Unknown',x*sx+4,y*sy-8);
+    drawFaceCircle({x,y,width,height},'#f87171','Unknown',sx,sy);
     setSt('Unknown face — not registered','bad');showUnknown();toast('Unknown — register first','e');
   }else{
     toast(data.error||'Check-in failed','e');
@@ -580,9 +603,7 @@ async function captureCheckout(){
 
   const{x,y,width,height}=det.detection.box;
   const sx=overlay.width/video.videoWidth,sy=overlay.height/video.videoHeight;
-  ctx.strokeStyle='#a78bfa';ctx.lineWidth=2.5;
-  ctx.strokeRect(x*sx,y*sy,width*sx,height*sy);
-  ctx.fillStyle='rgba(167,139,250,0.04)';ctx.fillRect(x*sx,y*sy,width*sx,height*sy);
+  drawFaceCircle({x,y,width,height},'#a78bfa',null,sx,sy);
 
   const res=await fetch('/api/attendance/checkout',{
     method:'POST',headers:{'Content-Type':'application/json'},
@@ -592,22 +613,18 @@ async function captureCheckout(){
 
   if(data.success){
     if(data.already_out){
-      ctx.fillStyle='#a78bfa';ctx.font='bold 13px Space Grotesk,sans-serif';
-      ctx.fillText(data.name+(data.confidence!=null?' '+data.confidence+'%':''),x*sx+4,y*sy-8);
+      drawFaceCircle({x,y,width,height},'#a78bfa',data.name+(data.confidence!=null?' '+data.confidence+'%':''),sx,sy);
       setSt('Already checked out: '+data.name,'pulse');
       showResult({...data,mode:'already_out'});
       toast('⚠️ '+data.name+' already checked out today','w');
     }else if(data.early){
-      ctx.fillStyle='#fb923c';ctx.font='bold 13px Space Grotesk,sans-serif';
-      ctx.fillText('⚠ '+data.name+(data.confidence!=null?' '+data.confidence+'%':''),x*sx+4,y*sy-8);
-      ctx.strokeStyle='#fb923c';ctx.strokeRect(x*sx,y*sy,width*sx,height*sy);
+      drawFaceCircle({x,y,width,height},'#fb923c','⚠ '+data.name+(data.confidence!=null?' '+data.confidence+'%':''),sx,sy);
       setSt('⚠️ Early leave: '+data.name+' at '+data.time_out+(data.confidence!=null?' | Accuracy: '+data.confidence+'%':''),'pulse');
       showResult({...data,mode:'early'});
       loadStats();loadTable();
       toast('⚠️ '+data.name+' left early at '+data.time_out+(data.confidence!=null?' ('+data.confidence+'%)':''),'w');
     }else{
-      ctx.fillStyle='#a78bfa';ctx.font='bold 13px Space Grotesk,sans-serif';
-      ctx.fillText('✓ '+data.name+(data.confidence!=null?' '+data.confidence+'%':''),x*sx+4,y*sy-8);
+      drawFaceCircle({x,y,width,height},'#a78bfa','✓ '+data.name+(data.confidence!=null?' '+data.confidence+'%':''),sx,sy);
       setSt('🚪 Checked out: '+data.name+' at '+data.time_out+(data.confidence!=null?' | Accuracy: '+data.confidence+'%':''),'ok');
       showResult({...data,mode:'checkout'});
       loadStats();loadTable();
@@ -617,8 +634,7 @@ async function captureCheckout(){
     setSt('Not checked in: '+data.name,'bad');
     toast(data.name+' has no check-in today — check in first','e');
   }else if(!data.recognized){
-    ctx.strokeStyle='#f87171';ctx.strokeRect(x*sx,y*sy,width*sx,height*sy);
-    ctx.fillStyle='#f87171';ctx.font='bold 13px Space Grotesk,sans-serif';ctx.fillText('Unknown',x*sx+4,y*sy-8);
+    drawFaceCircle({x,y,width,height},'#f87171','Unknown',sx,sy);
     setSt('Unknown face','bad');showUnknown();toast('Unknown — register first','e');
   }else{
     toast(data.error||'Checkout failed','e');
@@ -1008,13 +1024,31 @@ async function init(){
 
 async function detectFace(){
   return faceapi
-    .detectSingleFace(video,new faceapi.SsdMobilenetv1Options({minConfidence:0.35}))
+    .detectSingleFace(video,new faceapi.SsdMobilenetv1Options({minConfidence:0.65}))
     .withFaceLandmarks().withFaceDescriptor();
 }
-function avgDesc(descs){
-  const len=descs[0].length,avg=new Float32Array(len);
-  for(const d of descs)for(let i=0;i<len;i++)avg[i]+=d[i]/descs.length;
-  return Array.from(avg);
+
+// Draw circle overlay on registration canvas
+function drawRegCircle(box, color, label, sx, sy){
+  const cx = (box.x + box.width/2)  * sx;
+  const cy = (box.y + box.height/2) * sy;
+  const r  = Math.max(box.width, box.height) * 0.60 * ((sx+sy)/2);
+  ctx.beginPath(); ctx.arc(cx, cy, r+4, 0, Math.PI*2);
+  ctx.strokeStyle = color+'44'; ctx.lineWidth = 6; ctx.stroke();
+  ctx.beginPath(); ctx.arc(cx, cy, r, 0, Math.PI*2);
+  ctx.strokeStyle = color; ctx.lineWidth = 2.5; ctx.stroke();
+  ctx.beginPath(); ctx.arc(cx, cy, r, 0, Math.PI*2);
+  ctx.save(); ctx.globalAlpha=0.07; ctx.fillStyle=color; ctx.fill(); ctx.restore();
+  if(label){
+    ctx.font='bold 12px Space Grotesk,monospace';
+    const tw=ctx.measureText(label).width;
+    const txtY = cy - r - 10;
+    ctx.save(); ctx.globalAlpha=0.75; ctx.fillStyle='#000';
+    ctx.beginPath(); ctx.roundRect(cx-tw/2-6,txtY-14,tw+12,20,5); ctx.fill();
+    ctx.restore();
+    ctx.fillStyle=color; ctx.textAlign='center';
+    ctx.fillText(label,cx,txtY); ctx.textAlign='left';
+  }
 }
 
 async function registerFace(){
@@ -1031,32 +1065,37 @@ async function registerFace(){
   for(let i=0;i<REG_SAMPLES;i++){
     pL.textContent='Sample '+(i+1)+'/'+REG_SAMPLES+' — hold still...';
     pB.style.width=(i/REG_SAMPLES*100)+'%';
-    await new Promise(r=>setTimeout(r,400));
+    await new Promise(r=>setTimeout(r,350));
     let det=await detectFace();
     if(!det){await new Promise(r=>setTimeout(r,500));det=await detectFace();}
     if(det){
-      descs.push(det.descriptor);
       const score = det.detection.score || 0;
-      detScores.push(score);
-      const{x,y,width,height}=det.detection.box;
-      const sx=overlay.width/video.videoWidth,sy=overlay.height/video.videoHeight;
-      ctx.clearRect(0,0,overlay.width,overlay.height);
-      ctx.strokeStyle='#a78bfa';ctx.lineWidth=2;
-      ctx.strokeRect(x*sx,y*sy,width*sx,height*sy);
-      // Show per-sample score on canvas
-      const pct=Math.round(score*100);
-      const col=pct>=85?'#34d399':pct>=65?'#fbbf24':'#fb923c';
-      ctx.fillStyle=col;ctx.font='bold 12px Space Grotesk,monospace';
-      ctx.fillText('Sample '+(i+1)+': '+pct+'%',x*sx+4,y*sy-8);
-      pL.textContent='Sample '+(i+1)+'/'+REG_SAMPLES+' — detected at '+pct+'%';
+      // Only keep high-quality samples (score >= 0.65)
+      if(score >= 0.65){
+        descs.push(Array.from(det.descriptor));
+        detScores.push(score);
+        const{x,y,width,height}=det.detection.box;
+        const sx=overlay.width/video.videoWidth,sy=overlay.height/video.videoHeight;
+        ctx.clearRect(0,0,overlay.width,overlay.height);
+        const pct=Math.round(score*100);
+        const col=pct>=85?'#34d399':pct>=65?'#fbbf24':'#fb923c';
+        drawRegCircle({x,y,width,height},col,'Sample '+(i+1)+': '+pct+'%',sx,sy);
+        pL.textContent='Sample '+(i+1)+'/'+REG_SAMPLES+' — captured at '+pct+'% ✓';
+      } else {
+        const pct=Math.round(score*100);
+        pL.textContent='Sample '+(i+1)+'/'+REG_SAMPLES+' — quality too low ('+pct+'%), retrying...';
+        i--; // retry this sample
+        await new Promise(r=>setTimeout(r,300));
+      }
     } else {
       pL.textContent='Sample '+(i+1)+'/'+REG_SAMPLES+' — face not detected, skipping';
     }
   }
   pB.style.width='100%';
-  if(!descs.length){
-    toast('No face captured — try again','e');pL.textContent='No face detected — move closer and retry';
-    setSt('No face detected','bad');btn.disabled=false;btn.textContent='📸 Capture & Register Face';pB.style.width='0';return;
+  if(descs.length < 3){
+    toast('Only '+descs.length+' sample(s) captured — need at least 3. Move closer and retry','e');
+    pL.textContent='Too few samples — move closer, ensure good lighting, and retry';
+    setSt('Not enough samples captured','bad');btn.disabled=false;btn.textContent='📸 Capture & Register Face';pB.style.width='0';return;
   }
   // Registration accuracy = average of detection confidence scores
   const avgScore = detScores.reduce((a,b)=>a+b,0)/detScores.length;
@@ -1065,14 +1104,14 @@ async function registerFace(){
   pL.textContent='Got '+descs.length+'/'+REG_SAMPLES+' samples | Reg. Quality: '+registration_accuracy+'% — saving...';
   const res=await fetch('/api/register',{
     method:'POST',headers:{'Content-Type':'application/json'},
-    body:JSON.stringify({label:name,employee_id:empid,department:dept,descriptor:avgDesc(descs),registration_accuracy})
+    // Send all descriptors (array of arrays) for better multi-pose matching
+    body:JSON.stringify({label:name,employee_id:empid,department:dept,descriptors:descs,registration_accuracy})
   });
   const data=await res.json();
   ctx.clearRect(0,0,overlay.width,overlay.height);
   if(res.ok){
-    const accColor=registration_accuracy>=85?'#34d399':registration_accuracy>=65?'#fbbf24':'#fb923c';
     toast('✅ "'+name+'" registered! Quality: '+registration_accuracy+'%','s');
-    pL.textContent='✅ Registered: '+name+' | Quality: '+registration_accuracy+'%';
+    pL.textContent='✅ Registered: '+name+' | Quality: '+registration_accuracy+'% | Samples: '+descs.length;
     setSt('✅ Registered: '+name+' | Reg. Quality: '+registration_accuracy+'%','ok');
     document.getElementById('inp_name').value='';
     document.getElementById('inp_empid').value='';
@@ -1141,11 +1180,14 @@ app.get('/api/faces', async (req, res) => {
 
 app.post('/api/register', async (req, res) => {
   try {
-    const { label, employee_id='', department='', descriptor, registration_accuracy=null } = req.body;
-    if (!label || !descriptor) return res.status(400).json({ error: 'Name and descriptor required' });
+    const { label, employee_id='', department='', descriptor, descriptors, registration_accuracy=null } = req.body;
+    if (!label) return res.status(400).json({ error: 'Name required' });
+    // Accept either new format (descriptors = array of arrays) or old (descriptor = single array)
+    const toStore = descriptors || descriptor;
+    if (!toStore) return res.status(400).json({ error: 'Descriptor(s) required' });
     const result = await dbQuery(
       'INSERT INTO faces (label, employee_id, department, descriptor, registration_accuracy) VALUES (?,?,?,?,?)',
-      [label, employee_id, department, JSON.stringify(descriptor), registration_accuracy]
+      [label, employee_id, department, JSON.stringify(toStore), registration_accuracy]
     );
     res.status(201).json({ success: true, id: result.insertId, label, registration_accuracy });
   } catch(e) {
@@ -1173,7 +1215,10 @@ app.post('/api/attendance/mark', async (req, res) => {
 
     let best = null, bestD = Infinity;
     for (const f of faces) {
-      const d = euclidean(descriptor, JSON.parse(f.descriptor));
+      const stored = JSON.parse(f.descriptor);
+      // Support both old (single flat array) and new (array of arrays) format
+      const descriptorList = Array.isArray(stored[0]) ? stored : [stored];
+      const d = Math.min(...descriptorList.map(sd => euclidean(descriptor, sd)));
       if (d < bestD) { bestD = d; best = f; }
     }
     if (!best || bestD >= THRESHOLD) return res.json({ success: false, recognized: false });
@@ -1229,7 +1274,10 @@ app.post('/api/attendance/checkout', async (req, res) => {
 
     let best = null, bestD = Infinity;
     for (const f of faces) {
-      const d = euclidean(descriptor, JSON.parse(f.descriptor));
+      const stored = JSON.parse(f.descriptor);
+      // Support both old (single flat array) and new (array of arrays) format
+      const descriptorList = Array.isArray(stored[0]) ? stored : [stored];
+      const d = Math.min(...descriptorList.map(sd => euclidean(descriptor, sd)));
       if (d < bestD) { bestD = d; best = f; }
     }
     if (!best || bestD >= THRESHOLD) return res.json({ success: false, recognized: false });
