@@ -1226,10 +1226,10 @@ app.post('/api/attendance/mark', async (req, res) => {
     const confidence = Math.round(Math.max(0, Math.min(100, (1 - bestD / THRESHOLD) * 100)));
     const registered_accuracy = best.registration_accuracy || null;
 
-    const today    = new Date().toISOString().slice(0, 10);
-    const nowDate  = new Date();
-    const timeStr  = nowDate.toTimeString().slice(0, 8);
-    const totalMin = nowDate.getHours() * 60 + nowDate.getMinutes();
+    const nowIST   = new Date(new Date().toLocaleString('en-US', { timeZone: 'Asia/Kolkata' }));
+    const today    = nowIST.getFullYear() + '-' + String(nowIST.getMonth()+1).padStart(2,'0') + '-' + String(nowIST.getDate()).padStart(2,'0');
+    const timeStr  = String(nowIST.getHours()).padStart(2,'0') + ':' + String(nowIST.getMinutes()).padStart(2,'0') + ':' + String(nowIST.getSeconds()).padStart(2,'0');
+    const totalMin = nowIST.getHours() * 60 + nowIST.getMinutes();
 
     // After 11:00 AM → absent
     let status = 'present';
@@ -1285,10 +1285,10 @@ app.post('/api/attendance/checkout', async (req, res) => {
     const confidence = Math.round(Math.max(0, Math.min(100, (1 - bestD / THRESHOLD) * 100)));
     const registered_accuracy = best.registration_accuracy || null;
 
-    const today    = new Date().toISOString().slice(0, 10);
-    const nowDate  = new Date();
-    const timeStr  = nowDate.toTimeString().slice(0, 8);
-    const totalMin = nowDate.getHours() * 60 + nowDate.getMinutes();
+    const nowIST   = new Date(new Date().toLocaleString('en-US', { timeZone: 'Asia/Kolkata' }));
+    const today    = nowIST.getFullYear() + '-' + String(nowIST.getMonth()+1).padStart(2,'0') + '-' + String(nowIST.getDate()).padStart(2,'0');
+    const timeStr  = String(nowIST.getHours()).padStart(2,'0') + ':' + String(nowIST.getMinutes()).padStart(2,'0') + ':' + String(nowIST.getSeconds()).padStart(2,'0');
+    const totalMin = nowIST.getHours() * 60 + nowIST.getMinutes();
     const isEarly  = totalMin < CHECKOUT_FROM; // before 6:10 PM
 
     // Must have checked in first
