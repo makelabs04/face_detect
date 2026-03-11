@@ -108,6 +108,33 @@ async function setup() {
   console.log('✅ Models ready');
 }
 
+// ─── LED / BUZZER STATE ───────────────────────────────────────────────────────
+// Arduino polls GET /api/led/status every ~500 ms.
+// After each detection the server stores one pending command here.
+let pendingLedCommand = null;
+
+// Detection event  →  { led color, buzzer beeps }
+// LED codes: G=Green  O=Orange  B=Blue  R=Red  X=Off
+function getLedCommand(eventType) {
+  const MAP = {
+    checkin_present:   { led: 'G', buzzer: 1 },  // ✅ Green  + 1 beep
+    checkin_late:      { led: 'O', buzzer: 0 },  // ⏰ Orange + no beep
+    checkin_absent:    { led: 'R', buzzer: 0 },  // ❌ Red    + no beep
+    checkin_already:   { led: 'O', buzzer: 3 },  // ⚠️ Orange + 3 beeps
+    checkout_normal:   { led: 'B', buzzer: 2 },  // 🚪 Blue   + 2 beeps
+    checkout_early:    { led: 'R', buzzer: 0 },  // ⚠️ Red    + no beep
+    checkout_already:  { led: 'O', buzzer: 3 },  // ⚠️ Orange + 3 beeps
+    unknown:           { led: 'R', buzzer: 5 },  // ❓ Red    + 5 beeps
+  };
+  return MAP[eventType] || { led: 'X', buzzer: 0 };
+}
+
+function setLed(eventType, name = '', status = '') {
+  const cmd = getLedCommand(eventType);
+  pendingLedCommand = { led: cmd.led, buzzer: cmd.buzzer, name: String(name).substring(0,40), eventType, status, timestamp: Date.now() };
+  console.log(`💡 LED → event=${eventType} | led=${cmd.led} | buzzer=${cmd.buzzer} | name=${name}`);
+}
+
 // ─── HELPERS ─────────────────────────────────────────────────────────────────
 function dbQuery(sql, params = []) {
   return new Promise((resolve, reject) =>
@@ -1244,7 +1271,7 @@ app.post('/api/attendance/mark', async (req, res) => {
       const d = Math.min(...descriptorList.map(sd => euclidean(descriptor, sd)));
       if (d < bestD) { bestD = d; best = f; }
     }
-    if (!best || bestD >= THRESHOLD) return res.json({ success: false, recognized: false });
+    if (!best || bestD >= THRESHOLD) { setLed('unknown'); return res.json({ success: false, recognized: false }); }
 
     const confidence = Math.round(Math.max(0, Math.min(100, (1 - bestD / THRESHOLD) * 100)));
     const registered_accuracy = best.registration_accuracy || null;
@@ -1271,6 +1298,7 @@ app.post('/api/attendance/mark', async (req, res) => {
       [best.id, today]
     );
     if (existing.length) {
+      setLed('checkin_already', best.label, existing[0].status);
       return res.json({
         success: true, recognized: true, already: true, confidence, registered_accuracy,
         name: best.label, time_in: fmtTime(existing[0].time_in), status: existing[0].status,
@@ -1282,6 +1310,8 @@ app.post('/api/attendance/mark', async (req, res) => {
       'INSERT INTO attendance (face_id, name, date, time_in, status, expected_checkout) VALUES (?,?,?,?,?,?)',
       [best.id, best.label, today, timeStr, status, expectedCheckout]
     );
+    const evType = status === 'absent' ? 'checkin_absent' : status === 'late' ? 'checkin_late' : 'checkin_present';
+    setLed(evType, best.label, status);
     res.json({ success: true, recognized: true, already: false, confidence, registered_accuracy, name: best.label, time_in: fmtTime(timeStr), status, expected_checkout: expectedCheckout ? fmtTime(expectedCheckout) : null });
   } catch(e) { res.status(500).json({ error: e.message }); }
 });
@@ -1303,7 +1333,7 @@ app.post('/api/attendance/checkout', async (req, res) => {
       const d = Math.min(...descriptorList.map(sd => euclidean(descriptor, sd)));
       if (d < bestD) { bestD = d; best = f; }
     }
-    if (!best || bestD >= THRESHOLD) return res.json({ success: false, recognized: false });
+    if (!best || bestD >= THRESHOLD) { setLed('unknown'); return res.json({ success: false, recognized: false }); }
 
     const confidence = Math.round(Math.max(0, Math.min(100, (1 - bestD / THRESHOLD) * 100)));
     const registered_accuracy = best.registration_accuracy || null;
@@ -1320,11 +1350,13 @@ app.post('/api/attendance/checkout', async (req, res) => {
       [best.id, today]
     );
     if (!existing.length) {
+      setLed('unknown', best.label, 'not_checked_in');
       return res.json({ success: false, not_checked_in: true, name: best.label });
     }
 
     // Already checked out?
     if (existing[0].time_out) {
+      setLed('checkout_already', best.label, existing[0].status);
       return res.json({
         success: true, already_out: true, confidence, registered_accuracy, name: best.label,
         time_in: fmtTime(existing[0].time_in), time_out: fmtTime(existing[0].time_out),
@@ -1344,6 +1376,8 @@ app.post('/api/attendance/checkout', async (req, res) => {
       [timeStr, newStatus, best.id, today]
     );
 
+    const coEvType = isEarly ? 'checkout_early' : 'checkout_normal';
+    setLed(coEvType, best.label, newStatus);
     res.json({
       success: true, recognized: true, already_out: false, confidence, registered_accuracy,
       name: best.label, time_in: fmtTime(existing[0].time_in),
@@ -1739,6 +1773,31 @@ applyFilters();
 </body>
 </html>`;
 }
+
+// ─── LED API ROUTES ───────────────────────────────────────────────────────────
+
+// Arduino polls this ~every 500 ms. Returns plain text, clears after read.
+app.get('/api/led/status', (req, res) => {
+  const cmd = pendingLedCommand || { led: 'X', buzzer: 0, name: '', status: '' };
+  pendingLedCommand = null;
+  res.set('Content-Type', 'text/plain')
+     .send(`LED:${cmd.led};BUZZ:${cmd.buzzer};NAME:${cmd.name};STATUS:${cmd.status}`);
+});
+
+// JSON version for browser debugging
+app.get('/api/led/status/json', (req, res) => {
+  const cmd = pendingLedCommand || { led: 'X', buzzer: 0, name: '', status: '', timestamp: null };
+  pendingLedCommand = null;
+  res.json(cmd);
+});
+
+// Manual trigger endpoint (optional, for testing)
+app.post('/api/led/trigger', (req, res) => {
+  const { eventType, name = '', status = '' } = req.body;
+  if (!eventType) return res.status(400).json({ error: 'eventType required' });
+  setLed(eventType, name, status);
+  res.json({ success: true, ...pendingLedCommand });
+});
 
 // ─── PAGE ROUTES ──────────────────────────────────────────────────────────────
 app.get('/', async (req, res) => {
