@@ -113,18 +113,27 @@ async function setup() {
 // After each detection the server stores one pending command here.
 let pendingLedCommand = null;
 
-// Detection event  →  { led color, buzzer beeps }
-// LED codes: G=Green  O=Orange  B=Blue  R=Red  X=Off
+// Detection event  →  { led code, buzzer beeps }
+// LED codes:
+//   G  = GREEN solid  (present on-time)
+//   GL = GREEN blink  (late check-in)
+//   R  = RED   solid  (absent)
+//   RL = RED   blink  (early leave)
+//   RU = RED   blink  (unknown face)
+//   B  = BLUE  solid  (checkout normal)
+//   O  = BLUE  blink  (already checked in)
+//   OO = BLUE  blink  (already checked out)
+//   X  = OFF
 function getLedCommand(eventType) {
   const MAP = {
-    checkin_present:   { led: 'G', buzzer: 1 },  // ✅ Green  + 1 beep
-    checkin_late:      { led: 'O', buzzer: 0 },  // ⏰ Orange + no beep
-    checkin_absent:    { led: 'R', buzzer: 0 },  // ❌ Red    + no beep
-    checkin_already:   { led: 'O', buzzer: 3 },  // ⚠️ Orange + 3 beeps
-    checkout_normal:   { led: 'B', buzzer: 2 },  // 🚪 Blue   + 2 beeps
-    checkout_early:    { led: 'R', buzzer: 0 },  // ⚠️ Red    + no beep
-    checkout_already:  { led: 'O', buzzer: 3 },  // ⚠️ Orange + 3 beeps
-    unknown:           { led: 'R', buzzer: 5 },  // ❓ Red    + 5 beeps
+    checkin_present:   { led: 'G',  buzzer: 1 },  // ✅ GREEN solid  + 1 beep
+    checkin_late:      { led: 'GL', buzzer: 1 },  // ⏰ GREEN blink  + 1 beep
+    checkin_absent:    { led: 'R',  buzzer: 2 },  // ❌ RED   solid  + 2 beeps
+    checkin_already:   { led: 'O',  buzzer: 3 },  // ⚠️ BLUE  blink  + 3 beeps
+    checkout_normal:   { led: 'B',  buzzer: 2 },  // 🚪 BLUE  solid  + 2 beeps
+    checkout_early:    { led: 'RL', buzzer: 2 },  // ⚠️ RED   blink  + 2 beeps
+    checkout_already:  { led: 'OO', buzzer: 3 },  // ⚠️ BLUE  blink  + 3 beeps
+    unknown:           { led: 'RU', buzzer: 5 },  // ❓ RED   blink  + 5 beeps
   };
   return MAP[eventType] || { led: 'X', buzzer: 0 };
 }
