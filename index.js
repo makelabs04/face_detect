@@ -63,12 +63,12 @@ db.connect(err => {
   // NEW: unknown_faces table for tracking unknown detections + images
   db.query(`
     CREATE TABLE IF NOT EXISTS unknown_faces (
-      id           INT AUTO_INCREMENT PRIMARY KEY,
-      image_file   VARCHAR(255) DEFAULT NULL,
-      detected_at  DATETIME DEFAULT CURRENT_TIMESTAMP,
-      date         DATE NOT NULL,
-      time         TIME NOT NULL,
-      location     VARCHAR(100) DEFAULT ''
+      id             INT AUTO_INCREMENT PRIMARY KEY,
+      image_file     VARCHAR(255) DEFAULT NULL,
+      detected_at    DATETIME DEFAULT CURRENT_TIMESTAMP,
+      date           DATE NOT NULL,
+      time_detected  TIME NOT NULL,
+      location       VARCHAR(100) DEFAULT ''
     )
   `, err => { if (!err) console.log('✅ unknown_faces table ready'); });
 });
@@ -719,6 +719,7 @@ async function capture(){
       body: JSON.stringify({image: snapshot})
     });
     const saveData = await saveRes.json();
+    if (!saveRes.ok) { console.error('Save error:', saveData.error); toast('Save error: '+saveData.error,'e'); }
     showUnknown(snapshot);
     loadUnkCount();
     toast('❓ Unknown face detected & captured','e');
@@ -770,10 +771,11 @@ async function captureCheckout(){
     drawFaceCircle({x,y,width,height},'#f87171','Unknown',sx,sy);
     setSt('Unknown face — capturing...','bad');
     const snapshot = captureSnapshot({x,y,width,height});
-    await fetch('/api/unknown-faces/save', {
+    const sr2 = await fetch('/api/unknown-faces/save', {
       method:'POST', headers:{'Content-Type':'application/json'},
       body: JSON.stringify({image: snapshot})
     });
+    if (!sr2.ok) { const sd2 = await sr2.json(); console.error('Save error:', sd2.error); }
     showUnknown(snapshot);
     loadUnkCount();
     toast('❓ Unknown — register first','e');
@@ -1904,11 +1906,23 @@ app.post('/api/unknown-faces/save', async (req, res) => {
     }
 
     const result = await dbQuery(
-      'INSERT INTO unknown_faces (image_file, date, time) VALUES (?, ?, ?)',
+      'INSERT INTO unknown_faces (image_file, date, time_detected) VALUES (?, ?, ?)',
       [imageFile, dateStr, timeStr]
     );
     console.log(`❓ Unknown face saved: #${result.insertId} | image: ${imageFile}`);
     res.json({ success: true, id: result.insertId, image_file: imageFile });
+  } catch(e) {
+    console.error('❌ unknown-faces/save error:', e.message);
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// Debug: check DB directly
+app.get('/api/unknown-faces/debug', async (req, res) => {
+  try {
+    const rows = await dbQuery('SELECT id, image_file, date, time_detected, detected_at FROM unknown_faces ORDER BY id DESC LIMIT 20');
+    const count = await dbQuery('SELECT COUNT(*) AS c FROM unknown_faces');
+    res.json({ total: count[0].c, rows });
   } catch(e) { res.status(500).json({ error: e.message }); }
 });
 
