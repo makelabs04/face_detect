@@ -627,10 +627,10 @@ async function init(){
   }
 }
 
-async function detectFace(){
+async function detectFaces(){
   return faceapi
-    .detectSingleFace(video,new faceapi.SsdMobilenetv1Options({minConfidence:0.65}))
-    .withFaceLandmarks().withFaceDescriptor();
+    .detectAllFaces(video, new faceapi.SsdMobilenetv1Options({minConfidence:0.65}))
+    .withFaceLandmarks().withFaceDescriptors();
 }
 
 // Capture a snapshot of the video as base64 JPEG
@@ -676,112 +676,104 @@ function drawFaceCircle(box, color, label, sx, sy){
 async function capture(){
   if(!isReady)return;
   setSt('Scanning for check-in...','pulse');clearC();
-  const det=await detectFace();
-  if(!det){setSt('No face detected — look at the camera','bad');showIdle();toast('No face detected','e');return;}
+  const dets=await detectFaces();
+  if(!dets||!dets.length){setSt('No face detected — look at the camera','bad');showIdle();toast('No face detected','e');return;}
 
-  const{x,y,width,height}=det.detection.box;
-  const sx=overlay.width/video.videoWidth,sy=overlay.height/video.videoHeight;
+  const sx=overlay.width/video.videoWidth, sy=overlay.height/video.videoHeight;
+  let lastResult=null, unknownCount=0, successCount=0;
 
-  const res=await fetch('/api/attendance/mark',{
-    method:'POST',headers:{'Content-Type':'application/json'},
-    body:JSON.stringify({descriptor:Array.from(det.descriptor)})
-  });
-  const data=await res.json();
-
-  if(data.success && data.recognized){
-    if(data.already){
-      const lbl = data.name+(data.confidence!=null?' '+data.confidence+'%':'');
-      drawFaceCircle({x,y,width,height},'#00adee',lbl,sx,sy);
-      setSt('Already checked in: '+data.name,'pulse');
-      showResult({...data,mode:'already'});
-      toast('⚠️ '+data.name+' already checked in today','w');
-    }else{
-      const col=data.status==='late'?'#fbbf24':(data.status==='absent'?'#f87171':'#34d399');
-      const confTxt = data.confidence!=null?' ('+data.confidence+'%)':'';
-      const lbl = (data.status==='late'?'⏰ ':(data.status==='absent'?'❌ ':'✓ '))+data.name+confTxt;
-      drawFaceCircle({x,y,width,height},col,lbl,sx,sy);
-      let stMsg = (data.status==='late'?'⏰ Late':(data.status==='absent'?'❌ Absent':'✅ Present'))+': '+data.name+' at '+data.time_in+(data.confidence!=null?' | Accuracy: '+data.confidence+'%':'');
-      if(data.status==='late'&&data.expected_checkout) stMsg+=' | Expected out: '+data.expected_checkout;
-      setSt(stMsg, data.status==='absent'?'bad':(data.status==='late'?'pulse':'ok'));
-      showResult({...data,mode:'checkin'});
-      loadStats();loadTable();
-      let toastMsg = (data.status==='late'?'⏰ Late':(data.status==='absent'?'❌ Marked Absent':'✅ Present'))+': '+data.name+' at '+data.time_in+(data.confidence!=null?' ('+data.confidence+'%)':'');
-      if(data.status==='late'&&data.expected_checkout) toastMsg+=' | Checkout by: '+data.expected_checkout;
-      toast(toastMsg, data.status==='absent'?'e':(data.status==='late'?'w':'s'));
-    }
-  }else if(!data.recognized){
-    drawFaceCircle({x,y,width,height},'#f87171','Unknown',sx,sy);
-    setSt('Unknown face — capturing & saving image...','bad');
-    // Auto-capture unknown face image
-    const snapshot = captureSnapshot({x,y,width,height});
-    const saveRes = await fetch('/api/unknown-faces/save', {
-      method:'POST', headers:{'Content-Type':'application/json'},
-      body: JSON.stringify({image: snapshot})
+  // Process all detected faces in parallel
+  await Promise.all(dets.map(async det => {
+    const{x,y,width,height}=det.detection.box;
+    const res=await fetch('/api/attendance/mark',{
+      method:'POST',headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({descriptor:Array.from(det.descriptor)})
     });
-    const saveData = await saveRes.json();
-    if (!saveRes.ok) { console.error('Save error:', saveData.error); toast('Save error: '+saveData.error,'e'); }
-    showUnknown(snapshot);
-    loadUnkCount();
-    toast('❓ Unknown face detected & captured','e');
-  }else{
-    toast(data.error||'Check-in failed','e');
-  }
+    const data=await res.json();
+
+    if(data.success && data.recognized){
+      if(data.already){
+        drawFaceCircle({x,y,width,height},'#00adee',data.name+(data.confidence!=null?' '+data.confidence+'%':''),sx,sy);
+        toast('⚠️ '+data.name+' already checked in','w');
+      }else{
+        const col=data.status==='late'?'#fbbf24':(data.status==='absent'?'#f87171':'#34d399');
+        const lbl=(data.status==='late'?'⏰ ':(data.status==='absent'?'❌ ':'✓ '))+data.name+(data.confidence!=null?' '+data.confidence+'%':'');
+        drawFaceCircle({x,y,width,height},col,lbl,sx,sy);
+        let tMsg=(data.status==='late'?'⏰ Late':(data.status==='absent'?'❌ Absent':'✅ Present'))+': '+data.name+' at '+data.time_in+(data.confidence!=null?' ('+data.confidence+'%)':'');
+        if(data.status==='late'&&data.expected_checkout) tMsg+=' | Out by: '+data.expected_checkout;
+        toast(tMsg, data.status==='absent'?'e':(data.status==='late'?'w':'s'));
+        successCount++;
+        lastResult={...data,mode:'checkin'};
+      }
+    }else if(!data.recognized){
+      drawFaceCircle({x,y,width,height},'#f87171','Unknown',sx,sy);
+      unknownCount++;
+      const snapshot=captureSnapshot({x,y,width,height});
+      const saveRes=await fetch('/api/unknown-faces/save',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({image:snapshot})});
+      if(!saveRes.ok){const sd=await saveRes.json();console.error('Save error:',sd.error);}
+      if(unknownCount===1) showUnknown(snapshot);
+    }
+  }));
+
+  if(unknownCount>0){ loadUnkCount(); toast('❓ '+unknownCount+' unknown face'+(unknownCount>1?'s':'')+' captured','e'); }
+  if(successCount>0){ loadStats(); loadTable(); }
+  if(lastResult) showResult(lastResult);
+  else if(unknownCount>0 && !lastResult) setSt(unknownCount+' unknown face'+(unknownCount>1?'s':'')+' detected','bad');
+  else setSt(dets.length+' face'+(dets.length>1?'s':'')+' processed','ok');
 }
 
 // ── CHECK OUT ─────────────────────────────────────────────────
 async function captureCheckout(){
   if(!isReady)return;
   setSt('Scanning for check-out...','pulse');clearC();
-  const det=await detectFace();
-  if(!det){setSt('No face detected — look at the camera','bad');showIdle();toast('No face detected','e');return;}
+  const dets=await detectFaces();
+  if(!dets||!dets.length){setSt('No face detected — look at the camera','bad');showIdle();toast('No face detected','e');return;}
 
-  const{x,y,width,height}=det.detection.box;
-  const sx=overlay.width/video.videoWidth,sy=overlay.height/video.videoHeight;
-  drawFaceCircle({x,y,width,height},'#a78bfa',null,sx,sy);
+  const sx=overlay.width/video.videoWidth, sy=overlay.height/video.videoHeight;
+  let lastResult=null, unknownCount=0, successCount=0;
 
-  const res=await fetch('/api/attendance/checkout',{
-    method:'POST',headers:{'Content-Type':'application/json'},
-    body:JSON.stringify({descriptor:Array.from(det.descriptor)})
-  });
-  const data=await res.json();
+  await Promise.all(dets.map(async det => {
+    const{x,y,width,height}=det.detection.box;
+    drawFaceCircle({x,y,width,height},'#a78bfa',null,sx,sy);
 
-  if(data.success){
-    if(data.already_out){
-      drawFaceCircle({x,y,width,height},'#a78bfa',data.name+(data.confidence!=null?' '+data.confidence+'%':''),sx,sy);
-      setSt('Already checked out: '+data.name,'pulse');
-      showResult({...data,mode:'already_out'});
-      toast('⚠️ '+data.name+' already checked out today','w');
-    }else if(data.early){
-      drawFaceCircle({x,y,width,height},'#fb923c','⚠ '+data.name+(data.confidence!=null?' '+data.confidence+'%':''),sx,sy);
-      setSt('⚠️ Early leave: '+data.name+' at '+data.time_out+(data.confidence!=null?' | Accuracy: '+data.confidence+'%':''),'pulse');
-      showResult({...data,mode:'early'});
-      loadStats();loadTable();
-      toast('⚠️ '+data.name+' left early at '+data.time_out+(data.confidence!=null?' ('+data.confidence+'%)':''),'w');
-    }else{
-      drawFaceCircle({x,y,width,height},'#a78bfa','✓ '+data.name+(data.confidence!=null?' '+data.confidence+'%':''),sx,sy);
-      setSt('🚪 Checked out: '+data.name+' at '+data.time_out+(data.confidence!=null?' | Accuracy: '+data.confidence+'%':''),'ok');
-      showResult({...data,mode:'checkout'});
-      loadStats();loadTable();
-      toast('🚪 '+data.name+' checked out at '+data.time_out+(data.confidence!=null?' ('+data.confidence+'%)':''),'p');
-    }
-  }else if(data.not_checked_in){
-    setSt('Not checked in: '+data.name,'bad');
-    toast(data.name+' has no check-in today — check in first','e');
-  }else if(!data.recognized){
-    drawFaceCircle({x,y,width,height},'#f87171','Unknown',sx,sy);
-    setSt('Unknown face — capturing...','bad');
-    const snapshot = captureSnapshot({x,y,width,height});
-    const sr2 = await fetch('/api/unknown-faces/save', {
-      method:'POST', headers:{'Content-Type':'application/json'},
-      body: JSON.stringify({image: snapshot})
+    const res=await fetch('/api/attendance/checkout',{
+      method:'POST',headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({descriptor:Array.from(det.descriptor)})
     });
-    if (!sr2.ok) { const sd2 = await sr2.json(); console.error('Save error:', sd2.error); }
-    showUnknown(snapshot);
-    loadUnkCount();
-    toast('❓ Unknown — register first','e');
-  }else{
-    toast(data.error||'Checkout failed','e');
-  }
+    const data=await res.json();
+
+    if(data.success){
+      if(data.already_out){
+        drawFaceCircle({x,y,width,height},'#a78bfa',data.name+(data.confidence!=null?' '+data.confidence+'%':''),sx,sy);
+        toast('⚠️ '+data.name+' already checked out','w');
+      }else if(data.early){
+        drawFaceCircle({x,y,width,height},'#fb923c','⚠ '+data.name+(data.confidence!=null?' '+data.confidence+'%':''),sx,sy);
+        toast('⚠️ '+data.name+' left early at '+data.time_out+(data.confidence!=null?' ('+data.confidence+'%)':''),'w');
+        successCount++; lastResult={...data,mode:'early'};
+      }else{
+        drawFaceCircle({x,y,width,height},'#a78bfa','✓ '+data.name+(data.confidence!=null?' '+data.confidence+'%':''),sx,sy);
+        toast('🚪 '+data.name+' checked out at '+data.time_out+(data.confidence!=null?' ('+data.confidence+'%)':''),'p');
+        successCount++; lastResult={...data,mode:'checkout'};
+      }
+    }else if(data.not_checked_in){
+      toast(data.name+' not checked in today','e');
+    }else if(!data.recognized){
+      drawFaceCircle({x,y,width,height},'#f87171','Unknown',sx,sy);
+      unknownCount++;
+      const snapshot=captureSnapshot({x,y,width,height});
+      const sr2=await fetch('/api/unknown-faces/save',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({image:snapshot})});
+      if(!sr2.ok){const sd2=await sr2.json();console.error('Save error:',sd2.error);}
+      if(unknownCount===1) showUnknown(snapshot);
+    }else{
+      toast(data.error||'Checkout failed','e');
+    }
+  }));
+
+  if(unknownCount>0){ loadUnkCount(); toast('❓ '+unknownCount+' unknown face'+(unknownCount>1?'s':'')+' captured','e'); }
+  if(successCount>0){ loadStats(); loadTable(); }
+  if(lastResult) showResult(lastResult);
+  else if(unknownCount>0 && !lastResult) setSt(unknownCount+' unknown face'+(unknownCount>1?'s':'')+' detected','bad');
+  else setSt(dets.length+' face'+(dets.length>1?'s':'')+' processed','ok');
 }
 
 // ── RESULT DISPLAY ────────────────────────────────────────────
