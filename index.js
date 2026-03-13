@@ -83,7 +83,6 @@ const MODEL_FILES    = [
   'ssd_mobilenetv1_model-weights_manifest.json','ssd_mobilenetv1_model-shard1','ssd_mobilenetv1_model-shard2',
   'face_landmark_68_model-weights_manifest.json','face_landmark_68_model-shard1',
   'face_recognition_model-weights_manifest.json','face_recognition_model-shard1','face_recognition_model-shard2',
-  'tiny_face_detector_model-weights_manifest.json','tiny_face_detector_model-shard1',
 ];
 const MODEL_BASE_URL = 'https://raw.githubusercontent.com/justadudewhohacks/face-api.js/master/weights/';
 
@@ -258,36 +257,21 @@ const CLIENT_SCRIPT = `
 const isMobile = /iPhone|iPad|iPod|Android/i.test(navigator.userAgent);
 
 async function safeLoadModels(modelUrl, statusFn) {
-  // Try SSD MobileNet first (best accuracy), fallback to TinyFaceDetector on mobile
   statusFn('Loading recognition models...');
-  try {
-    await faceapi.nets.faceRecognitionNet.loadFromUri(modelUrl);
-    await faceapi.nets.faceLandmark68Net.loadFromUri(modelUrl);
-    statusFn('Loading face detector...');
-    if (isMobile) {
-      // TinyFaceDetector is much smaller — avoids the shard tensor mismatch on mobile
-      await faceapi.nets.tinyFaceDetector.loadFromUri(modelUrl);
-      window._detectorType = 'tiny';
-    } else {
-      await faceapi.nets.ssdMobilenetv1.loadFromUri(modelUrl);
-      window._detectorType = 'ssd';
-    }
-    return true;
-  } catch(e) {
-    // Last resort: try tiny on desktop too
-    try {
-      await faceapi.nets.tinyFaceDetector.loadFromUri(modelUrl);
-      window._detectorType = 'tiny';
-      return true;
-    } catch(e2) {
-      throw new Error('Model load failed: ' + e2.message);
-    }
-  }
+  await faceapi.nets.faceRecognitionNet.loadFromUri(modelUrl);
+  await faceapi.nets.faceLandmark68Net.loadFromUri(modelUrl);
+  statusFn('Loading face detector...');
+  // Use SSD MobileNet on all devices
+  // Mobile fix: use lower minConfidence + smaller input to avoid tensor mismatch
+  await faceapi.nets.ssdMobilenetv1.loadFromUri(modelUrl);
+  window._detectorType = 'ssd';
+  return true;
 }
 
 function getDetectorOptions() {
-  if (window._detectorType === 'tiny') {
-    return new faceapi.TinyFaceDetectorOptions({ inputSize: 320, scoreThreshold: 0.5 });
+  // On mobile use lower minConfidence and limit input size for stability
+  if (isMobile) {
+    return new faceapi.SsdMobilenetv1Options({ minConfidence: 0.4 });
   }
   return new faceapi.SsdMobilenetv1Options({ minConfidence: 0.55 });
 }
