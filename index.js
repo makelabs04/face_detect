@@ -1918,30 +1918,36 @@ app.get('/api/unknown-faces', async (req, res) => {
     const { date, limit = 24, offset = 0 } = req.query;
     const today = new Date(new Date().toLocaleString('en-US', { timeZone: 'Asia/Kolkata' }));
     const todayStr = today.getFullYear() + '-' + String(today.getMonth()+1).padStart(2,'0') + '-' + String(today.getDate()).padStart(2,'0');
-    // Week start
     const weekStart = new Date(today);
     weekStart.setDate(today.getDate() - today.getDay());
     const weekStr = weekStart.getFullYear() + '-' + String(weekStart.getMonth()+1).padStart(2,'0') + '-' + String(weekStart.getDate()).padStart(2,'0');
 
+    // Use DATE(detected_at) as fallback — handles timezone mismatches in date column
     let sql = 'SELECT * FROM unknown_faces';
     const params = [];
-    if (date) { sql += ' WHERE date = ?'; params.push(date); }
+    if (date) {
+      sql += ' WHERE (date = ? OR DATE(detected_at) = ?)';
+      params.push(date, date);
+    }
     sql += ' ORDER BY detected_at DESC LIMIT ? OFFSET ?';
     params.push(parseInt(limit), parseInt(offset));
 
     const faces = await dbQuery(sql, params);
 
-    // Count queries
-    const totalRows  = await dbQuery(date ? 'SELECT COUNT(*) AS c FROM unknown_faces WHERE date=?' : 'SELECT COUNT(*) AS c FROM unknown_faces', date ? [date] : []);
-    const todayRows  = await dbQuery('SELECT COUNT(*) AS c FROM unknown_faces WHERE date=?', [todayStr]);
-    const weekRows   = await dbQuery('SELECT COUNT(*) AS c FROM unknown_faces WHERE date >= ?', [weekStr]);
+    const totalRows = await dbQuery(
+      date ? 'SELECT COUNT(*) AS c FROM unknown_faces WHERE (date=? OR DATE(detected_at)=?)' : 'SELECT COUNT(*) AS c FROM unknown_faces',
+      date ? [date, date] : []
+    );
+    const todayRows = await dbQuery(
+      'SELECT COUNT(*) AS c FROM unknown_faces WHERE (date=? OR DATE(detected_at)=?)',
+      [todayStr, todayStr]
+    );
+    const weekRows = await dbQuery(
+      'SELECT COUNT(*) AS c FROM unknown_faces WHERE (date >= ? OR DATE(detected_at) >= ?)',
+      [weekStr, weekStr]
+    );
 
-    res.json({
-      faces,
-      total:  totalRows[0].c,
-      today:  todayRows[0].c,
-      week:   weekRows[0].c,
-    });
+    res.json({ faces, total: totalRows[0].c, today: todayRows[0].c, week: weekRows[0].c });
   } catch(e) { res.status(500).json({ error: e.message }); }
 });
 
@@ -1955,22 +1961,7 @@ app.get('/api/unknown-faces/count', async (req, res) => {
   } catch(e) { res.status(500).json({ count: 0 }); }
 });
 
-// Delete single unknown face
-app.delete('/api/unknown-faces/:id', async (req, res) => {
-  try {
-    const rows = await dbQuery('SELECT image_file FROM unknown_faces WHERE id=?', [parseInt(req.params.id)]);
-    if (!rows.length) return res.status(404).json({ error: 'Not found' });
-    // Delete image file
-    if (rows[0].image_file) {
-      const fp = path.join(UNKNOWN_IMAGES_DIR, rows[0].image_file);
-      try { if (fs.existsSync(fp)) fs.unlinkSync(fp); } catch(_) {}
-    }
-    await dbQuery('DELETE FROM unknown_faces WHERE id=?', [parseInt(req.params.id)]);
-    res.json({ success: true });
-  } catch(e) { res.status(500).json({ error: e.message }); }
-});
-
-// Delete all unknown faces (optionally filtered by date)
+// Delete all unknown faces — MUST be before /:id route so "all" isn't treated as an ID
 app.delete('/api/unknown-faces/all', async (req, res) => {
   try {
     const { date } = req.query;
@@ -1995,6 +1986,20 @@ app.delete('/api/unknown-faces/all', async (req, res) => {
       await dbQuery('DELETE FROM unknown_faces');
     }
     res.json({ success: true, deleted: rows.length });
+  } catch(e) { res.status(500).json({ error: e.message }); }
+});
+
+// Delete single unknown face — MUST be after /all route
+app.delete('/api/unknown-faces/:id', async (req, res) => {
+  try {
+    const rows = await dbQuery('SELECT image_file FROM unknown_faces WHERE id=?', [parseInt(req.params.id)]);
+    if (!rows.length) return res.status(404).json({ error: 'Not found' });
+    if (rows[0].image_file) {
+      const fp = path.join(UNKNOWN_IMAGES_DIR, rows[0].image_file);
+      try { if (fs.existsSync(fp)) fs.unlinkSync(fp); } catch(_) {}
+    }
+    await dbQuery('DELETE FROM unknown_faces WHERE id=?', [parseInt(req.params.id)]);
+    res.json({ success: true });
   } catch(e) { res.status(500).json({ error: e.message }); }
 });
 
