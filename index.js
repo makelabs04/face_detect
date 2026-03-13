@@ -7,11 +7,14 @@ const path    = require('path');
 const app  = express();
 const PORT = process.env.PORT || 3000;
 
-app.use(express.json({ limit: '10mb' }));
+app.use(express.json({ limit: '20mb' }));  // increased for base64 image uploads
 app.use(express.urlencoded({ extended: true }));
 
 app.use('/models',    express.static(path.join(__dirname, 'public', 'models')));
 app.use('/faceapi.js',(req, res) => res.sendFile(path.join(__dirname, 'public', 'faceapi.js')));
+
+// Serve unknown face images
+app.use('/unknown-images', express.static(path.join(__dirname, 'public', 'unknown-images')));
 
 const DB_CONFIG = {
   host     : '127.0.0.1',
@@ -56,13 +59,26 @@ db.connect(err => {
       FOREIGN KEY (face_id) REFERENCES faces(id) ON DELETE CASCADE
     )
   `, err => { if (!err) console.log('✅ attendance table ready'); });
+
+  // NEW: unknown_faces table for tracking unknown detections + images
+  db.query(`
+    CREATE TABLE IF NOT EXISTS unknown_faces (
+      id           INT AUTO_INCREMENT PRIMARY KEY,
+      image_file   VARCHAR(255) DEFAULT NULL,
+      detected_at  DATETIME DEFAULT CURRENT_TIMESTAMP,
+      date         DATE NOT NULL,
+      time         TIME NOT NULL,
+      location     VARCHAR(100) DEFAULT ''
+    )
+  `, err => { if (!err) console.log('✅ unknown_faces table ready'); });
 });
 
 // ─── AUTO DOWNLOAD face-api.js + MODELS ──────────────────────────────────────
-const PUBLIC_DIR   = path.join(__dirname, 'public');
-const MODELS_DIR   = path.join(PUBLIC_DIR, 'models');
-const FACEAPI_PATH = path.join(PUBLIC_DIR, 'faceapi.js');
-const FACEAPI_URL  = 'https://unpkg.com/face-api.js@0.22.2/dist/face-api.min.js';
+const PUBLIC_DIR          = path.join(__dirname, 'public');
+const MODELS_DIR          = path.join(PUBLIC_DIR, 'models');
+const UNKNOWN_IMAGES_DIR  = path.join(PUBLIC_DIR, 'unknown-images');
+const FACEAPI_PATH        = path.join(PUBLIC_DIR, 'faceapi.js');
+const FACEAPI_URL         = 'https://unpkg.com/face-api.js@0.22.2/dist/face-api.min.js';
 const MODEL_FILES  = [
   'ssd_mobilenetv1_model-weights_manifest.json','ssd_mobilenetv1_model-shard1','ssd_mobilenetv1_model-shard2',
   'face_landmark_68_model-weights_manifest.json','face_landmark_68_model-shard1',
@@ -90,13 +106,28 @@ function download(url, dest) {
 }
 
 async function setup() {
-  if (!fs.existsSync(PUBLIC_DIR)) fs.mkdirSync(PUBLIC_DIR, { recursive: true });
-  if (!fs.existsSync(MODELS_DIR)) fs.mkdirSync(MODELS_DIR, { recursive: true });
+  if (!fs.existsSync(PUBLIC_DIR))         fs.mkdirSync(PUBLIC_DIR, { recursive: true });
+  if (!fs.existsSync(MODELS_DIR))         fs.mkdirSync(MODELS_DIR, { recursive: true });
+  if (!fs.existsSync(UNKNOWN_IMAGES_DIR)) fs.mkdirSync(UNKNOWN_IMAGES_DIR, { recursive: true });
+
   if (!fs.existsSync(FACEAPI_PATH)) {
     process.stdout.write('📥 Downloading face-api.js... ');
     try { await download(FACEAPI_URL, FACEAPI_PATH); console.log('✅'); }
     catch(e) { console.log('❌ ' + e.message); }
   } else { console.log('✅ face-api.js cached'); }
+
+  // Validate + fix corrupt model files
+  for (const f of MODEL_FILES) {
+    const fp = path.join(MODELS_DIR, f);
+    if (fs.existsSync(fp)) {
+      const stat = fs.statSync(fp);
+      if (stat.size < 100) {
+        console.log(`⚠️ Corrupt model file detected: ${f} (${stat.size} bytes) — re-downloading...`);
+        fs.unlinkSync(fp);
+      }
+    }
+  }
+
   const missing = MODEL_FILES.filter(f => !fs.existsSync(path.join(MODELS_DIR, f)));
   if (!missing.length) { console.log('✅ All models cached'); return; }
   console.log('📥 Downloading ' + missing.length + ' model files...');
@@ -109,31 +140,18 @@ async function setup() {
 }
 
 // ─── LED / BUZZER STATE ───────────────────────────────────────────────────────
-// Arduino polls GET /api/led/status every ~500 ms.
-// After each detection the server stores one pending command here.
 let pendingLedCommand = null;
 
-// Detection event  →  { led code, buzzer beeps }
-// LED codes:
-//   G  = GREEN solid  (present on-time)
-//   GL = GREEN blink  (late check-in)
-//   R  = RED   solid  (absent)
-//   RL = RED   blink  (early leave)
-//   RU = RED   blink  (unknown face)
-//   B  = BLUE  solid  (checkout normal)
-//   O  = BLUE  blink  (already checked in)
-//   OO = BLUE  blink  (already checked out)
-//   X  = OFF
 function getLedCommand(eventType) {
   const MAP = {
-    checkin_present:   { led: 'G',  buzzer: 1 },  // ✅ GREEN solid  + 1 beep
-    checkin_late:      { led: 'GL', buzzer: 1 },  // ⏰ GREEN blink  + 1 beep
-    checkin_absent:    { led: 'R',  buzzer: 2 },  // ❌ RED   solid  + 2 beeps
-    checkin_already:   { led: 'O',  buzzer: 3 },  // ⚠️ BLUE  blink  + 3 beeps
-    checkout_normal:   { led: 'B',  buzzer: 2 },  // 🚪 BLUE  solid  + 2 beeps
-    checkout_early:    { led: 'RL', buzzer: 2 },  // ⚠️ RED   blink  + 2 beeps
-    checkout_already:  { led: 'OO', buzzer: 3 },  // ⚠️ BLUE  blink  + 3 beeps
-    unknown:           { led: 'RU', buzzer: 5 },  // ❓ RED   blink  + 5 beeps
+    checkin_present:   { led: 'G',  buzzer: 1 },
+    checkin_late:      { led: 'GL', buzzer: 1 },
+    checkin_absent:    { led: 'R',  buzzer: 2 },
+    checkin_already:   { led: 'O',  buzzer: 3 },
+    checkout_normal:   { led: 'B',  buzzer: 2 },
+    checkout_early:    { led: 'RL', buzzer: 2 },
+    checkout_already:  { led: 'OO', buzzer: 3 },
+    unknown:           { led: 'RU', buzzer: 5 },
   };
   return MAP[eventType] || { led: 'X', buzzer: 0 };
 }
@@ -172,26 +190,20 @@ function fmtTime(t) {
 }
 
 // ─── OFFICE TIMING CONFIG ─────────────────────────────────────────────────────
-// Office starts 9:30 AM, 10 min grace → late after 9:40 AM
-// Office ends 6:10 PM (18:10)
-// After 11:00 AM check-in → marked absent
 const OFFICE_START   = { h: 9,  m: 30 };
 const GRACE_MINUTES  = 10;
 const OFFICE_END     = { h: 18, m: 10 };
-const ABSENT_AFTER   = { h: 11, m: 0 };   // 11:00 AM → absent
+const ABSENT_AFTER   = { h: 11, m: 0 };
 const THRESHOLD      = 0.5;
 const REGISTER_SAMPLES = 10;
 
-// Derived thresholds in total minutes
-const LATE_AFTER     = OFFICE_START.h * 60 + OFFICE_START.m + GRACE_MINUTES; // 580 = 9:40
-const CHECKOUT_FROM  = OFFICE_END.h   * 60 + OFFICE_END.m;                   // 1090 = 18:10
-const ABSENT_AFTER_MIN = ABSENT_AFTER.h * 60 + ABSENT_AFTER.m;               // 660 = 11:00
+const LATE_AFTER       = OFFICE_START.h * 60 + OFFICE_START.m + GRACE_MINUTES;
+const CHECKOUT_FROM    = OFFICE_END.h   * 60 + OFFICE_END.m;
+const ABSENT_AFTER_MIN = ABSENT_AFTER.h * 60 + ABSENT_AFTER.m;
 
-// Calculate expected checkout based on check-in time (min 8h work or office end whichever later)
 function calcExpectedCheckout(timeInStr) {
   const parts = timeInStr.split(':');
   const inMin = parseInt(parts[0]) * 60 + parseInt(parts[1]);
-  // Must work at least 8 hours OR leave at office end, whichever is later
   const byWorkHours = inMin + 8 * 60;
   const expected = Math.max(byWorkHours, CHECKOUT_FROM);
   const eh = Math.floor(expected / 60);
@@ -219,6 +231,18 @@ function calcWorkingMinutes(timeIn, timeOut) {
   return diff > 0 ? diff : 0;
 }
 
+// ─── STATUS LABEL HELPER ──────────────────────────────────────────────────────
+function statusLabel(s) {
+  const map = {
+    present:           '✅ Present',
+    late:              '⏰ Late',
+    early_leave:       '⚠️ Early Leave',
+    late_early_leave:  '🔴 Late + Early',
+    absent:            '❌ Absent',
+  };
+  return map[s] || s;
+}
+
 // ─── ATTENDANCE PAGE ──────────────────────────────────────────────────────────
 function getAttendanceHTML(todayRecords) {
   const rows = todayRecords.map(r => `
@@ -233,7 +257,7 @@ function getAttendanceHTML(todayRecords) {
 <html lang="en">
 <head>
 <meta charset="UTF-8"/>
-<meta name="viewport" content="width=device-width,initial-scale=1"/>
+<meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1"/>
 <title>Attendance System</title>
 <style>
 @import url('https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@300;400;500;600;700&family=JetBrains+Mono:wght@400;600&display=swap');
@@ -246,35 +270,38 @@ function getAttendanceHTML(todayRecords) {
 body{font-family:'Space Grotesk',sans-serif;background:var(--bg);color:var(--text);min-height:100vh;overflow-x:hidden}
 body::before{content:'';position:fixed;inset:0;background:radial-gradient(ellipse 80% 50% at 50% -10%,rgba(0,173,238,0.08),transparent);pointer-events:none;z-index:0}
 
-nav{position:sticky;top:0;z-index:100;background:rgba(255,255,255,0.96);backdrop-filter:blur(20px);border-bottom:1px solid var(--border);display:flex;align-items:center;justify-content:space-between;padding:0 32px;height:62px}
-.nav-left{display:flex;align-items:center;gap:16px}
-.nav-logo{font-family:'JetBrains Mono',monospace;font-size:1.05rem;font-weight:600;letter-spacing:2px}
+nav{position:sticky;top:0;z-index:100;background:rgba(255,255,255,0.96);backdrop-filter:blur(20px);border-bottom:1px solid var(--border);display:flex;align-items:center;justify-content:space-between;padding:0 16px;height:62px}
+.nav-left{display:flex;align-items:center;gap:10px}
+.nav-logo{font-family:'JetBrains Mono',monospace;font-size:1rem;font-weight:600;letter-spacing:2px}
 .nav-logo span{color:var(--accent)}
-.nav-date{font-family:'JetBrains Mono',monospace;font-size:0.72rem;color:var(--muted);background:var(--card);border:1px solid var(--border);padding:4px 12px;border-radius:20px}
-.nav-right{display:flex;align-items:center;gap:10px}
-.reg-btn{display:flex;align-items:center;gap:8px;background:linear-gradient(135deg,rgba(0,173,238,0.12),rgba(248,249,250,0.9));border:1px solid rgba(0,173,238,0.35);color:var(--text);font-family:'Space Grotesk',sans-serif;font-size:0.82rem;font-weight:600;padding:8px 18px;border-radius:10px;text-decoration:none;transition:all 0.2s}
+.nav-date{font-family:'JetBrains Mono',monospace;font-size:0.65rem;color:var(--muted);background:var(--card);border:1px solid var(--border);padding:4px 10px;border-radius:20px;display:none}
+@media(min-width:600px){.nav-date{display:block}}
+.nav-right{display:flex;align-items:center;gap:6px;flex-wrap:nowrap}
+.reg-btn{display:flex;align-items:center;gap:6px;background:linear-gradient(135deg,rgba(0,173,238,0.12),rgba(248,249,250,0.9));border:1px solid rgba(0,173,238,0.35);color:var(--text);font-family:'Space Grotesk',sans-serif;font-size:0.75rem;font-weight:600;padding:7px 12px;border-radius:10px;text-decoration:none;transition:all 0.2s;white-space:nowrap}
 .reg-btn:hover{background:linear-gradient(135deg,rgba(0,173,238,0.22),rgba(248,249,250,1));border-color:rgba(0,173,238,0.6);transform:translateY(-1px)}
-.live-dot{width:8px;height:8px;border-radius:50%;background:var(--accent2);animation:livepulse 2s infinite}
+.live-dot{width:8px;height:8px;border-radius:50%;background:var(--accent2);animation:livepulse 2s infinite;flex-shrink:0}
 @keyframes livepulse{0%,100%{opacity:1;transform:scale(1)}50%{opacity:0.5;transform:scale(1.3)}}
 
-main{position:relative;z-index:1;max-width:1400px;margin:0 auto;padding:28px 32px}
+main{position:relative;z-index:1;max-width:1400px;margin:0 auto;padding:16px}
 
-/* timing info bar */
-.timing-bar{display:flex;align-items:center;gap:10px;background:var(--card);border:1px solid var(--border);border-radius:12px;padding:10px 18px;margin-bottom:18px;flex-wrap:wrap}
-.timing-item{display:flex;align-items:center;gap:7px;font-size:0.78rem;color:var(--muted)}
-.timing-item strong{color:var(--text);font-family:'JetBrains Mono',monospace;font-size:0.8rem}
+.timing-bar{display:flex;align-items:center;gap:8px;background:var(--card);border:1px solid var(--border);border-radius:12px;padding:10px 14px;margin-bottom:14px;flex-wrap:wrap;gap:6px}
+.timing-item{display:flex;align-items:center;gap:6px;font-size:0.72rem;color:var(--muted)}
+.timing-item strong{color:var(--text);font-family:'JetBrains Mono',monospace;font-size:0.72rem}
 .timing-sep{color:var(--muted2);font-size:0.9rem}
 .timing-dot{width:6px;height:6px;border-radius:50%;flex-shrink:0}
 .td-green{background:var(--accent2)}.td-yellow{background:var(--yellow)}.td-orange{background:var(--orange)}.td-purple{background:var(--purple)}
 
-.stats-bar{display:grid;grid-template-columns:repeat(5,1fr);gap:12px;margin-bottom:22px}
-.stat{background:var(--card);border:1px solid var(--border);border-radius:14px;padding:16px 18px;position:relative;overflow:hidden;transition:border-color 0.2s}
+.stats-bar{display:grid;grid-template-columns:repeat(5,1fr);gap:10px;margin-bottom:16px}
+@media(max-width:600px){.stats-bar{grid-template-columns:repeat(3,1fr)}}
+@media(max-width:380px){.stats-bar{grid-template-columns:repeat(2,1fr)}}
+.stat{background:var(--card);border:1px solid var(--border);border-radius:14px;padding:12px 14px;position:relative;overflow:hidden;transition:border-color 0.2s}
 .stat:hover{border-color:var(--muted2)}
-.stat-val{font-family:'JetBrains Mono',monospace;font-size:1.9rem;font-weight:600;color:var(--accent);line-height:1}
+.stat-val{font-family:'JetBrains Mono',monospace;font-size:1.6rem;font-weight:600;color:var(--accent);line-height:1}
 .stat-val.green{color:var(--accent2)}.stat-val.red{color:var(--red)}.stat-val.yellow{color:var(--yellow)}.stat-val.orange{color:var(--orange)}.stat-val.purple{color:var(--purple)}
-.stat-label{font-size:0.67rem;color:var(--muted);text-transform:uppercase;letter-spacing:1.2px;margin-top:6px}
+.stat-label{font-size:0.62rem;color:var(--muted);text-transform:uppercase;letter-spacing:1px;margin-top:5px}
 
-.top-row{display:grid;grid-template-columns:1fr 400px;gap:20px;margin-bottom:22px}
+.top-row{display:grid;grid-template-columns:1fr 360px;gap:16px;margin-bottom:16px}
+@media(max-width:900px){.top-row{grid-template-columns:1fr}}
 
 .cam-card{background:var(--card);border:1px solid var(--border);border-radius:16px;overflow:hidden}
 .cam-wrap{position:relative;background:#f8f9fa;aspect-ratio:4/3}
@@ -282,86 +309,87 @@ main{position:relative;z-index:1;max-width:1400px;margin:0 auto;padding:28px 32p
 #overlay{position:absolute;inset:0;width:100%;height:100%;pointer-events:none}
 .scan-line{position:absolute;left:0;right:0;height:2px;background:linear-gradient(90deg,transparent,var(--accent),transparent);animation:scan 3s ease-in-out infinite;opacity:0.4;pointer-events:none}
 @keyframes scan{0%,100%{top:5%;opacity:0}10%{opacity:0.6}90%{opacity:0.6}50%{top:95%}}
-.cam-controls{padding:12px 14px;background:var(--surface);display:flex;gap:8px;align-items:center;flex-wrap:wrap}
-.cam-status{flex:1;display:flex;align-items:center;gap:8px;font-size:0.78rem;color:var(--muted);min-width:120px}
+.cam-controls{padding:10px 12px;background:var(--surface);display:flex;gap:6px;align-items:center;flex-wrap:wrap}
+.cam-status{flex:1;display:flex;align-items:center;gap:8px;font-size:0.74rem;color:var(--muted);min-width:100px}
 .sled{width:7px;height:7px;border-radius:50%;background:var(--muted);flex-shrink:0;transition:background 0.3s}
 .sled.pulse{background:var(--yellow);animation:blink 1s infinite}.sled.ok{background:var(--accent2)}.sled.bad{background:var(--red)}.sled.purple{background:var(--purple)}
 @keyframes blink{0%,100%{opacity:1}50%{opacity:0.2}}
-.btn{padding:9px 16px;border:none;border-radius:9px;font-family:'Space Grotesk',sans-serif;font-size:0.81rem;font-weight:600;cursor:pointer;transition:all 0.18s;white-space:nowrap}
+.btn{padding:8px 14px;border:none;border-radius:9px;font-family:'Space Grotesk',sans-serif;font-size:0.78rem;font-weight:600;cursor:pointer;transition:all 0.18s;white-space:nowrap}
 .btn:disabled{opacity:0.3;cursor:not-allowed}
 .btn-checkin{background:var(--accent);color:#fff}.btn-checkin:hover:not(:disabled){background:#009ed8;transform:translateY(-1px);box-shadow:0 4px 16px rgba(0,173,238,0.35)}
 .btn-checkout{background:rgba(0,173,238,0.08);border:1px solid rgba(0,173,238,0.25);color:var(--accent)}.btn-checkout:hover:not(:disabled){background:rgba(0,173,238,0.16);transform:translateY(-1px)}
 .btn-auto{background:rgba(52,211,153,0.1);border:1px solid rgba(52,211,153,0.25);color:var(--accent2)}.btn-auto:hover:not(:disabled){background:rgba(52,211,153,0.2)}
 .btn-auto.active{background:rgba(248,113,113,0.1);border-color:rgba(248,113,113,0.3);color:var(--red)}
 
-/* result panel */
-.result-card{background:var(--card);border:1px solid var(--border);border-radius:16px;padding:22px;display:flex;flex-direction:column;gap:16px}
-.result-title{font-family:'JetBrains Mono',monospace;font-size:0.65rem;letter-spacing:2px;color:var(--muted);text-transform:uppercase}
-.result-idle{display:flex;flex-direction:column;align-items:center;justify-content:center;min-height:210px;gap:12px;color:var(--muted);font-size:0.82rem;text-align:center;line-height:1.7}
+.result-card{background:var(--card);border:1px solid var(--border);border-radius:16px;padding:18px;display:flex;flex-direction:column;gap:14px}
+.result-title{font-family:'JetBrains Mono',monospace;font-size:0.62rem;letter-spacing:2px;color:var(--muted);text-transform:uppercase}
+.result-idle{display:flex;flex-direction:column;align-items:center;justify-content:center;min-height:180px;gap:12px;color:var(--muted);font-size:0.8rem;text-align:center;line-height:1.7}
 .result-idle svg{opacity:0.12}
-.recognized-box,.unknown-box{display:none;flex-direction:column;gap:14px}
-.r-face-row{display:flex;align-items:center;gap:14px}
-.r-av{width:52px;height:52px;border-radius:50%;background:linear-gradient(135deg,#f8f9fa,#eef3f8);display:flex;align-items:center;justify-content:center;font-size:1.3rem;font-weight:700;color:var(--accent);border:1px solid rgba(0,173,238,0.25);flex-shrink:0}
-.r-name{font-size:1.25rem;font-weight:700;margin-bottom:5px}
-.r-badge{display:inline-flex;align-items:center;gap:5px;padding:4px 12px;border-radius:100px;font-size:0.74rem;font-weight:600}
+.recognized-box,.unknown-box{display:none;flex-direction:column;gap:12px}
+.r-face-row{display:flex;align-items:center;gap:12px}
+.r-av{width:48px;height:48px;border-radius:50%;background:linear-gradient(135deg,#f8f9fa,#eef3f8);display:flex;align-items:center;justify-content:center;font-size:1.2rem;font-weight:700;color:var(--accent);border:1px solid rgba(0,173,238,0.25);flex-shrink:0}
+.r-name{font-size:1.1rem;font-weight:700;margin-bottom:4px}
+.r-badge{display:inline-flex;align-items:center;gap:5px;padding:4px 10px;border-radius:100px;font-size:0.72rem;font-weight:600}
 .rb-present{background:rgba(52,211,153,0.1);color:var(--accent2);border:1px solid rgba(52,211,153,0.2)}
 .rb-late{background:rgba(251,191,36,0.1);color:var(--yellow);border:1px solid rgba(251,191,36,0.2)}
 .rb-early{background:rgba(251,146,60,0.1);color:var(--orange);border:1px solid rgba(251,146,60,0.2)}
 .rb-already{background:rgba(0,173,238,0.1);color:var(--accent);border:1px solid rgba(0,173,238,0.2)}
 .rb-checkout{background:rgba(0,173,238,0.1);color:var(--accent);border:1px solid rgba(0,173,238,0.2)}
 .rb-unk{background:rgba(248,113,113,0.1);color:var(--red);border:1px solid rgba(248,113,113,0.2)}
-.r-grid{display:grid;grid-template-columns:1fr 1fr 1fr 1fr;gap:8px}
-.r-cell{background:var(--surface);border-radius:10px;padding:10px;text-align:center}
-.r-cell .rv{font-family:'JetBrains Mono',monospace;font-size:0.92rem;font-weight:600;color:var(--accent)}
-.r-cell .rk{font-size:0.6rem;color:var(--muted);text-transform:uppercase;letter-spacing:1px;margin-top:3px}
-.conf-bar{height:4px;border-radius:2px;background:var(--muted2);margin-top:6px;overflow:hidden}
+.r-grid{display:grid;grid-template-columns:1fr 1fr 1fr 1fr;gap:7px}
+.r-cell{background:var(--surface);border-radius:10px;padding:8px;text-align:center}
+.r-cell .rv{font-family:'JetBrains Mono',monospace;font-size:0.86rem;font-weight:600;color:var(--accent)}
+.r-cell .rk{font-size:0.58rem;color:var(--muted);text-transform:uppercase;letter-spacing:1px;margin-top:2px}
+.conf-bar{height:3px;border-radius:2px;background:var(--muted2);margin-top:5px;overflow:hidden}
 .conf-bar-fill{height:100%;border-radius:2px;transition:width 0.4s ease,background 0.4s ease}
-.unk-hint{font-size:0.8rem;color:var(--muted);line-height:1.6}
-.goto-reg{display:inline-flex;align-items:center;gap:7px;padding:10px 16px;background:linear-gradient(135deg,rgba(0,173,238,0.12),rgba(248,249,250,0.9));border:1px solid rgba(0,173,238,0.25);color:var(--accent);font-size:0.8rem;font-weight:600;border-radius:10px;text-decoration:none;transition:all 0.2s;font-family:'Space Grotesk',sans-serif}
+.unk-hint{font-size:0.78rem;color:var(--muted);line-height:1.6}
+.goto-reg{display:inline-flex;align-items:center;gap:7px;padding:9px 14px;background:linear-gradient(135deg,rgba(0,173,238,0.12),rgba(248,249,250,0.9));border:1px solid rgba(0,173,238,0.25);color:var(--accent);font-size:0.78rem;font-weight:600;border-radius:10px;text-decoration:none;transition:all 0.2s;font-family:'Space Grotesk',sans-serif}
 .goto-reg:hover{background:linear-gradient(135deg,rgba(0,173,238,0.2),rgba(248,249,250,1));transform:translateY(-1px)}
 
-/* table */
 .table-card{background:var(--card);border:1px solid var(--border);border-radius:16px;overflow:hidden}
-.table-head{display:flex;align-items:center;justify-content:space-between;padding:14px 20px;border-bottom:1px solid var(--border)}
-.table-head h3{font-family:'JetBrains Mono',monospace;font-size:0.7rem;letter-spacing:1.5px;color:var(--muted);text-transform:uppercase}
-.thr{display:flex;align-items:center;gap:10px}
-.cnt-pill{background:rgba(0,173,238,0.1);color:var(--accent);font-size:0.72rem;font-weight:600;padding:3px 10px;border-radius:12px;font-family:'JetBrains Mono',monospace}
-.search-inp{background:var(--surface);border:1px solid var(--border);border-radius:8px;padding:7px 12px;color:var(--text);font-family:'Space Grotesk',sans-serif;font-size:0.8rem;outline:none;width:170px;transition:border-color 0.2s}
+.table-head{display:flex;align-items:center;justify-content:space-between;padding:12px 16px;border-bottom:1px solid var(--border);flex-wrap:wrap;gap:8px}
+.table-head h3{font-family:'JetBrains Mono',monospace;font-size:0.65rem;letter-spacing:1.5px;color:var(--muted);text-transform:uppercase}
+.thr{display:flex;align-items:center;gap:8px;flex-wrap:wrap}
+.cnt-pill{background:rgba(0,173,238,0.1);color:var(--accent);font-size:0.7rem;font-weight:600;padding:3px 10px;border-radius:12px;font-family:'JetBrains Mono',monospace}
+.search-inp{background:var(--surface);border:1px solid var(--border);border-radius:8px;padding:6px 10px;color:var(--text);font-family:'Space Grotesk',sans-serif;font-size:0.78rem;outline:none;width:150px;transition:border-color 0.2s}
 .search-inp:focus{border-color:var(--accent)}.search-inp::placeholder{color:var(--muted)}
-.tbl-wrap{overflow-x:auto;max-height:420px;overflow-y:auto}
+.tbl-wrap{overflow-x:auto;max-height:400px;overflow-y:auto}
 .tbl-wrap::-webkit-scrollbar{width:3px;height:3px}.tbl-wrap::-webkit-scrollbar-thumb{background:var(--muted2);border-radius:2px}
 table{width:100%;border-collapse:collapse}
-thead th{padding:10px 16px;text-align:left;font-size:0.65rem;font-weight:600;color:var(--muted);text-transform:uppercase;letter-spacing:1px;background:var(--surface);border-bottom:1px solid var(--border);position:sticky;top:0;white-space:nowrap}
+thead th{padding:9px 14px;text-align:left;font-size:0.62rem;font-weight:600;color:var(--muted);text-transform:uppercase;letter-spacing:1px;background:var(--surface);border-bottom:1px solid var(--border);position:sticky;top:0;white-space:nowrap}
 tbody tr{border-bottom:1px solid rgba(207,216,227,0.8);transition:background 0.15s}
 tbody tr:last-child{border-bottom:none}
 tbody tr:hover{background:rgba(0,173,238,0.04)}
-td{padding:11px 16px;font-size:0.83rem;vertical-align:middle}
-.td-name{display:flex;align-items:center;gap:10px;font-weight:600}
-.td-av{width:30px;height:30px;border-radius:50%;background:linear-gradient(135deg,#f8f9fa,#eef3f8);display:flex;align-items:center;justify-content:center;font-size:0.8rem;font-weight:700;color:var(--accent);border:1px solid rgba(0,173,238,0.2);flex-shrink:0}
-.time-pill{font-family:'JetBrains Mono',monospace;font-size:0.77rem;background:rgba(0,173,238,0.08);color:var(--accent);padding:3px 10px;border-radius:20px;border:1px solid rgba(0,173,238,0.12)}
+td{padding:10px 14px;font-size:0.82rem;vertical-align:middle}
+.td-name{display:flex;align-items:center;gap:9px;font-weight:600}
+.td-av{width:28px;height:28px;border-radius:50%;background:linear-gradient(135deg,#f8f9fa,#eef3f8);display:flex;align-items:center;justify-content:center;font-size:0.75rem;font-weight:700;color:var(--accent);border:1px solid rgba(0,173,238,0.2);flex-shrink:0}
+.time-pill{font-family:'JetBrains Mono',monospace;font-size:0.74rem;background:rgba(0,173,238,0.08);color:var(--accent);padding:2px 9px;border-radius:20px;border:1px solid rgba(0,173,238,0.12)}
 .time-pill.out{background:rgba(0,173,238,0.08);color:var(--accent);border-color:rgba(0,173,238,0.12)}
-.badge{display:inline-flex;align-items:center;padding:3px 10px;border-radius:20px;font-size:0.68rem;font-weight:600;letter-spacing:0.3px;text-transform:uppercase;white-space:nowrap}
+.badge{display:inline-flex;align-items:center;padding:3px 9px;border-radius:20px;font-size:0.65rem;font-weight:600;letter-spacing:0.3px;text-transform:uppercase;white-space:nowrap}
 .badge-present{background:rgba(52,211,153,0.08);color:var(--accent2);border:1px solid rgba(52,211,153,0.18)}
 .badge-late{background:rgba(251,191,36,0.08);color:var(--yellow);border:1px solid rgba(251,191,36,0.18)}
 .badge-early_leave{background:rgba(251,146,60,0.08);color:var(--orange);border:1px solid rgba(251,146,60,0.18)}
 .badge-late_early_leave{background:rgba(248,113,113,0.08);color:var(--red);border:1px solid rgba(248,113,113,0.18)}
 .badge-absent{background:rgba(248,113,113,0.08);color:var(--red);border:1px solid rgba(248,113,113,0.18)}
-.tbl-empty{text-align:center;padding:50px;color:var(--muted);font-size:0.84rem}
+.tbl-empty{text-align:center;padding:40px;color:var(--muted);font-size:0.82rem}
 
-#loadOv{position:fixed;inset:0;background:rgba(255,255,255,0.97);display:flex;flex-direction:column;align-items:center;justify-content:center;gap:18px;z-index:999}
+#loadOv{position:fixed;inset:0;background:rgba(255,255,255,0.97);display:flex;flex-direction:column;align-items:center;justify-content:center;gap:16px;z-index:999;padding:20px}
 #loadOv.gone{display:none}
-.spin{width:46px;height:46px;border:2px solid var(--border);border-top-color:var(--accent);border-radius:50%;animation:spin 0.8s linear infinite}
+.spin{width:42px;height:42px;border:2px solid var(--border);border-top-color:var(--accent);border-radius:50%;animation:spin 0.8s linear infinite}
 @keyframes spin{to{transform:rotate(360deg)}}
-.load-sub{font-family:'JetBrains Mono',monospace;font-size:0.75rem;color:var(--muted);letter-spacing:1px;text-align:center}
-.load-h{font-size:1rem;font-weight:600}
-.load-err{font-size:0.8rem;color:var(--red);background:rgba(248,113,113,0.07);border:1px solid rgba(248,113,113,0.18);border-radius:10px;padding:12px 18px;max-width:360px;text-align:center;line-height:1.6;display:none}
+.load-sub{font-family:'JetBrains Mono',monospace;font-size:0.72rem;color:var(--muted);letter-spacing:1px;text-align:center}
+.load-h{font-size:0.95rem;font-weight:600}
+.load-err{font-size:0.78rem;color:var(--red);background:rgba(248,113,113,0.07);border:1px solid rgba(248,113,113,0.18);border-radius:10px;padding:12px 16px;max-width:320px;text-align:center;line-height:1.6;display:none}
 .load-err.show{display:block}
-.toast{position:fixed;bottom:24px;right:24px;padding:12px 20px;border-radius:12px;font-size:0.82rem;font-weight:600;opacity:0;transform:translateY(10px);transition:all 0.3s;z-index:500;pointer-events:none;max-width:340px}
+.load-retry{margin-top:6px;padding:8px 18px;background:var(--accent);color:#fff;border:none;border-radius:8px;font-family:'Space Grotesk',sans-serif;font-size:0.82rem;font-weight:600;cursor:pointer;display:none}
+.load-retry.show{display:block}
+.toast{position:fixed;bottom:20px;right:16px;left:16px;padding:11px 16px;border-radius:12px;font-size:0.8rem;font-weight:600;opacity:0;transform:translateY(10px);transition:all 0.3s;z-index:500;pointer-events:none}
+@media(min-width:500px){.toast{left:auto;max-width:340px}}
 .toast.show{opacity:1;transform:translateY(0)}
 .toast.s{background:rgba(52,211,153,0.93);color:#000}.toast.e{background:rgba(248,113,113,0.93);color:#fff}.toast.i{background:rgba(0,173,238,0.93);color:#fff}.toast.w{background:rgba(251,191,36,0.93);color:#000}.toast.p{background:rgba(0,173,238,0.93);color:#fff}
 
-@media(max-width:1000px){.top-row{grid-template-columns:1fr}.stats-bar{grid-template-columns:repeat(3,1fr)}main{padding:16px}}
-@media(max-width:600px){.stats-bar{grid-template-columns:1fr 1fr}}
+/* Unknown counter badge */
+.unk-badge{background:rgba(248,113,113,0.12);border:1px solid rgba(248,113,113,0.3);color:var(--red);padding:3px 8px;border-radius:10px;font-family:'JetBrains Mono',monospace;font-size:0.68rem;font-weight:700}
 </style>
 </head>
 <body>
@@ -371,6 +399,7 @@ td{padding:11px 16px;font-size:0.83rem;vertical-align:middle}
   <div class="load-h" id="loadTitle">Initializing</div>
   <div class="load-sub" id="loadMsg">Loading face recognition...</div>
   <div class="load-err" id="loadErr"></div>
+  <button class="load-retry" id="loadRetry" onclick="location.reload()">🔄 Retry</button>
 </div>
 
 <nav>
@@ -380,28 +409,28 @@ td{padding:11px 16px;font-size:0.83rem;vertical-align:middle}
   </div>
   <div class="nav-right">
     <div class="live-dot"></div>
+    <a class="reg-btn" href="/unknown-faces" style="background:rgba(248,113,113,0.08);border-color:rgba(248,113,113,0.3);color:var(--red)">
+      ❓ Unknown <span class="unk-badge" id="unkNavCount">0</span>
+    </a>
     <a class="reg-btn" href="/records" style="background:rgba(0,173,238,0.1);border-color:rgba(0,173,238,0.3);color:var(--accent)">
       📊 Records
     </a>
     <a class="reg-btn" href="/register">
-      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2"><path d="M16 21v-2a4 4 0 0 0-4-4H6a4 4 0 0 0-4 4v2"/><circle cx="9" cy="7" r="4"/><line x1="19" y1="8" x2="19" y2="14"/><line x1="22" y1="11" x2="16" y2="11"/></svg>
-      Register Face
+      <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2"><path d="M16 21v-2a4 4 0 0 0-4-4H6a4 4 0 0 0-4 4v2"/><circle cx="9" cy="7" r="4"/><line x1="19" y1="8" x2="19" y2="14"/><line x1="22" y1="11" x2="16" y2="11"/></svg>
+      Register
     </a>
   </div>
 </nav>
 
 <main>
-
   <div class="timing-bar">
     <div class="timing-item"><div class="timing-dot td-green"></div>On Time: before <strong>9:40 AM</strong></div>
     <div class="timing-sep">·</div>
-    <div class="timing-item"><div class="timing-dot td-yellow"></div>Late: after <strong>9:40 AM</strong> <span style="font-size:0.7rem;margin-left:4px">(9:30 + 10 min grace)</span></div>
+    <div class="timing-item"><div class="timing-dot td-yellow"></div>Late: after <strong>9:40 AM</strong></div>
     <div class="timing-sep">·</div>
-    <div class="timing-item"><div class="timing-dot td-purple"></div>Check-out from: <strong>6:10 PM</strong></div>
+    <div class="timing-item"><div class="timing-dot td-purple"></div>Checkout from: <strong>6:10 PM</strong></div>
     <div class="timing-sep">·</div>
-    <div class="timing-item"><div class="timing-dot td-orange"></div>Early leave: before <strong>6:10 PM</strong></div>
-    <div class="timing-sep">·</div>
-    <div class="timing-item"><div class="timing-dot" style="background:var(--red)"></div>Absent if check-in after <strong>11:00 AM</strong></div>
+    <div class="timing-item"><div class="timing-dot" style="background:var(--red)"></div>Absent after <strong>11:00 AM</strong></div>
   </div>
 
   <div class="stats-bar">
@@ -433,7 +462,7 @@ td{padding:11px 16px;font-size:0.83rem;vertical-align:middle}
     <div class="result-card">
       <div class="result-title">Recognition Result</div>
       <div class="result-idle" id="resultIdle">
-        <svg width="54" height="54" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.2">
+        <svg width="50" height="50" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.2">
           <circle cx="12" cy="8" r="4"/><path d="M6 20v-2a6 6 0 0 1 12 0v2"/>
           <path d="M16 3l2 2-4 4M8 3L6 5l4 4" opacity="0.5"/>
         </svg>
@@ -464,10 +493,16 @@ td{padding:11px 16px;font-size:0.83rem;vertical-align:middle}
       </div>
       <div class="unknown-box" id="unknownBox">
         <span class="r-badge rb-unk">❓ Unknown Person</span>
-        <div class="unk-hint">Face not found in the system. Register this person first to track attendance.</div>
+        <div class="unk-hint">Face not found in system. Image has been captured and saved. Register this person to track attendance.</div>
+        <div id="unkPreview" style="margin-top:4px;display:none">
+          <img id="unkPreviewImg" src="" style="width:100%;max-width:220px;border-radius:10px;border:1px solid var(--border)" />
+        </div>
         <a class="goto-reg" href="/register">
-          <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M16 21v-2a4 4 0 0 0-4-4H6a4 4 0 0 0-4 4v2"/><circle cx="9" cy="7" r="4"/><line x1="19" y1="8" x2="19" y2="14"/><line x1="22" y1="11" x2="16" y2="11"/></svg>
+          <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M16 21v-2a4 4 0 0 0-4-4H6a4 4 0 0 0-4 4v2"/><circle cx="9" cy="7" r="4"/><line x1="19" y1="8" x2="19" y2="14"/><line x1="22" y1="11" x2="16" y2="11"/></svg>
           Register This Person
+        </a>
+        <a class="goto-reg" href="/unknown-faces" style="background:rgba(248,113,113,0.08);border-color:rgba(248,113,113,0.25);color:var(--red)">
+          ❓ View All Unknown Faces
         </a>
       </div>
     </div>
@@ -497,9 +532,11 @@ td{padding:11px 16px;font-size:0.83rem;vertical-align:middle}
 <div class="toast" id="toast"></div>
 
 <script>
+// ── Mobile tensor fix: try CDN fallback if local model fails ──
 const MODEL_URL = '/models';
+const CDN_MODEL_URL = 'https://justadudewhohacks.github.io/face-api.js/models';
 const THRESHOLD = ${THRESHOLD};
-let isReady = false, autoOn = false, autoMode = 'checkin';
+let isReady = false, autoOn = false, modelsLoaded = false;
 const video   = document.getElementById('video');
 const overlay = document.getElementById('overlay');
 const ctx     = overlay.getContext('2d');
@@ -513,42 +550,81 @@ function showErr(msg){
   document.getElementById('loadMsg').style.display='none';
   document.querySelector('.spin').style.display='none';
   const el=document.getElementById('loadErr');el.textContent=msg;el.classList.add('show');
+  document.getElementById('loadRetry').classList.add('show');
 }
 function setLoad(t,m){document.getElementById('loadTitle').textContent=t;document.getElementById('loadMsg').textContent=m;}
 
 setLoad('Loading Library','Fetching face-api.js...');
 const sc=document.createElement('script');sc.src='/faceapi.js';
-sc.onload=init;sc.onerror=()=>showErr('Could not load face-api.js');
+sc.onload=init;sc.onerror=()=>showErr('Could not load face-api.js — check network connection');
 document.head.appendChild(sc);
+
+async function loadModels(baseUrl) {
+  await faceapi.nets.ssdMobilenetv1.loadFromUri(baseUrl);
+  await faceapi.nets.faceLandmark68Net.loadFromUri(baseUrl);
+  await faceapi.nets.faceRecognitionNet.loadFromUri(baseUrl);
+}
 
 async function init(){
   try{
-    setLoad('Checking Models','Verifying files...');
-    const probe=await fetch('/models/ssd_mobilenetv1_model-weights_manifest.json');
-    if(!probe.ok){showErr('Models not ready. Wait 30s and refresh.');return;}
+    setLoad('Verifying Models','Checking local files...');
+    let useUrl = MODEL_URL;
+    try {
+      const probe = await fetch('/models/ssd_mobilenetv1_model-weights_manifest.json');
+      if(!probe.ok) throw new Error('manifest not found');
+      // Check size to detect corrupt files
+      const mdata = await probe.json();
+      if (!mdata || !mdata.weightsManifest) throw new Error('invalid manifest');
+    } catch(e) {
+      console.warn('Local models issue, trying CDN fallback:', e.message);
+      useUrl = CDN_MODEL_URL;
+      setLoad('Loading from CDN','Local models unavailable, using CDN...');
+    }
+
     setLoad('Loading Models 1/3','SSD MobileNet...');
-    await faceapi.nets.ssdMobilenetv1.loadFromUri(MODEL_URL);
-    setLoad('Loading Models 2/3','Landmark net...');
-    await faceapi.nets.faceLandmark68Net.loadFromUri(MODEL_URL);
-    setLoad('Loading Models 3/3','Recognition net...');
-    await faceapi.nets.faceRecognitionNet.loadFromUri(MODEL_URL);
+    try {
+      await loadModels(useUrl);
+      modelsLoaded = true;
+    } catch(modelErr) {
+      if (useUrl !== CDN_MODEL_URL) {
+        console.warn('Local model load failed, trying CDN:', modelErr.message);
+        setLoad('Retrying via CDN','Local model corrupted, downloading fresh...');
+        // Tell server to re-download
+        try { await fetch('/api/models/refresh', {method:'POST'}); } catch(_){}
+        await loadModels(CDN_MODEL_URL);
+        modelsLoaded = true;
+      } else {
+        throw modelErr;
+      }
+    }
+
     setLoad('Starting Camera','Requesting access...');
     let stream;
-    try{stream=await navigator.mediaDevices.getUserMedia({video:{width:{ideal:640},height:{ideal:480},facingMode:'user'}});}
-    catch(e){showErr('Camera denied: '+e.message);return;}
+    try{
+      stream = await navigator.mediaDevices.getUserMedia({
+        video:{width:{ideal:640},height:{ideal:480},facingMode:'user'}
+      });
+    } catch(e){
+      showErr('Camera denied: '+e.message+'. Please allow camera access and reload.');
+      return;
+    }
     video.srcObject=stream;
     await new Promise(r=>video.onloadedmetadata=r);
     await video.play();
     await new Promise(r=>setTimeout(r,400));
-    overlay.width=video.videoWidth||640;overlay.height=video.videoHeight||480;
+    overlay.width=video.videoWidth||640;
+    overlay.height=video.videoHeight||480;
     document.getElementById('loadOv').classList.add('gone');
     isReady=true;
     document.getElementById('btnC').disabled=false;
     document.getElementById('btnCO').disabled=false;
     document.getElementById('btnA').disabled=false;
     setSt('Ready — use Check In or Check Out','ok');
-    loadStats();loadTable();
-  }catch(e){showErr(e.message);}
+    loadStats();loadTable();loadUnkCount();
+  }catch(e){
+    console.error('Init error:', e);
+    showErr('Load failed: '+e.message+'. Try refreshing or check if face-api models are downloaded.');
+  }
 }
 
 async function detectFace(){
@@ -557,21 +633,32 @@ async function detectFace(){
     .withFaceLandmarks().withFaceDescriptor();
 }
 
-// Draw circular face overlay + label above
+// Capture a snapshot of the video as base64 JPEG
+function captureSnapshot(box){
+  const snap = document.createElement('canvas');
+  const sw = video.videoWidth, sh = video.videoHeight;
+  // Crop around face with padding
+  const pad = 60;
+  const x = Math.max(0, (box ? box.x - pad : 0));
+  const y = Math.max(0, (box ? box.y - pad : 0));
+  const w = Math.min(sw, (box ? box.width + pad*2 : sw));
+  const h = Math.min(sh, (box ? box.height + pad*2 : sh));
+  snap.width = w; snap.height = h;
+  const sc2 = snap.getContext('2d');
+  sc2.drawImage(video, x, y, w, h, 0, 0, w, h);
+  return snap.toDataURL('image/jpeg', 0.75); // compress for storage
+}
+
 function drawFaceCircle(box, color, label, sx, sy){
   const cx = (box.x + box.width/2)  * sx;
   const cy = (box.y + box.height/2) * sy;
   const r  = Math.max(box.width, box.height) * 0.60 * ((sx+sy)/2);
-  // Outer glow ring
   ctx.beginPath(); ctx.arc(cx, cy, r+4, 0, Math.PI*2);
   ctx.strokeStyle = color+'33'; ctx.lineWidth = 6; ctx.stroke();
-  // Main circle
   ctx.beginPath(); ctx.arc(cx, cy, r, 0, Math.PI*2);
   ctx.strokeStyle = color; ctx.lineWidth = 2.5; ctx.stroke();
-  // Fill tint
   ctx.beginPath(); ctx.arc(cx, cy, r, 0, Math.PI*2);
   ctx.save(); ctx.globalAlpha = 0.06; ctx.fillStyle = color; ctx.fill(); ctx.restore();
-  // Label above circle
   if(label){
     const txtY = cy - r - 10;
     ctx.font = 'bold 13px Space Grotesk,sans-serif';
@@ -624,7 +711,17 @@ async function capture(){
     }
   }else if(!data.recognized){
     drawFaceCircle({x,y,width,height},'#f87171','Unknown',sx,sy);
-    setSt('Unknown face — not registered','bad');showUnknown();toast('Unknown — register first','e');
+    setSt('Unknown face — capturing & saving image...','bad');
+    // Auto-capture unknown face image
+    const snapshot = captureSnapshot({x,y,width,height});
+    const saveRes = await fetch('/api/unknown-faces/save', {
+      method:'POST', headers:{'Content-Type':'application/json'},
+      body: JSON.stringify({image: snapshot})
+    });
+    const saveData = await saveRes.json();
+    showUnknown(snapshot);
+    loadUnkCount();
+    toast('❓ Unknown face detected & captured','e');
   }else{
     toast(data.error||'Check-in failed','e');
   }
@@ -671,7 +768,15 @@ async function captureCheckout(){
     toast(data.name+' has no check-in today — check in first','e');
   }else if(!data.recognized){
     drawFaceCircle({x,y,width,height},'#f87171','Unknown',sx,sy);
-    setSt('Unknown face','bad');showUnknown();toast('Unknown — register first','e');
+    setSt('Unknown face — capturing...','bad');
+    const snapshot = captureSnapshot({x,y,width,height});
+    await fetch('/api/unknown-faces/save', {
+      method:'POST', headers:{'Content-Type':'application/json'},
+      body: JSON.stringify({image: snapshot})
+    });
+    showUnknown(snapshot);
+    loadUnkCount();
+    toast('❓ Unknown — register first','e');
   }else{
     toast(data.error||'Checkout failed','e');
   }
@@ -683,10 +788,16 @@ function showIdle(){
   document.getElementById('recognizedBox').style.display='none';
   document.getElementById('unknownBox').style.display='none';
 }
-function showUnknown(){
+function showUnknown(snapshot){
   document.getElementById('resultIdle').style.display='none';
   document.getElementById('recognizedBox').style.display='none';
   document.getElementById('unknownBox').style.display='flex';
+  if(snapshot){
+    const img = document.getElementById('unkPreviewImg');
+    const prev = document.getElementById('unkPreview');
+    img.src = snapshot;
+    prev.style.display = 'block';
+  }
 }
 function showResult(d){
   document.getElementById('resultIdle').style.display='none';
@@ -699,7 +810,6 @@ function showResult(d){
   const tOutEl=document.getElementById('rTimeOut');
   const tOutLbl=document.getElementById('rTimeOutLabel');
 
-  // Live match confidence
   const conf = d.confidence != null ? d.confidence : null;
   const confEl = document.getElementById('rConf');
   const confBar = document.getElementById('rConfBar');
@@ -713,7 +823,6 @@ function showResult(d){
     confEl.textContent='—'; confBar.style.width='0%'; confEl.style.color='var(--accent)';
   }
 
-  // Registration quality
   const regAcc = d.registered_accuracy != null ? d.registered_accuracy : null;
   const regEl  = document.getElementById('rRegAcc');
   const regBar = document.getElementById('rRegAccBar');
@@ -804,6 +913,13 @@ async function loadTable(){
   }catch(e){}
 }
 
+async function loadUnkCount(){
+  try{
+    const {count=0}=await(await fetch('/api/unknown-faces/count')).json();
+    document.getElementById('unkNavCount').textContent=count;
+  }catch(e){}
+}
+
 function filterTable(q){
   document.querySelectorAll('#attBody tr[data-name]').forEach(r=>{
     r.style.display=r.dataset.name.includes(q.toLowerCase())?'':'none';
@@ -815,23 +931,11 @@ function setSt(t,type){document.getElementById('st').textContent=t;const d=docum
 function toast(msg,type='i'){const t=document.getElementById('toast');t.textContent=msg;t.className='toast '+type+' show';clearTimeout(t._to);t._to=setTimeout(()=>t.classList.remove('show'),4000);}
 function esc(s){return String(s).replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));}
 
-loadStats();loadTable();
-setInterval(()=>{loadStats();loadTable();},30000);
+loadStats();loadTable();loadUnkCount();
+setInterval(()=>{loadStats();loadTable();loadUnkCount();},30000);
 </script>
 </body>
 </html>`;
-}
-
-// ─── STATUS LABEL HELPER ──────────────────────────────────────────────────────
-function statusLabel(s) {
-  const map = {
-    present:           '✅ Present',
-    late:              '⏰ Late',
-    early_leave:       '⚠️ Early Leave',
-    late_early_leave:  '🔴 Late + Early',
-    absent:            '❌ Absent',
-  };
-  return map[s] || s;
 }
 
 // ─── REGISTER PAGE ────────────────────────────────────────────────────────────
@@ -858,7 +962,7 @@ function getRegisterHTML(faces) {
 <html lang="en">
 <head>
 <meta charset="UTF-8"/>
-<meta name="viewport" content="width=device-width,initial-scale=1"/>
+<meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1"/>
 <title>Register Face — Attendance</title>
 <style>
 @import url('https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@300;400;500;600;700&family=JetBrains+Mono:wght@400;600&display=swap');
@@ -871,76 +975,76 @@ function getRegisterHTML(faces) {
 body{font-family:'Space Grotesk',sans-serif;background:var(--bg);color:var(--text);min-height:100vh;overflow-x:hidden}
 body::before{content:'';position:fixed;inset:0;background:radial-gradient(ellipse 60% 40% at 80% 20%,rgba(0,173,238,0.07),transparent),radial-gradient(ellipse 50% 50% at 20% 80%,rgba(0,173,238,0.05),transparent);pointer-events:none;z-index:0}
 
-nav{position:sticky;top:0;z-index:100;background:rgba(255,255,255,0.96);backdrop-filter:blur(20px);border-bottom:1px solid var(--border);display:flex;align-items:center;justify-content:space-between;padding:0 32px;height:62px}
-.nav-logo{font-family:'JetBrains Mono',monospace;font-size:1.05rem;font-weight:600;letter-spacing:2px}
+nav{position:sticky;top:0;z-index:100;background:rgba(255,255,255,0.96);backdrop-filter:blur(20px);border-bottom:1px solid var(--border);display:flex;align-items:center;justify-content:space-between;padding:0 16px;height:62px}
+.nav-logo{font-family:'JetBrains Mono',monospace;font-size:1rem;font-weight:600;letter-spacing:2px}
 .nav-logo span{color:var(--purple)}
-.nav-logo em{font-style:normal;font-family:'Space Grotesk',sans-serif;font-size:0.65rem;color:var(--muted);letter-spacing:1px;margin-left:8px;font-weight:400}
-.back-btn{display:flex;align-items:center;gap:8px;background:var(--card);border:1px solid var(--border);color:var(--muted);font-family:'Space Grotesk',sans-serif;font-size:0.82rem;font-weight:500;padding:8px 16px;border-radius:10px;text-decoration:none;transition:all 0.2s}
+.nav-logo em{font-style:normal;font-family:'Space Grotesk',sans-serif;font-size:0.62rem;color:var(--muted);letter-spacing:1px;margin-left:8px;font-weight:400}
+.back-btn{display:flex;align-items:center;gap:7px;background:var(--card);border:1px solid var(--border);color:var(--muted);font-family:'Space Grotesk',sans-serif;font-size:0.78rem;font-weight:500;padding:7px 12px;border-radius:10px;text-decoration:none;transition:all 0.2s;white-space:nowrap}
 .back-btn:hover{border-color:var(--accent);color:var(--text)}
 
-main{position:relative;z-index:1;max-width:1200px;margin:0 auto;padding:28px 32px;display:grid;grid-template-columns:420px 1fr;gap:24px}
+main{position:relative;z-index:1;max-width:1200px;margin:0 auto;padding:16px;display:grid;grid-template-columns:380px 1fr;gap:18px}
+@media(max-width:900px){main{grid-template-columns:1fr}}
 
-.left-col{display:flex;flex-direction:column;gap:16px}
+.left-col{display:flex;flex-direction:column;gap:14px}
 .cam-card{background:var(--card);border:1px solid var(--border);border-radius:16px;overflow:hidden}
 .cam-wrap{position:relative;background:#f8f9fa;aspect-ratio:4/3}
 #video{width:100%;height:100%;object-fit:cover;display:block}
 #overlay{position:absolute;inset:0;width:100%;height:100%;pointer-events:none}
-.corner{position:absolute;width:22px;height:22px;border-color:var(--purple);border-style:solid;opacity:0.6;pointer-events:none}
-.corner.tl{top:14px;left:14px;border-width:2px 0 0 2px}
-.corner.tr{top:14px;right:14px;border-width:2px 2px 0 0}
-.corner.bl{bottom:14px;left:14px;border-width:0 0 2px 2px}
-.corner.br{bottom:14px;right:14px;border-width:0 2px 2px 0}
-.cam-status{padding:10px 14px;background:var(--surface);border-top:1px solid var(--border);display:flex;align-items:center;gap:8px;font-size:0.78rem;color:var(--muted)}
+.corner{position:absolute;width:20px;height:20px;border-color:var(--purple);border-style:solid;opacity:0.6;pointer-events:none}
+.corner.tl{top:12px;left:12px;border-width:2px 0 0 2px}
+.corner.tr{top:12px;right:12px;border-width:2px 2px 0 0}
+.corner.bl{bottom:12px;left:12px;border-width:0 0 2px 2px}
+.corner.br{bottom:12px;right:12px;border-width:0 2px 2px 0}
+.cam-status{padding:9px 12px;background:var(--surface);border-top:1px solid var(--border);display:flex;align-items:center;gap:8px;font-size:0.75rem;color:var(--muted)}
 .sled{width:7px;height:7px;border-radius:50%;background:var(--muted);flex-shrink:0;transition:background 0.3s}
 .sled.pulse{background:var(--yellow);animation:blink 1s infinite}.sled.ok{background:var(--accent2)}.sled.bad{background:var(--red)}.sled.purple{background:var(--purple)}
 @keyframes blink{0%,100%{opacity:1}50%{opacity:0.2}}
 
-.form-card{background:var(--card);border:1px solid var(--border);border-radius:16px;padding:22px;display:flex;flex-direction:column;gap:15px}
-.form-title{font-family:'JetBrains Mono',monospace;font-size:0.67rem;letter-spacing:2px;color:var(--muted);text-transform:uppercase;padding-bottom:10px;border-bottom:1px solid var(--border)}
-.field{display:flex;flex-direction:column;gap:6px}
-.field label{font-size:0.73rem;color:var(--muted);font-weight:500}
+.form-card{background:var(--card);border:1px solid var(--border);border-radius:16px;padding:18px;display:flex;flex-direction:column;gap:13px}
+.form-title{font-family:'JetBrains Mono',monospace;font-size:0.64rem;letter-spacing:2px;color:var(--muted);text-transform:uppercase;padding-bottom:10px;border-bottom:1px solid var(--border)}
+.field{display:flex;flex-direction:column;gap:5px}
+.field label{font-size:0.7rem;color:var(--muted);font-weight:500}
 .field label span{color:var(--red)}
-.inp{background:var(--surface);border:1px solid var(--border);border-radius:10px;padding:10px 14px;color:var(--text);font-family:'Space Grotesk',sans-serif;font-size:0.87rem;outline:none;transition:border-color 0.2s;width:100%}
+.inp{background:var(--surface);border:1px solid var(--border);border-radius:10px;padding:10px 12px;color:var(--text);font-family:'Space Grotesk',sans-serif;font-size:0.85rem;outline:none;transition:border-color 0.2s;width:100%}
 .inp:focus{border-color:var(--purple)}.inp::placeholder{color:var(--muted)}
-.prog-label{font-size:0.72rem;color:var(--muted);font-family:'JetBrains Mono',monospace}
-.prog-track{background:var(--surface);border-radius:4px;height:4px;overflow:hidden;margin-top:5px}
+.prog-label{font-size:0.7rem;color:var(--muted);font-family:'JetBrains Mono',monospace}
+.prog-track{background:var(--surface);border-radius:4px;height:4px;overflow:hidden;margin-top:4px}
 .prog-fill{height:100%;background:linear-gradient(90deg,var(--purple),var(--accent));transition:width 0.3s;width:0}
-.reg-btn-main{width:100%;padding:12px;background:linear-gradient(135deg,rgba(0,173,238,0.14),rgba(248,249,250,0.95));border:1px solid rgba(0,173,238,0.35);color:var(--text);font-family:'Space Grotesk',sans-serif;font-size:0.88rem;font-weight:700;border-radius:12px;cursor:pointer;transition:all 0.2s;letter-spacing:0.3px;margin-top:2px}
+.reg-btn-main{width:100%;padding:12px;background:linear-gradient(135deg,rgba(0,173,238,0.14),rgba(248,249,250,0.95));border:1px solid rgba(0,173,238,0.35);color:var(--text);font-family:'Space Grotesk',sans-serif;font-size:0.86rem;font-weight:700;border-radius:12px;cursor:pointer;transition:all 0.2s;letter-spacing:0.3px;margin-top:2px}
 .reg-btn-main:hover:not(:disabled){background:linear-gradient(135deg,rgba(0,173,238,0.24),rgba(248,249,250,1));border-color:rgba(0,173,238,0.55);transform:translateY(-1px);box-shadow:0 4px 22px rgba(0,173,238,0.18)}
 .reg-btn-main:disabled{opacity:0.3;cursor:not-allowed}
 
 .right-col{}
 .list-card{background:var(--card);border:1px solid var(--border);border-radius:16px;overflow:hidden}
-.list-head{padding:16px 20px;border-bottom:1px solid var(--border);display:flex;align-items:center;justify-content:space-between}
-.list-head h3{font-family:'JetBrains Mono',monospace;font-size:0.7rem;letter-spacing:1.5px;color:var(--muted);text-transform:uppercase}
-.list-cnt{background:rgba(0,173,238,0.1);color:var(--accent);font-size:0.72rem;font-weight:700;padding:3px 10px;border-radius:12px;font-family:'JetBrains Mono',monospace}
-.list-scroll{overflow-y:auto;max-height:600px}
+.list-head{padding:14px 18px;border-bottom:1px solid var(--border);display:flex;align-items:center;justify-content:space-between}
+.list-head h3{font-family:'JetBrains Mono',monospace;font-size:0.67rem;letter-spacing:1.5px;color:var(--muted);text-transform:uppercase}
+.list-cnt{background:rgba(0,173,238,0.1);color:var(--accent);font-size:0.7rem;font-weight:700;padding:3px 10px;border-radius:12px;font-family:'JetBrains Mono',monospace}
+.list-scroll{overflow-y:auto;max-height:560px}
 .list-scroll::-webkit-scrollbar{width:3px}.list-scroll::-webkit-scrollbar-thumb{background:var(--muted2);border-radius:2px}
 table{width:100%;border-collapse:collapse}
-thead th{padding:9px 14px;text-align:left;font-size:0.65rem;font-weight:600;color:var(--muted);text-transform:uppercase;letter-spacing:1px;background:var(--surface);border-bottom:1px solid var(--border);position:sticky;top:0}
+thead th{padding:9px 12px;text-align:left;font-size:0.62rem;font-weight:600;color:var(--muted);text-transform:uppercase;letter-spacing:1px;background:var(--surface);border-bottom:1px solid var(--border);position:sticky;top:0}
 tbody tr{border-bottom:1px solid rgba(207,216,227,0.8);transition:background 0.15s}
 tbody tr:last-child{border-bottom:none}
 tbody tr:hover{background:rgba(0,173,238,0.04)}
-td{padding:10px 14px;font-size:0.82rem;vertical-align:middle}
-.td-name{display:flex;align-items:center;gap:10px;font-weight:600}
-.td-av{width:30px;height:30px;border-radius:50%;background:linear-gradient(135deg,#f8f9fa,#eef3f8);display:flex;align-items:center;justify-content:center;font-size:0.8rem;font-weight:700;color:var(--purple);border:1px solid rgba(0,173,238,0.2);flex-shrink:0}
-.del-btn{background:rgba(248,113,113,0.07);border:1px solid rgba(248,113,113,0.18);color:var(--red);font-size:0.72rem;font-weight:600;padding:4px 10px;border-radius:7px;cursor:pointer;font-family:'Space Grotesk',sans-serif;transition:all 0.2s}
+td{padding:9px 12px;font-size:0.8rem;vertical-align:middle}
+.td-name{display:flex;align-items:center;gap:9px;font-weight:600}
+.td-av{width:28px;height:28px;border-radius:50%;background:linear-gradient(135deg,#f8f9fa,#eef3f8);display:flex;align-items:center;justify-content:center;font-size:0.75rem;font-weight:700;color:var(--purple);border:1px solid rgba(0,173,238,0.2);flex-shrink:0}
+.del-btn{background:rgba(248,113,113,0.07);border:1px solid rgba(248,113,113,0.18);color:var(--red);font-size:0.7rem;font-weight:600;padding:4px 10px;border-radius:7px;cursor:pointer;font-family:'Space Grotesk',sans-serif;transition:all 0.2s}
 .del-btn:hover{background:rgba(248,113,113,0.18)}
-.list-empty{text-align:center;padding:44px 20px;color:var(--muted);font-size:0.82rem}
+.list-empty{text-align:center;padding:40px 20px;color:var(--muted);font-size:0.8rem}
 
-#loadOv{position:fixed;inset:0;background:rgba(255,255,255,0.97);display:flex;flex-direction:column;align-items:center;justify-content:center;gap:18px;z-index:999}
+#loadOv{position:fixed;inset:0;background:rgba(255,255,255,0.97);display:flex;flex-direction:column;align-items:center;justify-content:center;gap:16px;z-index:999;padding:20px}
 #loadOv.gone{display:none}
-.spin{width:46px;height:46px;border:2px solid var(--border);border-top-color:var(--purple);border-radius:50%;animation:spin 0.8s linear infinite}
+.spin{width:42px;height:42px;border:2px solid var(--border);border-top-color:var(--purple);border-radius:50%;animation:spin 0.8s linear infinite}
 @keyframes spin{to{transform:rotate(360deg)}}
-.load-sub{font-family:'JetBrains Mono',monospace;font-size:0.75rem;color:var(--muted);letter-spacing:1px}
-.load-h{font-size:1rem;font-weight:600}
-.load-err{font-size:0.8rem;color:var(--red);background:rgba(248,113,113,0.07);border:1px solid rgba(248,113,113,0.18);border-radius:10px;padding:12px 18px;max-width:360px;text-align:center;line-height:1.6;display:none}
+.load-sub{font-family:'JetBrains Mono',monospace;font-size:0.72rem;color:var(--muted);letter-spacing:1px;text-align:center}
+.load-h{font-size:0.95rem;font-weight:600}
+.load-err{font-size:0.78rem;color:var(--red);background:rgba(248,113,113,0.07);border:1px solid rgba(248,113,113,0.18);border-radius:10px;padding:12px 16px;max-width:320px;text-align:center;line-height:1.6;display:none}
 .load-err.show{display:block}
-.toast{position:fixed;bottom:24px;right:24px;padding:12px 20px;border-radius:12px;font-size:0.82rem;font-weight:600;opacity:0;transform:translateY(10px);transition:all 0.3s;z-index:500;pointer-events:none;max-width:320px}
+.toast{position:fixed;bottom:20px;right:16px;left:16px;padding:11px 16px;border-radius:12px;font-size:0.8rem;font-weight:600;opacity:0;transform:translateY(10px);transition:all 0.3s;z-index:500;pointer-events:none}
+@media(min-width:500px){.toast{left:auto;max-width:320px}}
 .toast.show{opacity:1;transform:translateY(0)}
 .toast.s{background:rgba(52,211,153,0.93);color:#000}.toast.e{background:rgba(248,113,113,0.93);color:#fff}.toast.i{background:rgba(0,173,238,0.93);color:#fff}
-
-@media(max-width:900px){main{grid-template-columns:1fr}main{padding:16px}}
 </style>
 </head>
 <body>
@@ -953,11 +1057,12 @@ td{padding:10px 14px;font-size:0.82rem;vertical-align:middle}
 
 <nav>
   <div class="nav-logo">ATTEND<span>.</span>AI <em>/ Register</em></div>
-  <div style="display:flex;gap:10px">
+  <div style="display:flex;gap:8px">
+    <a class="back-btn" href="/unknown-faces" style="border-color:rgba(248,113,113,0.3);color:var(--red)">❓ Unknown</a>
     <a class="back-btn" href="/records" style="border-color:rgba(0,173,238,0.3);color:var(--accent)">📊 Records</a>
     <a class="back-btn" href="/">
-      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M19 12H5M12 5l-7 7 7 7"/></svg>
-      Back to Attendance
+      <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M19 12H5M12 5l-7 7 7 7"/></svg>
+      Back
     </a>
   </div>
 </nav>
@@ -1010,7 +1115,7 @@ td{padding:10px 14px;font-size:0.82rem;vertical-align:middle}
         <table>
           <thead><tr><th>Name</th><th>DB ID</th><th>Emp ID</th><th>Dept</th><th>Reg. Quality</th><th>Registered</th><th></th></tr></thead>
           <tbody id="facesTbody">
-            ${rows || '<tr><td colspan="6" class="list-empty">No faces registered yet.<br/>Use the camera on the left to enroll people.</td></tr>'}
+            ${rows || '<tr><td colspan="7" class="list-empty">No faces registered yet.<br/>Use the camera on the left to enroll people.</td></tr>'}
           </tbody>
         </table>
       </div>
@@ -1022,6 +1127,7 @@ td{padding:10px 14px;font-size:0.82rem;vertical-align:middle}
 
 <script>
 const MODEL_URL   = '/models';
+const CDN_MODEL_URL = 'https://justadudewhohacks.github.io/face-api.js/models';
 const REG_SAMPLES = ${REGISTER_SAMPLES};
 let isReady = false;
 const video   = document.getElementById('video');
@@ -1056,12 +1162,30 @@ document.head.appendChild(sc);
 
 async function init(){
   try{
-    setLoad('Loading Models','Starting up...');
-    const probe=await fetch('/models/ssd_mobilenetv1_model-weights_manifest.json');
-    if(!probe.ok){showErr('Models not ready. Wait and refresh.');return;}
-    await faceapi.nets.ssdMobilenetv1.loadFromUri(MODEL_URL);
-    await faceapi.nets.faceLandmark68Net.loadFromUri(MODEL_URL);
-    await faceapi.nets.faceRecognitionNet.loadFromUri(MODEL_URL);
+    setLoad('Verifying Models','Checking files...');
+    let useUrl = MODEL_URL;
+    try {
+      const probe = await fetch('/models/ssd_mobilenetv1_model-weights_manifest.json');
+      if(!probe.ok) throw new Error('not found');
+      const mdata = await probe.json();
+      if (!mdata || !mdata.weightsManifest) throw new Error('invalid');
+    } catch(e) {
+      useUrl = CDN_MODEL_URL;
+      setLoad('Using CDN Fallback','Local models unavailable...');
+    }
+    setLoad('Loading Models','Please wait...');
+    try {
+      await faceapi.nets.ssdMobilenetv1.loadFromUri(useUrl);
+      await faceapi.nets.faceLandmark68Net.loadFromUri(useUrl);
+      await faceapi.nets.faceRecognitionNet.loadFromUri(useUrl);
+    } catch(e) {
+      if(useUrl !== CDN_MODEL_URL){
+        setLoad('CDN Fallback','Local model corrupted...');
+        await faceapi.nets.ssdMobilenetv1.loadFromUri(CDN_MODEL_URL);
+        await faceapi.nets.faceLandmark68Net.loadFromUri(CDN_MODEL_URL);
+        await faceapi.nets.faceRecognitionNet.loadFromUri(CDN_MODEL_URL);
+      } else { throw e; }
+    }
     let stream;
     try{stream=await navigator.mediaDevices.getUserMedia({video:{width:{ideal:640},height:{ideal:480},facingMode:'user'}});}
     catch(e){showErr('Camera denied: '+e.message);return;}
@@ -1083,7 +1207,6 @@ async function detectFace(){
     .withFaceLandmarks().withFaceDescriptor();
 }
 
-// Draw circle overlay on registration canvas
 function drawRegCircle(box, color, label, sx, sy){
   const cx = (box.x + box.width/2)  * sx;
   const cy = (box.y + box.height/2) * sy;
@@ -1116,7 +1239,7 @@ async function registerFace(){
   btn.disabled=true;btn.textContent='⏳ Capturing...';
   setSt('Capturing samples — hold still...','purple');
   const descs=[];
-  const detScores=[];  // face detection confidence scores per sample
+  const detScores=[];
   for(let i=0;i<REG_SAMPLES;i++){
     pL.textContent='Sample '+(i+1)+'/'+REG_SAMPLES+' — hold still...';
     pB.style.width=(i/REG_SAMPLES*100)+'%';
@@ -1125,7 +1248,6 @@ async function registerFace(){
     if(!det){await new Promise(r=>setTimeout(r,500));det=await detectFace();}
     if(det){
       const score = det.detection.score || 0;
-      // Only keep high-quality samples (score >= 0.65)
       if(score >= 0.65){
         descs.push(Array.from(det.descriptor));
         detScores.push(score);
@@ -1139,7 +1261,7 @@ async function registerFace(){
       } else {
         const pct=Math.round(score*100);
         pL.textContent='Sample '+(i+1)+'/'+REG_SAMPLES+' — quality too low ('+pct+'%), retrying...';
-        i--; // retry this sample
+        i--;
         await new Promise(r=>setTimeout(r,300));
       }
     } else {
@@ -1148,18 +1270,15 @@ async function registerFace(){
   }
   pB.style.width='100%';
   if(descs.length < 3){
-    toast('Only '+descs.length+' sample(s) captured — need at least 3. Move closer and retry','e');
+    toast('Only '+descs.length+' sample(s) — need at least 3. Move closer and retry','e');
     pL.textContent='Too few samples — move closer, ensure good lighting, and retry';
     setSt('Not enough samples captured','bad');btn.disabled=false;btn.textContent='📸 Capture & Register Face';pB.style.width='0';return;
   }
-  // Registration accuracy = average of detection confidence scores
   const avgScore = detScores.reduce((a,b)=>a+b,0)/detScores.length;
   const registration_accuracy = Math.round(avgScore*100);
-
-  pL.textContent='Got '+descs.length+'/'+REG_SAMPLES+' samples | Reg. Quality: '+registration_accuracy+'% — saving...';
+  pL.textContent='Got '+descs.length+'/'+REG_SAMPLES+' samples | Quality: '+registration_accuracy+'% — saving...';
   const res=await fetch('/api/register',{
     method:'POST',headers:{'Content-Type':'application/json'},
-    // Send all descriptors (array of arrays) for better multi-pose matching
     body:JSON.stringify({label:name,employee_id:empid,department:dept,descriptors:descs,registration_accuracy})
   });
   const data=await res.json();
@@ -1224,6 +1343,490 @@ function esc(s){return String(s).replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;',
 </html>`;
 }
 
+// ─── UNKNOWN FACES PAGE ───────────────────────────────────────────────────────
+function getUnknownFacesHTML() {
+  return `<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8"/>
+<meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1"/>
+<title>Unknown Faces — Attendance</title>
+<style>
+@import url('https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@300;400;500;600;700&family=JetBrains+Mono:wght@400;600&display=swap');
+:root{
+  --bg:#ffffff;--surface:#f8f9fa;--card:#ffffff;--border:#dbe3ea;
+  --accent:#00adee;--accent2:#34d399;--red:#f87171;--yellow:#fbbf24;
+  --orange:#fb923c;--text:#1f2937;--muted:#6b7280;--muted2:#cfd8e3;
+}
+*{box-sizing:border-box;margin:0;padding:0}
+body{font-family:'Space Grotesk',sans-serif;background:var(--bg);color:var(--text);min-height:100vh}
+body::before{content:'';position:fixed;inset:0;background:radial-gradient(ellipse 80% 50% at 50% -10%,rgba(248,113,113,0.06),transparent);pointer-events:none;z-index:0}
+
+nav{position:sticky;top:0;z-index:100;background:rgba(255,255,255,0.96);backdrop-filter:blur(20px);border-bottom:1px solid var(--border);display:flex;align-items:center;justify-content:space-between;padding:0 16px;height:62px}
+.nav-logo{font-family:'JetBrains Mono',monospace;font-size:1rem;font-weight:600;letter-spacing:2px}
+.nav-logo span{color:var(--red)}
+.nav-right{display:flex;gap:8px}
+.nav-link{display:flex;align-items:center;gap:7px;background:var(--card);border:1px solid var(--border);color:var(--muted);font-family:'Space Grotesk',sans-serif;font-size:0.78rem;font-weight:500;padding:7px 12px;border-radius:10px;text-decoration:none;transition:all 0.2s;white-space:nowrap}
+.nav-link:hover{border-color:var(--accent);color:var(--text)}
+
+main{position:relative;z-index:1;max-width:1400px;margin:0 auto;padding:20px 16px}
+
+.top-bar{display:flex;align-items:center;justify-content:space-between;margin-bottom:20px;flex-wrap:wrap;gap:12px}
+.top-bar h2{font-size:1.2rem;font-weight:700}
+.top-bar h2 em{color:var(--red);font-style:normal}
+.actions{display:flex;gap:8px;align-items:center;flex-wrap:wrap}
+.btn-del-all{padding:8px 16px;background:rgba(248,113,113,0.08);border:1px solid rgba(248,113,113,0.25);color:var(--red);font-family:'Space Grotesk',sans-serif;font-size:0.8rem;font-weight:600;border-radius:9px;cursor:pointer;transition:all 0.18s}
+.btn-del-all:hover{background:rgba(248,113,113,0.18)}
+.filter-row{display:flex;gap:8px;align-items:center;flex-wrap:wrap}
+.filter-inp{background:var(--surface);border:1px solid var(--border);border-radius:8px;padding:8px 12px;color:var(--text);font-family:'Space Grotesk',sans-serif;font-size:0.8rem;outline:none;transition:border-color 0.2s}
+.filter-inp:focus{border-color:var(--accent)}.filter-inp::placeholder{color:var(--muted)}
+
+/* Stats row */
+.stats-row{display:grid;grid-template-columns:repeat(3,1fr);gap:12px;margin-bottom:20px}
+@media(max-width:500px){.stats-row{grid-template-columns:1fr 1fr}}
+.stat-card{background:var(--card);border:1px solid var(--border);border-radius:12px;padding:14px}
+.stat-val{font-family:'JetBrains Mono',monospace;font-size:1.6rem;font-weight:600;color:var(--red);line-height:1}
+.stat-val.today{color:var(--orange)}
+.stat-val.week{color:var(--yellow)}
+.stat-lbl{font-size:0.62rem;color:var(--muted);text-transform:uppercase;letter-spacing:1px;margin-top:5px}
+
+/* Grid of face cards */
+.faces-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(200px,1fr));gap:14px}
+@media(max-width:500px){.faces-grid{grid-template-columns:repeat(auto-fill,minmax(160px,1fr))}}
+
+.face-card{background:var(--card);border:1px solid var(--border);border-radius:14px;overflow:hidden;transition:all 0.2s;position:relative}
+.face-card:hover{border-color:rgba(248,113,113,0.4);box-shadow:0 4px 20px rgba(248,113,113,0.1)}
+.face-img-wrap{aspect-ratio:1;overflow:hidden;background:var(--surface);position:relative}
+.face-img-wrap img{width:100%;height:100%;object-fit:cover;display:block}
+.face-img-wrap .no-img{display:flex;align-items:center;justify-content:center;width:100%;height:100%;font-size:2rem;opacity:0.3}
+.face-info{padding:10px 12px}
+.face-time{font-family:'JetBrains Mono',monospace;font-size:0.72rem;color:var(--accent);font-weight:600}
+.face-date{font-size:0.68rem;color:var(--muted);margin-top:2px}
+.face-del{position:absolute;top:6px;right:6px;width:26px;height:26px;border-radius:50%;background:rgba(248,113,113,0.85);border:none;color:#fff;font-size:0.8rem;cursor:pointer;display:flex;align-items:center;justify-content:center;opacity:0;transition:opacity 0.2s;line-height:1}
+.face-card:hover .face-del{opacity:1}
+.face-badge{position:absolute;top:6px;left:6px;background:rgba(248,113,113,0.85);color:#fff;font-size:0.62rem;font-weight:700;padding:2px 7px;border-radius:10px;font-family:'JetBrains Mono',monospace}
+
+.empty-state{text-align:center;padding:80px 20px;color:var(--muted)}
+.empty-state svg{opacity:0.12;margin-bottom:16px}
+.empty-state p{font-size:0.9rem;line-height:1.7}
+
+.load-more{margin:20px auto;display:block;padding:10px 28px;background:var(--surface);border:1px solid var(--border);color:var(--text);font-family:'Space Grotesk',sans-serif;font-size:0.82rem;font-weight:600;border-radius:10px;cursor:pointer;transition:all 0.2s}
+.load-more:hover{border-color:var(--accent);color:var(--accent)}
+
+.toast{position:fixed;bottom:20px;right:16px;left:16px;padding:11px 16px;border-radius:12px;font-size:0.8rem;font-weight:600;opacity:0;transform:translateY(10px);transition:all 0.3s;z-index:500;pointer-events:none}
+@media(min-width:500px){.toast{left:auto;max-width:320px}}
+.toast.show{opacity:1;transform:translateY(0)}
+.toast.s{background:rgba(52,211,153,0.93);color:#000}.toast.e{background:rgba(248,113,113,0.93);color:#fff}.toast.i{background:rgba(0,173,238,0.93);color:#fff}
+
+/* Lightbox */
+.lb{position:fixed;inset:0;background:rgba(0,0,0,0.85);z-index:900;display:none;align-items:center;justify-content:center;padding:20px}
+.lb.open{display:flex}
+.lb-img{max-width:90vw;max-height:90vh;border-radius:12px;box-shadow:0 20px 60px rgba(0,0,0,0.5)}
+.lb-close{position:fixed;top:16px;right:16px;width:36px;height:36px;border-radius:50%;background:rgba(255,255,255,0.2);border:none;color:#fff;font-size:1.2rem;cursor:pointer;display:flex;align-items:center;justify-content:center}
+.lb-close:hover{background:rgba(255,255,255,0.35)}
+</style>
+</head>
+<body>
+
+<nav>
+  <div class="nav-logo">ATTEND<span>.</span>AI <span style="color:var(--muted);font-size:0.65rem;font-family:'Space Grotesk',sans-serif;font-weight:400;letter-spacing:1px;margin-left:6px">/ Unknown Faces</span></div>
+  <div class="nav-right">
+    <a href="/" class="nav-link">📋 Attendance</a>
+    <a href="/records" class="nav-link">📊 Records</a>
+    <a href="/register" class="nav-link">👤 Register</a>
+  </div>
+</nav>
+
+<main>
+  <div class="top-bar">
+    <h2>❓ Unknown <em>Faces</em> Detected</h2>
+    <div class="actions">
+      <div class="filter-row">
+        <input type="date" id="fDate" class="filter-inp" placeholder="Filter by date" onchange="loadFaces()"/>
+        <button class="btn-del-all" onclick="deleteAll()">🗑 Clear All</button>
+      </div>
+    </div>
+  </div>
+
+  <div class="stats-row">
+    <div class="stat-card"><div class="stat-val" id="statTotal">—</div><div class="stat-lbl">Total Unknown</div></div>
+    <div class="stat-card"><div class="stat-val today" id="statToday">—</div><div class="stat-lbl">Today</div></div>
+    <div class="stat-card"><div class="stat-val week" id="statWeek">—</div><div class="stat-lbl">This Week</div></div>
+  </div>
+
+  <div class="faces-grid" id="facesGrid">
+    <div style="grid-column:1/-1;text-align:center;padding:50px;color:var(--muted)">Loading...</div>
+  </div>
+  <button class="load-more" id="loadMoreBtn" onclick="loadMore()" style="display:none">Load More</button>
+</main>
+
+<!-- Lightbox -->
+<div class="lb" id="lb" onclick="closeLb()">
+  <button class="lb-close" onclick="closeLb()">✕</button>
+  <img class="lb-img" id="lbImg" src="" alt="Unknown Face"/>
+</div>
+
+<div class="toast" id="toast"></div>
+
+<script>
+let page = 0;
+const PER_PAGE = 24;
+let totalCount = 0;
+
+async function loadFaces(reset = true) {
+  if(reset) { page = 0; document.getElementById('facesGrid').innerHTML = '<div style="grid-column:1/-1;text-align:center;padding:50px;color:var(--muted)">Loading...</div>'; }
+  const date = document.getElementById('fDate').value;
+  const params = new URLSearchParams({limit: PER_PAGE, offset: page * PER_PAGE});
+  if(date) params.set('date', date);
+  try {
+    const {faces=[], total=0, today=0, week=0} = await(await fetch('/api/unknown-faces?'+params)).json();
+    totalCount = total;
+    document.getElementById('statTotal').textContent = total;
+    document.getElementById('statToday').textContent = today;
+    document.getElementById('statWeek').textContent  = week;
+
+    if(reset) document.getElementById('facesGrid').innerHTML = '';
+    const grid = document.getElementById('facesGrid');
+
+    if(!faces.length && page === 0){
+      grid.innerHTML = \`<div class="empty-state" style="grid-column:1/-1">
+        <svg width="60" height="60" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.2">
+          <circle cx="12" cy="8" r="4"/><path d="M6 20v-2a6 6 0 0 1 12 0v2"/><path d="M18 8l4 4-4 4" opacity="0.3"/>
+        </svg>
+        <p>No unknown faces detected yet.<br/>Unknown visitors will appear here automatically<br/>when the system detects an unregistered face.</p>
+      </div>\`;
+      document.getElementById('loadMoreBtn').style.display = 'none';
+      return;
+    }
+
+    faces.forEach(f => {
+      const card = document.createElement('div');
+      card.className = 'face-card';
+      card.dataset.id = f.id;
+      const imgContent = f.image_file
+        ? \`<img src="/unknown-images/\${f.image_file}" alt="Unknown" loading="lazy" onclick="openLb(this.src)" style="cursor:zoom-in"/>\`
+        : \`<div class="no-img">👤</div>\`;
+      const dt = new Date(f.detected_at);
+      const timeStr = dt.toLocaleTimeString('en-IN',{hour:'2-digit',minute:'2-digit',hour12:true});
+      const dateStr = dt.toLocaleDateString('en-IN',{day:'2-digit',month:'short',year:'numeric'});
+      card.innerHTML = \`
+        <div class="face-img-wrap">\${imgContent}</div>
+        <span class="face-badge">#\${f.id}</span>
+        <button class="face-del" onclick="delFace(\${f.id},this)" title="Delete">✕</button>
+        <div class="face-info">
+          <div class="face-time">\${timeStr}</div>
+          <div class="face-date">\${dateStr}</div>
+        </div>
+      \`;
+      grid.appendChild(card);
+    });
+
+    const shown = (page + 1) * PER_PAGE;
+    document.getElementById('loadMoreBtn').style.display = shown < total ? 'block' : 'none';
+  } catch(e) {
+    document.getElementById('facesGrid').innerHTML = '<div style="grid-column:1/-1;text-align:center;padding:50px;color:var(--red)">Error: '+e.message+'</div>';
+  }
+}
+
+function loadMore() {
+  page++;
+  loadFaces(false);
+}
+
+async function delFace(id, btn) {
+  const card = btn.closest('.face-card');
+  try {
+    const r = await fetch('/api/unknown-faces/'+id, {method:'DELETE'});
+    if(r.ok){
+      card.style.transition='all 0.3s';card.style.opacity='0';card.style.transform='scale(0.9)';
+      setTimeout(()=>card.remove(),300);
+      toast('Deleted','i');
+      loadFaces();
+    } else { toast('Delete failed','e'); }
+  } catch(e){ toast('Error: '+e.message,'e'); }
+}
+
+async function deleteAll() {
+  const date = document.getElementById('fDate').value;
+  const msg = date ? \`Delete ALL unknown faces for \${date}?\` : 'Delete ALL unknown face records and images?';
+  if(!confirm(msg)) return;
+  const params = new URLSearchParams();
+  if(date) params.set('date', date);
+  try {
+    const r = await fetch('/api/unknown-faces/all?'+params, {method:'DELETE'});
+    if(r.ok){ toast('All records cleared','i'); loadFaces(); }
+    else toast('Failed to clear','e');
+  } catch(e){ toast('Error: '+e.message,'e'); }
+}
+
+function openLb(src){ document.getElementById('lbImg').src=src; document.getElementById('lb').classList.add('open'); }
+function closeLb(){ document.getElementById('lb').classList.remove('open'); }
+document.addEventListener('keydown', e=>{ if(e.key==='Escape') closeLb(); });
+
+function toast(msg,type='i'){const t=document.getElementById('toast');t.textContent=msg;t.className='toast '+type+' show';clearTimeout(t._to);t._to=setTimeout(()=>t.classList.remove('show'),3000);}
+
+loadFaces();
+setInterval(()=>loadFaces(), 20000);
+</script>
+</body>
+</html>`;
+}
+
+// ─── RECORDS PAGE HTML ────────────────────────────────────────────────────────
+function getRecordsHTML() {
+  return `<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8"/>
+<meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1"/>
+<title>Attendance Records</title>
+<style>
+@import url('https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@300;400;500;600;700&family=JetBrains+Mono:wght@400;600&display=swap');
+:root{
+  --bg:#ffffff;--surface:#f8f9fa;--card:#ffffff;--border:#dbe3ea;
+  --accent:#00adee;--accent2:#00adee;--red:#f87171;--yellow:#fbbf24;
+  --purple:#00adee;--orange:#fb923c;--text:#1f2937;--muted:#6b7280;--muted2:#cfd8e3;
+}
+*{box-sizing:border-box;margin:0;padding:0}
+body{font-family:'Space Grotesk',sans-serif;background:var(--bg);color:var(--text);min-height:100vh;overflow-x:hidden}
+body::before{content:'';position:fixed;inset:0;background:radial-gradient(ellipse 80% 50% at 50% -10%,rgba(0,173,238,0.07),transparent);pointer-events:none;z-index:0}
+
+nav{position:sticky;top:0;z-index:100;background:rgba(255,255,255,0.96);backdrop-filter:blur(20px);border-bottom:1px solid var(--border);display:flex;align-items:center;justify-content:space-between;padding:0 16px;height:62px}
+.nav-left{display:flex;align-items:center;gap:16px}
+.nav-logo{font-family:'JetBrains Mono',monospace;font-size:1rem;font-weight:600;letter-spacing:2px}
+.nav-logo span{color:var(--accent)}
+.nav-right{display:flex;align-items:center;gap:8px}
+.nav-link{display:flex;align-items:center;gap:7px;background:var(--card);border:1px solid var(--border);color:var(--muted);font-family:'Space Grotesk',sans-serif;font-size:0.78rem;font-weight:500;padding:7px 12px;border-radius:10px;text-decoration:none;transition:all 0.2s;white-space:nowrap}
+.nav-link:hover{border-color:var(--accent);color:var(--text)}
+.nav-link.active{border-color:rgba(0,173,238,0.4);color:var(--accent);background:rgba(0,173,238,0.08)}
+
+main{position:relative;z-index:1;max-width:1500px;margin:0 auto;padding:20px 16px}
+
+.filter-card{background:var(--card);border:1px solid var(--border);border-radius:14px;padding:16px 18px;margin-bottom:18px}
+.filter-title{font-family:'JetBrains Mono',monospace;font-size:0.6rem;letter-spacing:2px;color:var(--muted);text-transform:uppercase;margin-bottom:12px}
+.filter-row{display:flex;align-items:flex-end;gap:10px;flex-wrap:wrap}
+.filter-group{display:flex;flex-direction:column;gap:4px}
+.filter-label{font-size:0.65rem;color:var(--muted);text-transform:uppercase;letter-spacing:0.8px}
+.filter-inp,.filter-sel{background:var(--surface);border:1px solid var(--border);border-radius:8px;padding:7px 10px;color:var(--text);font-family:'Space Grotesk',sans-serif;font-size:0.8rem;outline:none;transition:border-color 0.2s;min-width:120px}
+.filter-inp:focus,.filter-sel:focus{border-color:var(--accent)}
+.filter-inp::placeholder{color:var(--muted)}
+.filter-sel option{background:var(--card)}
+.btn-filter{padding:8px 16px;border:none;border-radius:9px;background:var(--accent);color:#fff;font-family:'Space Grotesk',sans-serif;font-size:0.8rem;font-weight:600;cursor:pointer;transition:all 0.18s}
+.btn-filter:hover{background:#009ed8;transform:translateY(-1px)}
+.btn-clear{padding:8px 12px;border:1px solid var(--border);border-radius:9px;background:transparent;color:var(--muted);font-family:'Space Grotesk',sans-serif;font-size:0.8rem;cursor:pointer;transition:all 0.18s}
+.btn-clear:hover{border-color:var(--red);color:var(--red)}
+
+.summary-bar{display:grid;grid-template-columns:repeat(6,1fr);gap:10px;margin-bottom:18px}
+@media(max-width:700px){.summary-bar{grid-template-columns:repeat(3,1fr)}}
+@media(max-width:400px){.summary-bar{grid-template-columns:repeat(2,1fr)}}
+.sum-card{background:var(--card);border:1px solid var(--border);border-radius:12px;padding:12px 14px}
+.sum-val{font-family:'JetBrains Mono',monospace;font-size:1.3rem;font-weight:600;color:var(--accent);line-height:1}
+.sum-val.green{color:var(--accent2)}.sum-val.yellow{color:var(--yellow)}.sum-val.orange{color:var(--orange)}.sum-val.red{color:var(--red)}.sum-val.purple{color:var(--purple)}
+.sum-lbl{font-size:0.6rem;color:var(--muted);text-transform:uppercase;letter-spacing:1px;margin-top:4px}
+
+.table-card{background:var(--card);border:1px solid var(--border);border-radius:16px;overflow:hidden}
+.table-head{display:flex;align-items:center;justify-content:space-between;padding:12px 16px;border-bottom:1px solid var(--border);flex-wrap:wrap;gap:8px}
+.table-head h3{font-family:'JetBrains Mono',monospace;font-size:0.65rem;letter-spacing:1.5px;color:var(--muted);text-transform:uppercase}
+.cnt-pill{background:rgba(0,173,238,0.1);color:var(--accent);font-size:0.7rem;font-weight:600;padding:3px 10px;border-radius:12px;font-family:'JetBrains Mono',monospace}
+.tbl-wrap{overflow-x:auto;max-height:560px;overflow-y:auto}
+.tbl-wrap::-webkit-scrollbar{width:3px;height:3px}.tbl-wrap::-webkit-scrollbar-thumb{background:var(--muted2);border-radius:2px}
+table{width:100%;border-collapse:collapse}
+thead th{padding:9px 12px;text-align:left;font-size:0.62rem;font-weight:600;color:var(--muted);text-transform:uppercase;letter-spacing:1px;background:var(--surface);border-bottom:1px solid var(--border);position:sticky;top:0;white-space:nowrap}
+tbody tr{border-bottom:1px solid rgba(207,216,227,0.8);transition:background 0.15s}
+tbody tr:last-child{border-bottom:none}
+tbody tr:hover{background:rgba(0,173,238,0.04)}
+td{padding:9px 12px;font-size:0.8rem;vertical-align:middle;white-space:nowrap}
+.td-name{display:flex;align-items:center;gap:8px;font-weight:600}
+.td-av{width:26px;height:26px;border-radius:50%;background:linear-gradient(135deg,#f8f9fa,#eef3f8);display:flex;align-items:center;justify-content:center;font-size:0.72rem;font-weight:700;color:var(--accent);border:1px solid rgba(0,173,238,0.2);flex-shrink:0}
+.time-pill{font-family:'JetBrains Mono',monospace;font-size:0.7rem;background:rgba(0,173,238,0.08);color:var(--accent);padding:2px 8px;border-radius:20px;border:1px solid rgba(0,173,238,0.12)}
+.time-pill.out{background:rgba(0,173,238,0.08);color:var(--accent);border-color:rgba(0,173,238,0.12)}
+.time-pill.exp{background:rgba(251,191,36,0.08);color:var(--yellow);border-color:rgba(251,191,36,0.12)}
+.time-pill.work{background:rgba(52,211,153,0.08);color:var(--accent2);border-color:rgba(52,211,153,0.12)}
+.badge{display:inline-flex;align-items:center;padding:2px 8px;border-radius:20px;font-size:0.62rem;font-weight:600;letter-spacing:0.3px;text-transform:uppercase;white-space:nowrap}
+.badge-present{background:rgba(52,211,153,0.08);color:var(--accent2);border:1px solid rgba(52,211,153,0.18)}
+.badge-late{background:rgba(251,191,36,0.08);color:var(--yellow);border:1px solid rgba(251,191,36,0.18)}
+.badge-early_leave{background:rgba(251,146,60,0.08);color:var(--orange);border:1px solid rgba(251,146,60,0.18)}
+.badge-late_early_leave{background:rgba(248,113,113,0.08);color:var(--red);border:1px solid rgba(248,113,113,0.18)}
+.badge-absent{background:rgba(248,113,113,0.08);color:var(--red);border:1px solid rgba(248,113,113,0.18)}
+.tbl-empty{text-align:center;padding:50px;color:var(--muted);font-size:0.82rem}
+.date-chip{font-family:'JetBrains Mono',monospace;font-size:0.7rem;color:var(--muted);background:var(--surface);padding:2px 8px;border-radius:6px;border:1px solid var(--border)}
+
+.total-work-bar{display:flex;align-items:center;gap:14px;background:rgba(52,211,153,0.05);border:1px solid rgba(52,211,153,0.12);border-radius:10px;padding:10px 16px;margin:10px 14px 14px}
+.tw-label{font-size:0.7rem;color:var(--muted);text-transform:uppercase;letter-spacing:1px}
+.tw-val{font-family:'JetBrains Mono',monospace;font-size:1rem;font-weight:600;color:var(--accent2)}
+.tw-note{font-size:0.7rem;color:var(--muted);margin-left:auto}
+.loading-row td{text-align:center;padding:50px;color:var(--muted)}
+</style>
+</head>
+<body>
+<nav>
+  <div class="nav-left">
+    <div class="nav-logo">ATTEND<span>.</span>AI <em style="font-size:0.6rem;color:var(--muted);letter-spacing:1px;margin-left:6px;font-weight:400;font-family:'Space Grotesk',sans-serif">RECORDS</em></div>
+  </div>
+  <div class="nav-right">
+    <a href="/" class="nav-link">📋 Today</a>
+    <a href="/records" class="nav-link active">📊 Records</a>
+    <a href="/unknown-faces" class="nav-link" style="color:var(--red);border-color:rgba(248,113,113,0.25)">❓ Unknown</a>
+    <a href="/register" class="nav-link">👤 Register</a>
+  </div>
+</nav>
+<main>
+  <div class="filter-card">
+    <div class="filter-title">🔍 Filter Records</div>
+    <div class="filter-row">
+      <div class="filter-group">
+        <div class="filter-label">From Date</div>
+        <input type="date" id="fFrom" class="filter-inp" />
+      </div>
+      <div class="filter-group">
+        <div class="filter-label">To Date</div>
+        <input type="date" id="fTo" class="filter-inp" />
+      </div>
+      <div class="filter-group">
+        <div class="filter-label">Status</div>
+        <select id="fStatus" class="filter-sel">
+          <option value="">All Statuses</option>
+          <option value="present">✅ Present</option>
+          <option value="late">⏰ Late</option>
+          <option value="early_leave">⚠️ Early Leave</option>
+          <option value="late_early_leave">🔴 Late + Early Leave</option>
+          <option value="absent">❌ Absent</option>
+        </select>
+      </div>
+      <div class="filter-group">
+        <div class="filter-label">Department</div>
+        <select id="fDept" class="filter-sel"><option value="">All Departments</option></select>
+      </div>
+      <div class="filter-group">
+        <div class="filter-label">Name Search</div>
+        <input type="text" id="fName" class="filter-inp" placeholder="Search name..." />
+      </div>
+      <div class="filter-group">
+        <div class="filter-label">&nbsp;</div>
+        <div style="display:flex;gap:8px">
+          <button class="btn-filter" onclick="applyFilters()">🔍 Apply</button>
+          <button class="btn-clear" onclick="clearFilters()">✕ Clear</button>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <div class="summary-bar">
+    <div class="sum-card"><div class="sum-val" id="sumTotal">—</div><div class="sum-lbl">Total Records</div></div>
+    <div class="sum-card"><div class="sum-val green" id="sumPresent">—</div><div class="sum-lbl">Present</div></div>
+    <div class="sum-card"><div class="sum-val yellow" id="sumLate">—</div><div class="sum-lbl">Late</div></div>
+    <div class="sum-card"><div class="sum-val orange" id="sumEarly">—</div><div class="sum-lbl">Early Leave</div></div>
+    <div class="sum-card"><div class="sum-val red" id="sumAbsent">—</div><div class="sum-lbl">Absent</div></div>
+    <div class="sum-card"><div class="sum-val purple" id="sumWork">—</div><div class="sum-lbl">Total Work Hours</div></div>
+  </div>
+
+  <div class="table-card">
+    <div class="table-head">
+      <h3>📋 Attendance Records</h3>
+      <span class="cnt-pill" id="recCnt">loading...</span>
+    </div>
+    <div class="tbl-wrap">
+      <table>
+        <thead>
+          <tr>
+            <th>Name</th><th>Emp ID</th><th>Department</th><th>Date</th>
+            <th>Check In</th><th>Check Out</th><th>Exp. Checkout</th><th>Working Hours</th><th>Status</th>
+          </tr>
+        </thead>
+        <tbody id="recBody">
+          <tr class="loading-row"><td colspan="9">Loading records...</td></tr>
+        </tbody>
+      </table>
+    </div>
+    <div id="totalWorkBar" class="total-work-bar" style="display:none">
+      <span class="tw-label">Total Working Hours:</span>
+      <span class="tw-val" id="totalWorkVal">0h 0m</span>
+      <span class="tw-note" id="totalWorkNote"></span>
+    </div>
+  </div>
+</main>
+
+<script>
+const statusLabels = {
+  present:'✅ Present', late:'⏰ Late', early_leave:'⚠️ Early Leave',
+  late_early_leave:'🔴 Late + Early', absent:'❌ Absent'
+};
+function esc(s){return String(s).replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));}
+
+(function setDefaults(){
+  const now=new Date();
+  const y=now.getFullYear(),m=String(now.getMonth()+1).padStart(2,'0'),d=String(now.getDate()).padStart(2,'0');
+  document.getElementById('fFrom').value=y+'-'+m+'-01';
+  document.getElementById('fTo').value=y+'-'+m+'-'+d;
+})();
+
+(async function loadDepts(){
+  try{
+    const{departments=[]}=await(await fetch('/api/departments')).json();
+    const sel=document.getElementById('fDept');
+    departments.forEach(d=>{const o=document.createElement('option');o.value=d;o.textContent=d;sel.appendChild(o);});
+  }catch(e){}
+})();
+
+async function applyFilters(){
+  const from=document.getElementById('fFrom').value;
+  const to=document.getElementById('fTo').value;
+  const status=document.getElementById('fStatus').value;
+  const dept=document.getElementById('fDept').value;
+  const name=document.getElementById('fName').value.trim();
+  const body=document.getElementById('recBody');
+  body.innerHTML='<tr class="loading-row"><td colspan="9">Loading...</td></tr>';
+  const params=new URLSearchParams();
+  if(from)params.set('from',from);if(to)params.set('to',to);
+  if(status)params.set('status',status);if(dept)params.set('department',dept);if(name)params.set('name',name);
+  try{
+    const{records=[],total_working='0h 0m',total_working_minutes=0}=await(await fetch('/api/attendance/records?'+params)).json();
+    document.getElementById('recCnt').textContent=records.length+' records';
+    const counts={present:0,late:0,early_leave:0,late_early_leave:0,absent:0};
+    records.forEach(r=>{if(counts[r.status]!==undefined)counts[r.status]++;});
+    document.getElementById('sumTotal').textContent=records.length;
+    document.getElementById('sumPresent').textContent=counts.present;
+    document.getElementById('sumLate').textContent=counts.late;
+    document.getElementById('sumEarly').textContent=counts.early_leave+counts.late_early_leave;
+    document.getElementById('sumAbsent').textContent=counts.absent;
+    const th=Math.floor(total_working_minutes/60),tm=total_working_minutes%60;
+    document.getElementById('sumWork').textContent=th+'h '+tm+'m';
+    if(records.length){
+      document.getElementById('totalWorkVal').textContent=total_working;
+      document.getElementById('totalWorkNote').textContent=from&&to?'Range: '+from+' → '+to:'';
+      document.getElementById('totalWorkBar').style.display='flex';
+    }else{document.getElementById('totalWorkBar').style.display='none';}
+    if(!records.length){body.innerHTML='<tr><td colspan="9" class="tbl-empty">No records found</td></tr>';return;}
+    body.innerHTML=records.map(r=>{
+      const wh=r.working_hours?'<span class="time-pill work">'+esc(r.working_hours)+'</span>':'<span style="color:var(--muted)">—</span>';
+      const exp=r.expected_checkout?'<span class="time-pill exp">'+esc(r.expected_checkout)+'</span>':'<span style="color:var(--muted)">—</span>';
+      return '<tr>'+
+        '<td><div class="td-name"><div class="td-av">'+esc(r.name[0].toUpperCase())+'</div>'+esc(r.name)+'</div></td>'+
+        '<td style="color:var(--muted);font-family:monospace;font-size:0.72rem">'+(r.employee_id||'—')+'</td>'+
+        '<td style="color:var(--muted);font-size:0.72rem">'+(r.department||'—')+'</td>'+
+        '<td><span class="date-chip">'+esc(r.date)+'</span></td>'+
+        '<td><span class="time-pill">'+esc(r.time_in)+'</span></td>'+
+        '<td><span class="time-pill out">'+esc(r.time_out||'—')+'</span></td>'+
+        '<td>'+exp+'</td><td>'+wh+'</td>'+
+        '<td><span class="badge badge-'+esc(r.status)+'">'+(statusLabels[r.status]||r.status)+'</span></td>'+
+        '</tr>';
+    }).join('');
+  }catch(e){body.innerHTML='<tr><td colspan="9" class="tbl-empty" style="color:var(--red)">Error: '+esc(e.message)+'</td></tr>';}
+}
+
+function clearFilters(){
+  document.getElementById('fStatus').value='';document.getElementById('fDept').value='';document.getElementById('fName').value='';
+  const now=new Date();const y=now.getFullYear(),m=String(now.getMonth()+1).padStart(2,'0'),d=String(now.getDate()).padStart(2,'0');
+  document.getElementById('fFrom').value=y+'-'+m+'-01';document.getElementById('fTo').value=y+'-'+m+'-'+d;
+  applyFilters();
+}
+document.getElementById('fName').addEventListener('keydown',e=>{if(e.key==='Enter')applyFilters();});
+applyFilters();
+</script>
+</body>
+</html>`;
+}
+
 // ─── API ROUTES ───────────────────────────────────────────────────────────────
 
 app.get('/api/faces', async (req, res) => {
@@ -1241,7 +1844,6 @@ app.post('/api/register', async (req, res) => {
     if (!safeLabel) return res.status(400).json({ error: 'Name required' });
     if (/\d/.test(safeLabel)) return res.status(400).json({ error: 'Name cannot contain numbers' });
     if (safeDepartment && /\d/.test(safeDepartment)) return res.status(400).json({ error: 'Department cannot contain numbers' });
-    // Accept either new format (descriptors = array of arrays) or old (descriptor = single array)
     const toStore = descriptors || descriptor;
     if (!toStore) return res.status(400).json({ error: 'Descriptor(s) required' });
     const result = await dbQuery(
@@ -1263,6 +1865,139 @@ app.delete('/api/faces/:id', async (req, res) => {
   } catch(e) { res.status(500).json({ error: e.message }); }
 });
 
+// ── Force model re-download (called when tensor mismatch detected on client) ──
+app.post('/api/models/refresh', async (req, res) => {
+  try {
+    // Delete potentially corrupt model files so they'll be re-downloaded on next setup
+    for (const f of MODEL_FILES) {
+      const fp = path.join(MODELS_DIR, f);
+      if (fs.existsSync(fp)) {
+        try { fs.unlinkSync(fp); } catch(_) {}
+      }
+    }
+    console.log('🔄 Model files cleared for re-download');
+    // Re-run setup in background
+    setup().catch(e => console.error('Re-setup error:', e));
+    res.json({ success: true, message: 'Models queued for re-download. Reload in 60 seconds.' });
+  } catch(e) { res.status(500).json({ error: e.message }); }
+});
+
+// ── UNKNOWN FACES API ─────────────────────────────────────────────────────────
+
+// Save unknown face with auto-captured image
+app.post('/api/unknown-faces/save', async (req, res) => {
+  try {
+    const { image } = req.body; // base64 JPEG data URL
+    const nowIST = new Date(new Date().toLocaleString('en-US', { timeZone: 'Asia/Kolkata' }));
+    const today  = nowIST.toISOString().slice(0, 10).replace('T', ' ').slice(0, 10);
+    const dateStr = nowIST.getFullYear() + '-' + String(nowIST.getMonth()+1).padStart(2,'0') + '-' + String(nowIST.getDate()).padStart(2,'0');
+    const timeStr = String(nowIST.getHours()).padStart(2,'0') + ':' + String(nowIST.getMinutes()).padStart(2,'0') + ':' + String(nowIST.getSeconds()).padStart(2,'0');
+
+    let imageFile = null;
+    if (image && image.startsWith('data:image')) {
+      // Save base64 image to disk
+      const base64Data = image.replace(/^data:image\/\w+;base64,/, '');
+      const filename = `unk_${Date.now()}_${Math.random().toString(36).slice(2,6)}.jpg`;
+      const filepath = path.join(UNKNOWN_IMAGES_DIR, filename);
+      fs.writeFileSync(filepath, Buffer.from(base64Data, 'base64'));
+      imageFile = filename;
+    }
+
+    const result = await dbQuery(
+      'INSERT INTO unknown_faces (image_file, date, time) VALUES (?, ?, ?)',
+      [imageFile, dateStr, timeStr]
+    );
+    console.log(`❓ Unknown face saved: #${result.insertId} | image: ${imageFile}`);
+    res.json({ success: true, id: result.insertId, image_file: imageFile });
+  } catch(e) { res.status(500).json({ error: e.message }); }
+});
+
+// Get unknown faces list with pagination
+app.get('/api/unknown-faces', async (req, res) => {
+  try {
+    const { date, limit = 24, offset = 0 } = req.query;
+    const today = new Date(new Date().toLocaleString('en-US', { timeZone: 'Asia/Kolkata' }));
+    const todayStr = today.getFullYear() + '-' + String(today.getMonth()+1).padStart(2,'0') + '-' + String(today.getDate()).padStart(2,'0');
+    // Week start
+    const weekStart = new Date(today);
+    weekStart.setDate(today.getDate() - today.getDay());
+    const weekStr = weekStart.getFullYear() + '-' + String(weekStart.getMonth()+1).padStart(2,'0') + '-' + String(weekStart.getDate()).padStart(2,'0');
+
+    let sql = 'SELECT * FROM unknown_faces';
+    const params = [];
+    if (date) { sql += ' WHERE date = ?'; params.push(date); }
+    sql += ' ORDER BY detected_at DESC LIMIT ? OFFSET ?';
+    params.push(parseInt(limit), parseInt(offset));
+
+    const faces = await dbQuery(sql, params);
+
+    // Count queries
+    const totalRows  = await dbQuery(date ? 'SELECT COUNT(*) AS c FROM unknown_faces WHERE date=?' : 'SELECT COUNT(*) AS c FROM unknown_faces', date ? [date] : []);
+    const todayRows  = await dbQuery('SELECT COUNT(*) AS c FROM unknown_faces WHERE date=?', [todayStr]);
+    const weekRows   = await dbQuery('SELECT COUNT(*) AS c FROM unknown_faces WHERE date >= ?', [weekStr]);
+
+    res.json({
+      faces,
+      total:  totalRows[0].c,
+      today:  todayRows[0].c,
+      week:   weekRows[0].c,
+    });
+  } catch(e) { res.status(500).json({ error: e.message }); }
+});
+
+// Count for nav badge
+app.get('/api/unknown-faces/count', async (req, res) => {
+  try {
+    const todayIST = new Date(new Date().toLocaleString('en-US', { timeZone: 'Asia/Kolkata' }));
+    const todayStr = todayIST.getFullYear() + '-' + String(todayIST.getMonth()+1).padStart(2,'0') + '-' + String(todayIST.getDate()).padStart(2,'0');
+    const rows = await dbQuery('SELECT COUNT(*) AS c FROM unknown_faces WHERE date=?', [todayStr]);
+    res.json({ count: rows[0].c });
+  } catch(e) { res.status(500).json({ count: 0 }); }
+});
+
+// Delete single unknown face
+app.delete('/api/unknown-faces/:id', async (req, res) => {
+  try {
+    const rows = await dbQuery('SELECT image_file FROM unknown_faces WHERE id=?', [parseInt(req.params.id)]);
+    if (!rows.length) return res.status(404).json({ error: 'Not found' });
+    // Delete image file
+    if (rows[0].image_file) {
+      const fp = path.join(UNKNOWN_IMAGES_DIR, rows[0].image_file);
+      try { if (fs.existsSync(fp)) fs.unlinkSync(fp); } catch(_) {}
+    }
+    await dbQuery('DELETE FROM unknown_faces WHERE id=?', [parseInt(req.params.id)]);
+    res.json({ success: true });
+  } catch(e) { res.status(500).json({ error: e.message }); }
+});
+
+// Delete all unknown faces (optionally filtered by date)
+app.delete('/api/unknown-faces/all', async (req, res) => {
+  try {
+    const { date } = req.query;
+    let rows;
+    if (date) {
+      rows = await dbQuery('SELECT image_file FROM unknown_faces WHERE date=?', [date]);
+      for (const r of rows) {
+        if (r.image_file) {
+          const fp = path.join(UNKNOWN_IMAGES_DIR, r.image_file);
+          try { if (fs.existsSync(fp)) fs.unlinkSync(fp); } catch(_) {}
+        }
+      }
+      await dbQuery('DELETE FROM unknown_faces WHERE date=?', [date]);
+    } else {
+      rows = await dbQuery('SELECT image_file FROM unknown_faces');
+      for (const r of rows) {
+        if (r.image_file) {
+          const fp = path.join(UNKNOWN_IMAGES_DIR, r.image_file);
+          try { if (fs.existsSync(fp)) fs.unlinkSync(fp); } catch(_) {}
+        }
+      }
+      await dbQuery('DELETE FROM unknown_faces');
+    }
+    res.json({ success: true, deleted: rows.length });
+  } catch(e) { res.status(500).json({ error: e.message }); }
+});
+
 // ── CHECK IN ──────────────────────────────────────────────────────────────────
 app.post('/api/attendance/mark', async (req, res) => {
   try {
@@ -1275,7 +2010,6 @@ app.post('/api/attendance/mark', async (req, res) => {
     let best = null, bestD = Infinity;
     for (const f of faces) {
       const stored = JSON.parse(f.descriptor);
-      // Support both old (single flat array) and new (array of arrays) format
       const descriptorList = Array.isArray(stored[0]) ? stored : [stored];
       const d = Math.min(...descriptorList.map(sd => euclidean(descriptor, sd)));
       if (d < bestD) { bestD = d; best = f; }
@@ -1290,7 +2024,6 @@ app.post('/api/attendance/mark', async (req, res) => {
     const timeStr  = String(nowIST.getHours()).padStart(2,'0') + ':' + String(nowIST.getMinutes()).padStart(2,'0') + ':' + String(nowIST.getSeconds()).padStart(2,'0');
     const totalMin = nowIST.getHours() * 60 + nowIST.getMinutes();
 
-    // After 11:00 AM → absent
     let status = 'present';
     if (totalMin >= ABSENT_AFTER_MIN) {
       status = 'absent';
@@ -1298,10 +2031,8 @@ app.post('/api/attendance/mark', async (req, res) => {
       status = 'late';
     }
 
-    // Calculate expected checkout for late arrivals
     const expectedCheckout = (status === 'late') ? calcExpectedCheckout(timeStr) : null;
 
-    // Already checked in today?
     const existing = await dbQuery(
       'SELECT id, time_in, status, expected_checkout FROM attendance WHERE face_id=? AND date=?',
       [best.id, today]
@@ -1337,7 +2068,6 @@ app.post('/api/attendance/checkout', async (req, res) => {
     let best = null, bestD = Infinity;
     for (const f of faces) {
       const stored = JSON.parse(f.descriptor);
-      // Support both old (single flat array) and new (array of arrays) format
       const descriptorList = Array.isArray(stored[0]) ? stored : [stored];
       const d = Math.min(...descriptorList.map(sd => euclidean(descriptor, sd)));
       if (d < bestD) { bestD = d; best = f; }
@@ -1351,9 +2081,8 @@ app.post('/api/attendance/checkout', async (req, res) => {
     const today    = nowIST.getFullYear() + '-' + String(nowIST.getMonth()+1).padStart(2,'0') + '-' + String(nowIST.getDate()).padStart(2,'0');
     const timeStr  = String(nowIST.getHours()).padStart(2,'0') + ':' + String(nowIST.getMinutes()).padStart(2,'0') + ':' + String(nowIST.getSeconds()).padStart(2,'0');
     const totalMin = nowIST.getHours() * 60 + nowIST.getMinutes();
-    const isEarly  = totalMin < CHECKOUT_FROM; // before 6:10 PM
+    const isEarly  = totalMin < CHECKOUT_FROM;
 
-    // Must have checked in first
     const existing = await dbQuery(
       'SELECT id, time_in, time_out, status FROM attendance WHERE face_id=? AND date=?',
       [best.id, today]
@@ -1363,7 +2092,6 @@ app.post('/api/attendance/checkout', async (req, res) => {
       return res.json({ success: false, not_checked_in: true, name: best.label });
     }
 
-    // Already checked out?
     if (existing[0].time_out) {
       setLed('checkout_already', best.label, existing[0].status);
       return res.json({
@@ -1373,12 +2101,10 @@ app.post('/api/attendance/checkout', async (req, res) => {
       });
     }
 
-    // Determine final status
-    // was_late + early_leave → late_early_leave
     const wasLate   = existing[0].status === 'late';
     const newStatus = isEarly
       ? (wasLate ? 'late_early_leave' : 'early_leave')
-      : existing[0].status; // keep present/late if on time checkout
+      : existing[0].status;
 
     await dbQuery(
       'UPDATE attendance SET time_out=?, status=? WHERE face_id=? AND date=?',
@@ -1431,7 +2157,7 @@ app.get('/api/attendance/stats', async (req, res) => {
   } catch(e) { res.status(500).json({ error: e.message }); }
 });
 
-// ── RECORDS (date range, filters) ─────────────────────────────────────────────
+// ── RECORDS ───────────────────────────────────────────────────────────────────
 app.get('/api/attendance/records', async (req, res) => {
   try {
     const { from, to, status, department, name } = req.query;
@@ -1447,7 +2173,6 @@ app.get('/api/attendance/records', async (req, res) => {
     if (name)       { sql += ' AND a.name LIKE ?'; params.push('%'+name+'%'); }
     sql += ' ORDER BY a.date DESC, a.time_in ASC';
     const records = await dbQuery(sql, params);
-    // Calculate working hours per record
     const result = records.map(r => {
       const wMin = calcWorkingMinutes(r.time_in, r.time_out);
       return {
@@ -1459,14 +2184,13 @@ app.get('/api/attendance/records', async (req, res) => {
         working_minutes: wMin
       };
     });
-    // Total working minutes across all records
     const totalMin = result.reduce((s, r) => s + r.working_minutes, 0);
     const totalH = Math.floor(totalMin / 60), totalM = totalMin % 60;
     res.json({ records: result, total_working: `${totalH}h ${totalM}m`, total_working_minutes: totalMin });
   } catch(e) { res.status(500).json({ error: e.message }); }
 });
 
-// ── DEPARTMENTS LIST ──────────────────────────────────────────────────────────
+// ── DEPARTMENTS ───────────────────────────────────────────────────────────────
 app.get('/api/departments', async (req, res) => {
   try {
     const rows = await dbQuery('SELECT DISTINCT department FROM faces WHERE department != "" ORDER BY department');
@@ -1474,318 +2198,7 @@ app.get('/api/departments', async (req, res) => {
   } catch(e) { res.status(500).json({ error: e.message }); }
 });
 
-// ─── RECORDS PAGE HTML ────────────────────────────────────────────────────────
-function getRecordsHTML() {
-  return `<!DOCTYPE html>
-<html lang="en">
-<head>
-<meta charset="UTF-8"/>
-<meta name="viewport" content="width=device-width,initial-scale=1"/>
-<title>Attendance Records</title>
-<style>
-@import url('https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@300;400;500;600;700&family=JetBrains+Mono:wght@400;600&display=swap');
-:root{
-  --bg:#ffffff;--surface:#f8f9fa;--card:#ffffff;--border:#dbe3ea;
-  --accent:#00adee;--accent2:#00adee;--red:#f87171;--yellow:#fbbf24;
-  --purple:#00adee;--orange:#fb923c;--text:#1f2937;--muted:#6b7280;--muted2:#cfd8e3;
-}
-*{box-sizing:border-box;margin:0;padding:0}
-body{font-family:'Space Grotesk',sans-serif;background:var(--bg);color:var(--text);min-height:100vh;overflow-x:hidden}
-body::before{content:'';position:fixed;inset:0;background:radial-gradient(ellipse 80% 50% at 50% -10%,rgba(0,173,238,0.07),transparent);pointer-events:none;z-index:0}
-
-nav{position:sticky;top:0;z-index:100;background:rgba(255,255,255,0.96);backdrop-filter:blur(20px);border-bottom:1px solid var(--border);display:flex;align-items:center;justify-content:space-between;padding:0 32px;height:62px}
-.nav-left{display:flex;align-items:center;gap:16px}
-.nav-logo{font-family:'JetBrains Mono',monospace;font-size:1.05rem;font-weight:600;letter-spacing:2px}
-.nav-logo span{color:var(--accent)}
-.nav-right{display:flex;align-items:center;gap:10px}
-.nav-link{display:flex;align-items:center;gap:8px;background:var(--card);border:1px solid var(--border);color:var(--muted);font-family:'Space Grotesk',sans-serif;font-size:0.82rem;font-weight:500;padding:8px 16px;border-radius:10px;text-decoration:none;transition:all 0.2s}
-.nav-link:hover{border-color:var(--accent);color:var(--text)}
-.nav-link.active{border-color:rgba(0,173,238,0.4);color:var(--accent);background:rgba(0,173,238,0.08)}
-
-main{position:relative;z-index:1;max-width:1500px;margin:0 auto;padding:28px 32px}
-
-/* filter bar */
-.filter-card{background:var(--card);border:1px solid var(--border);border-radius:14px;padding:18px 20px;margin-bottom:20px}
-.filter-title{font-family:'JetBrains Mono',monospace;font-size:0.62rem;letter-spacing:2px;color:var(--muted);text-transform:uppercase;margin-bottom:14px}
-.filter-row{display:flex;align-items:flex-end;gap:12px;flex-wrap:wrap}
-.filter-group{display:flex;flex-direction:column;gap:5px}
-.filter-label{font-size:0.68rem;color:var(--muted);text-transform:uppercase;letter-spacing:0.8px}
-.filter-inp,.filter-sel{background:var(--surface);border:1px solid var(--border);border-radius:8px;padding:8px 12px;color:var(--text);font-family:'Space Grotesk',sans-serif;font-size:0.82rem;outline:none;transition:border-color 0.2s;min-width:130px}
-.filter-inp:focus,.filter-sel:focus{border-color:var(--accent)}
-.filter-inp::placeholder{color:var(--muted)}
-.filter-sel option{background:var(--card)}
-.btn-filter{padding:9px 18px;border:none;border-radius:9px;background:var(--accent);color:#fff;font-family:'Space Grotesk',sans-serif;font-size:0.82rem;font-weight:600;cursor:pointer;transition:all 0.18s}
-.btn-filter:hover{background:#009ed8;transform:translateY(-1px)}
-.btn-clear{padding:9px 14px;border:1px solid var(--border);border-radius:9px;background:transparent;color:var(--muted);font-family:'Space Grotesk',sans-serif;font-size:0.82rem;cursor:pointer;transition:all 0.18s}
-.btn-clear:hover{border-color:var(--red);color:var(--red)}
-
-/* summary bar */
-.summary-bar{display:grid;grid-template-columns:repeat(6,1fr);gap:12px;margin-bottom:20px}
-.sum-card{background:var(--card);border:1px solid var(--border);border-radius:12px;padding:14px 16px}
-.sum-val{font-family:'JetBrains Mono',monospace;font-size:1.4rem;font-weight:600;color:var(--accent);line-height:1}
-.sum-val.green{color:var(--accent2)}.sum-val.yellow{color:var(--yellow)}.sum-val.orange{color:var(--orange)}.sum-val.red{color:var(--red)}.sum-val.purple{color:var(--purple)}
-.sum-lbl{font-size:0.63rem;color:var(--muted);text-transform:uppercase;letter-spacing:1px;margin-top:5px}
-
-/* table */
-.table-card{background:var(--card);border:1px solid var(--border);border-radius:16px;overflow:hidden}
-.table-head{display:flex;align-items:center;justify-content:space-between;padding:14px 20px;border-bottom:1px solid var(--border)}
-.table-head h3{font-family:'JetBrains Mono',monospace;font-size:0.7rem;letter-spacing:1.5px;color:var(--muted);text-transform:uppercase}
-.cnt-pill{background:rgba(0,173,238,0.1);color:var(--accent);font-size:0.72rem;font-weight:600;padding:3px 10px;border-radius:12px;font-family:'JetBrains Mono',monospace}
-.tbl-wrap{overflow-x:auto;max-height:600px;overflow-y:auto}
-.tbl-wrap::-webkit-scrollbar{width:3px;height:3px}.tbl-wrap::-webkit-scrollbar-thumb{background:var(--muted2);border-radius:2px}
-table{width:100%;border-collapse:collapse}
-thead th{padding:10px 14px;text-align:left;font-size:0.63rem;font-weight:600;color:var(--muted);text-transform:uppercase;letter-spacing:1px;background:var(--surface);border-bottom:1px solid var(--border);position:sticky;top:0;white-space:nowrap}
-tbody tr{border-bottom:1px solid rgba(207,216,227,0.8);transition:background 0.15s}
-tbody tr:last-child{border-bottom:none}
-tbody tr:hover{background:rgba(0,173,238,0.04)}
-td{padding:10px 14px;font-size:0.82rem;vertical-align:middle;white-space:nowrap}
-.td-name{display:flex;align-items:center;gap:9px;font-weight:600}
-.td-av{width:28px;height:28px;border-radius:50%;background:linear-gradient(135deg,#f8f9fa,#eef3f8);display:flex;align-items:center;justify-content:center;font-size:0.75rem;font-weight:700;color:var(--accent);border:1px solid rgba(0,173,238,0.2);flex-shrink:0}
-.time-pill{font-family:'JetBrains Mono',monospace;font-size:0.74rem;background:rgba(0,173,238,0.08);color:var(--accent);padding:2px 9px;border-radius:20px;border:1px solid rgba(0,173,238,0.12)}
-.time-pill.out{background:rgba(0,173,238,0.08);color:var(--accent);border-color:rgba(0,173,238,0.12)}
-.time-pill.exp{background:rgba(251,191,36,0.08);color:var(--yellow);border-color:rgba(251,191,36,0.12)}
-.time-pill.work{background:rgba(52,211,153,0.08);color:var(--accent2);border-color:rgba(52,211,153,0.12)}
-.badge{display:inline-flex;align-items:center;padding:3px 9px;border-radius:20px;font-size:0.65rem;font-weight:600;letter-spacing:0.3px;text-transform:uppercase;white-space:nowrap}
-.badge-present{background:rgba(52,211,153,0.08);color:var(--accent2);border:1px solid rgba(52,211,153,0.18)}
-.badge-late{background:rgba(251,191,36,0.08);color:var(--yellow);border:1px solid rgba(251,191,36,0.18)}
-.badge-early_leave{background:rgba(251,146,60,0.08);color:var(--orange);border:1px solid rgba(251,146,60,0.18)}
-.badge-late_early_leave{background:rgba(248,113,113,0.08);color:var(--red);border:1px solid rgba(248,113,113,0.18)}
-.badge-absent{background:rgba(248,113,113,0.08);color:var(--red);border:1px solid rgba(248,113,113,0.18)}
-.tbl-empty{text-align:center;padding:60px;color:var(--muted);font-size:0.84rem}
-.date-chip{font-family:'JetBrains Mono',monospace;font-size:0.74rem;color:var(--muted);background:var(--surface);padding:2px 9px;border-radius:6px;border:1px solid var(--border)}
-
-/* total bar */
-.total-work-bar{display:flex;align-items:center;gap:14px;background:rgba(52,211,153,0.05);border:1px solid rgba(52,211,153,0.12);border-radius:10px;padding:10px 18px;margin-top:12px}
-.tw-label{font-size:0.72rem;color:var(--muted);text-transform:uppercase;letter-spacing:1px}
-.tw-val{font-family:'JetBrains Mono',monospace;font-size:1.05rem;font-weight:600;color:var(--accent2)}
-.tw-note{font-size:0.72rem;color:var(--muted);margin-left:auto}
-
-.loading-row td{text-align:center;padding:50px;color:var(--muted)}
-</style>
-</head>
-<body>
-<nav>
-  <div class="nav-left">
-    <div class="nav-logo">FACE<span>·</span>ATT <em style="font-size:0.6rem;color:var(--muted);letter-spacing:1px;margin-left:6px;font-weight:400;font-family:'Space Grotesk',sans-serif">RECORDS</em></div>
-  </div>
-  <div class="nav-right">
-    <a href="/" class="nav-link">📋 Today</a>
-    <a href="/records" class="nav-link active">📊 Records</a>
-    <a href="/register" class="nav-link">👤 Register</a>
-  </div>
-</nav>
-<main>
-
-  <!-- FILTER BAR -->
-  <div class="filter-card">
-    <div class="filter-title">🔍 Filter Records</div>
-    <div class="filter-row">
-      <div class="filter-group">
-        <div class="filter-label">From Date</div>
-        <input type="date" id="fFrom" class="filter-inp" />
-      </div>
-      <div class="filter-group">
-        <div class="filter-label">To Date</div>
-        <input type="date" id="fTo" class="filter-inp" />
-      </div>
-      <div class="filter-group">
-        <div class="filter-label">Status</div>
-        <select id="fStatus" class="filter-sel">
-          <option value="">All Statuses</option>
-          <option value="present">✅ Present</option>
-          <option value="late">⏰ Late</option>
-          <option value="early_leave">⚠️ Early Leave</option>
-          <option value="late_early_leave">🔴 Late + Early Leave</option>
-          <option value="absent">❌ Absent</option>
-        </select>
-      </div>
-      <div class="filter-group">
-        <div class="filter-label">Department</div>
-        <select id="fDept" class="filter-sel"><option value="">All Departments</option></select>
-      </div>
-      <div class="filter-group">
-        <div class="filter-label">Name Search</div>
-        <input type="text" id="fName" class="filter-inp" placeholder="Search name..." />
-      </div>
-      <div class="filter-group">
-        <div class="filter-label">&nbsp;</div>
-        <div style="display:flex;gap:8px">
-          <button class="btn-filter" onclick="applyFilters()">🔍 Apply</button>
-          <button class="btn-clear" onclick="clearFilters()">✕ Clear</button>
-        </div>
-      </div>
-    </div>
-  </div>
-
-  <!-- SUMMARY BAR -->
-  <div class="summary-bar">
-    <div class="sum-card"><div class="sum-val" id="sumTotal">—</div><div class="sum-lbl">Total Records</div></div>
-    <div class="sum-card"><div class="sum-val green" id="sumPresent">—</div><div class="sum-lbl">Present</div></div>
-    <div class="sum-card"><div class="sum-val yellow" id="sumLate">—</div><div class="sum-lbl">Late</div></div>
-    <div class="sum-card"><div class="sum-val orange" id="sumEarly">—</div><div class="sum-lbl">Early Leave</div></div>
-    <div class="sum-card"><div class="sum-val red" id="sumAbsent">—</div><div class="sum-lbl">Absent</div></div>
-    <div class="sum-card"><div class="sum-val purple" id="sumWork">—</div><div class="sum-lbl">Total Work Hours</div></div>
-  </div>
-
-  <!-- TABLE -->
-  <div class="table-card">
-    <div class="table-head">
-      <h3>📋 Attendance Records</h3>
-      <span class="cnt-pill" id="recCnt">loading...</span>
-    </div>
-    <div class="tbl-wrap">
-      <table>
-        <thead>
-          <tr>
-            <th>Name</th>
-            <th>Emp ID</th>
-            <th>Department</th>
-            <th>Date</th>
-            <th>Check In</th>
-            <th>Check Out</th>
-            <th>Exp. Checkout</th>
-            <th>Working Hours</th>
-            <th>Status</th>
-          </tr>
-        </thead>
-        <tbody id="recBody">
-          <tr class="loading-row"><td colspan="9">Loading records...</td></tr>
-        </tbody>
-      </table>
-    </div>
-    <div id="totalWorkBar" class="total-work-bar" style="margin:12px 16px 16px;display:none">
-      <span class="tw-label">Total Working Hours (selected range):</span>
-      <span class="tw-val" id="totalWorkVal">0h 0m</span>
-      <span class="tw-note" id="totalWorkNote"></span>
-    </div>
-  </div>
-
-</main>
-
-<script>
-const statusLabels = {
-  present:'✅ Present', late:'⏰ Late', early_leave:'⚠️ Early Leave',
-  late_early_leave:'🔴 Late + Early', absent:'❌ Absent'
-};
-
-function esc(s){return String(s).replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));}
-function fmt(s){return s||'—';}
-
-// Set default date range to current month
-(function setDefaults(){
-  const now = new Date();
-  const y = now.getFullYear(), m = String(now.getMonth()+1).padStart(2,'0');
-  const d = String(now.getDate()).padStart(2,'0');
-  document.getElementById('fFrom').value = y+'-'+m+'-01';
-  document.getElementById('fTo').value   = y+'-'+m+'-'+d;
-})();
-
-// Load departments
-(async function loadDepts(){
-  try{
-    const {departments=[]} = await(await fetch('/api/departments')).json();
-    const sel = document.getElementById('fDept');
-    departments.forEach(d=>{
-      const o=document.createElement('option');o.value=d;o.textContent=d;sel.appendChild(o);
-    });
-  }catch(e){}
-})();
-
-async function applyFilters(){
-  const from   = document.getElementById('fFrom').value;
-  const to     = document.getElementById('fTo').value;
-  const status = document.getElementById('fStatus').value;
-  const dept   = document.getElementById('fDept').value;
-  const name   = document.getElementById('fName').value.trim();
-
-  const body = document.getElementById('recBody');
-  body.innerHTML='<tr class="loading-row"><td colspan="9">Loading...</td></tr>';
-
-  const params = new URLSearchParams();
-  if(from)   params.set('from',from);
-  if(to)     params.set('to',to);
-  if(status) params.set('status',status);
-  if(dept)   params.set('department',dept);
-  if(name)   params.set('name',name);
-
-  try{
-    const {records=[], total_working='0h 0m', total_working_minutes=0} =
-      await(await fetch('/api/attendance/records?'+params)).json();
-
-    document.getElementById('recCnt').textContent = records.length+' records';
-
-    // Summary counts
-    const counts = {present:0,late:0,early_leave:0,late_early_leave:0,absent:0};
-    records.forEach(r=>{if(counts[r.status]!==undefined)counts[r.status]++;});
-    document.getElementById('sumTotal').textContent   = records.length;
-    document.getElementById('sumPresent').textContent = counts.present;
-    document.getElementById('sumLate').textContent    = counts.late;
-    document.getElementById('sumEarly').textContent   = counts.early_leave + counts.late_early_leave;
-    document.getElementById('sumAbsent').textContent  = counts.absent;
-    const th = Math.floor(total_working_minutes/60), tm = total_working_minutes%60;
-    document.getElementById('sumWork').textContent    = th+'h '+tm+'m';
-
-    // Total bar
-    if(records.length){
-      document.getElementById('totalWorkVal').textContent = total_working;
-      let note = '';
-      if(from && to) note = 'Date range: '+from+' → '+to;
-      document.getElementById('totalWorkNote').textContent = note;
-      document.getElementById('totalWorkBar').style.display = 'flex';
-    } else {
-      document.getElementById('totalWorkBar').style.display = 'none';
-    }
-
-    if(!records.length){
-      body.innerHTML='<tr><td colspan="9" class="tbl-empty">No records found for selected filters</td></tr>';
-      return;
-    }
-
-    body.innerHTML = records.map(r => {
-      const wh = r.working_hours ? '<span class="time-pill work">'+esc(r.working_hours)+'</span>' : '<span style="color:var(--muted)">—</span>';
-      const exp = r.expected_checkout
-        ? '<span class="time-pill exp">'+esc(r.expected_checkout)+'</span>'
-        : '<span style="color:var(--muted)">—</span>';
-      return '<tr>'+
-        '<td><div class="td-name"><div class="td-av">'+esc(r.name[0].toUpperCase())+'</div>'+esc(r.name)+'</div></td>'+
-        '<td style="color:var(--muted);font-family:monospace;font-size:0.75rem">'+(r.employee_id||'—')+'</td>'+
-        '<td style="color:var(--muted);font-size:0.75rem">'+(r.department||'—')+'</td>'+
-        '<td><span class="date-chip">'+esc(r.date)+'</span></td>'+
-        '<td><span class="time-pill">'+esc(r.time_in)+'</span></td>'+
-        '<td><span class="time-pill out">'+esc(r.time_out||'—')+'</span></td>'+
-        '<td>'+exp+'</td>'+
-        '<td>'+wh+'</td>'+
-        '<td><span class="badge badge-'+esc(r.status)+'">'+(statusLabels[r.status]||r.status)+'</span></td>'+
-        '</tr>';
-    }).join('');
-  }catch(e){
-    body.innerHTML='<tr><td colspan="9" class="tbl-empty" style="color:var(--red)">Error loading records: '+esc(e.message)+'</td></tr>';
-  }
-}
-
-function clearFilters(){
-  document.getElementById('fStatus').value='';
-  document.getElementById('fDept').value='';
-  document.getElementById('fName').value='';
-  const now=new Date();
-  const y=now.getFullYear(),m=String(now.getMonth()+1).padStart(2,'0'),d=String(now.getDate()).padStart(2,'0');
-  document.getElementById('fFrom').value=y+'-'+m+'-01';
-  document.getElementById('fTo').value=y+'-'+m+'-'+d;
-  applyFilters();
-}
-
-document.getElementById('fName').addEventListener('keydown',e=>{ if(e.key==='Enter') applyFilters(); });
-
-// Auto load on page open
-applyFilters();
-</script>
-</body>
-</html>`;
-}
-
 // ─── LED API ROUTES ───────────────────────────────────────────────────────────
-
-// Arduino polls this ~every 500 ms. Returns plain text, clears after read.
 app.get('/api/led/status', (req, res) => {
   const cmd = pendingLedCommand || { led: 'X', buzzer: 0, name: '', status: '' };
   pendingLedCommand = null;
@@ -1793,14 +2206,12 @@ app.get('/api/led/status', (req, res) => {
      .send(`LED:${cmd.led};BUZZ:${cmd.buzzer};NAME:${cmd.name};STATUS:${cmd.status}`);
 });
 
-// JSON version for browser debugging
 app.get('/api/led/status/json', (req, res) => {
   const cmd = pendingLedCommand || { led: 'X', buzzer: 0, name: '', status: '', timestamp: null };
   pendingLedCommand = null;
   res.json(cmd);
 });
 
-// Manual trigger endpoint (optional, for testing)
 app.post('/api/led/trigger', (req, res) => {
   const { eventType, name = '', status = '' } = req.body;
   if (!eventType) return res.status(400).json({ error: 'eventType required' });
@@ -1833,14 +2244,19 @@ app.get('/records', (req, res) => {
   res.send(getRecordsHTML());
 });
 
+app.get('/unknown-faces', (req, res) => {
+  res.send(getUnknownFacesHTML());
+});
+
 // ─── START ────────────────────────────────────────────────────────────────────
 setup().then(() => {
   app.listen(PORT, () => {
     console.log('\n==========================================');
     console.log('🚀  http://localhost:' + PORT);
-    console.log('📋  Attendance → http://localhost:' + PORT + '/');
-    console.log('📊  Records    → http://localhost:' + PORT + '/records');
-    console.log('👤  Register   → http://localhost:' + PORT + '/register');
+    console.log('📋  Attendance    → http://localhost:' + PORT + '/');
+    console.log('📊  Records       → http://localhost:' + PORT + '/records');
+    console.log('👤  Register      → http://localhost:' + PORT + '/register');
+    console.log('❓  Unknown Faces → http://localhost:' + PORT + '/unknown-faces');
     console.log('⏰  Office: ' + OFFICE_START.h + ':' + String(OFFICE_START.m).padStart(2,'0') +
       ' AM  |  Grace: +' + GRACE_MINUTES + ' min  |  End: ' + OFFICE_END.h + ':' + String(OFFICE_END.m).padStart(2,'0') +
       '  |  Absent after: ' + ABSENT_AFTER.h + ':00 AM');
