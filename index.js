@@ -65,10 +65,10 @@ db.connect(err => {
     CREATE TABLE IF NOT EXISTS unknown_faces (
       id             INT AUTO_INCREMENT PRIMARY KEY,
       image_file     VARCHAR(255) DEFAULT NULL,
-      detected_at    DATETIME DEFAULT CURRENT_TIMESTAMP,
+      captured_at    DATETIME DEFAULT CURRENT_TIMESTAMP,
       date           DATE NOT NULL,
       time_detected  TIME NOT NULL,
-      location       VARCHAR(100) DEFAULT ''
+      source         VARCHAR(50) DEFAULT 'checkin'
     )
   `, err => { if (!err) console.log('✅ unknown_faces table ready'); });
 });
@@ -1508,7 +1508,7 @@ async function loadFaces(reset = true) {
       const imgContent = f.image_file
         ? \`<img src="/unknown-images/\${f.image_file}" alt="Unknown" loading="lazy" onclick="openLb(this.src)" style="cursor:zoom-in"/>\`
         : \`<div class="no-img">👤</div>\`;
-      const dt = new Date(f.detected_at);
+      const dt = new Date(f.captured_at);
       const timeStr = dt.toLocaleTimeString('en-IN',{hour:'2-digit',minute:'2-digit',hour12:true});
       const dateStr = dt.toLocaleDateString('en-IN',{day:'2-digit',month:'short',year:'numeric'});
       card.innerHTML = \`
@@ -1906,8 +1906,8 @@ app.post('/api/unknown-faces/save', async (req, res) => {
     }
 
     const result = await dbQuery(
-      'INSERT INTO unknown_faces (image_file, date, time_detected) VALUES (?, ?, ?)',
-      [imageFile, dateStr, timeStr]
+      'INSERT INTO unknown_faces (image_file, date, time_detected, source) VALUES (?, ?, ?, ?)',
+      [imageFile, dateStr, timeStr, 'checkin']
     );
     console.log(`❓ Unknown face saved: #${result.insertId} | image: ${imageFile}`);
     res.json({ success: true, id: result.insertId, image_file: imageFile });
@@ -1920,7 +1920,7 @@ app.post('/api/unknown-faces/save', async (req, res) => {
 // Debug: check DB directly
 app.get('/api/unknown-faces/debug', async (req, res) => {
   try {
-    const rows = await dbQuery('SELECT id, image_file, date, time_detected, detected_at FROM unknown_faces ORDER BY id DESC LIMIT 20');
+    const rows = await dbQuery('SELECT id, image_file, date, time_detected, captured_at FROM unknown_faces ORDER BY id DESC LIMIT 20');
     const count = await dbQuery('SELECT COUNT(*) AS c FROM unknown_faces');
     res.json({ total: count[0].c, rows });
   } catch(e) { res.status(500).json({ error: e.message }); }
@@ -1940,24 +1940,24 @@ app.get('/api/unknown-faces', async (req, res) => {
     let sql = 'SELECT * FROM unknown_faces';
     const params = [];
     if (date) {
-      sql += ' WHERE (date = ? OR DATE(detected_at) = ?)';
+      sql += ' WHERE (date = ? OR DATE(captured_at) = ?)';
       params.push(date, date);
     }
-    sql += ' ORDER BY detected_at DESC LIMIT ? OFFSET ?';
+    sql += ' ORDER BY captured_at DESC LIMIT ? OFFSET ?';
     params.push(parseInt(limit), parseInt(offset));
 
     const faces = await dbQuery(sql, params);
 
     const totalRows = await dbQuery(
-      date ? 'SELECT COUNT(*) AS c FROM unknown_faces WHERE (date=? OR DATE(detected_at)=?)' : 'SELECT COUNT(*) AS c FROM unknown_faces',
+      date ? 'SELECT COUNT(*) AS c FROM unknown_faces WHERE (date=? OR DATE(captured_at)=?)' : 'SELECT COUNT(*) AS c FROM unknown_faces',
       date ? [date, date] : []
     );
     const todayRows = await dbQuery(
-      'SELECT COUNT(*) AS c FROM unknown_faces WHERE (date=? OR DATE(detected_at)=?)',
+      'SELECT COUNT(*) AS c FROM unknown_faces WHERE (date=? OR DATE(captured_at)=?)',
       [todayStr, todayStr]
     );
     const weekRows = await dbQuery(
-      'SELECT COUNT(*) AS c FROM unknown_faces WHERE (date >= ? OR DATE(detected_at) >= ?)',
+      'SELECT COUNT(*) AS c FROM unknown_faces WHERE (date >= ? OR DATE(captured_at) >= ?)',
       [weekStr, weekStr]
     );
 
@@ -1970,7 +1970,7 @@ app.get('/api/unknown-faces/count', async (req, res) => {
   try {
     const todayIST = new Date(new Date().toLocaleString('en-US', { timeZone: 'Asia/Kolkata' }));
     const todayStr = todayIST.getFullYear() + '-' + String(todayIST.getMonth()+1).padStart(2,'0') + '-' + String(todayIST.getDate()).padStart(2,'0');
-    const rows = await dbQuery('SELECT COUNT(*) AS c FROM unknown_faces WHERE date=?', [todayStr]);
+    const rows = await dbQuery('SELECT COUNT(*) AS c FROM unknown_faces WHERE (date=? OR DATE(captured_at)=?)', [todayStr, todayStr]);
     res.json({ count: rows[0].c });
   } catch(e) { res.status(500).json({ count: 0 }); }
 });
