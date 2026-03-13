@@ -650,26 +650,39 @@ function captureSnapshot(box){
 }
 
 function drawFaceCircle(box, color, label, sx, sy){
-  const cx = (box.x + box.width/2)  * sx;
-  const cy = (box.y + box.height/2) * sy;
-  const r  = Math.max(box.width, box.height) * 0.60 * ((sx+sy)/2);
-  ctx.beginPath(); ctx.arc(cx, cy, r+4, 0, Math.PI*2);
-  ctx.strokeStyle = color+'33'; ctx.lineWidth = 6; ctx.stroke();
-  ctx.beginPath(); ctx.arc(cx, cy, r, 0, Math.PI*2);
-  ctx.strokeStyle = color; ctx.lineWidth = 2.5; ctx.stroke();
-  ctx.beginPath(); ctx.arc(cx, cy, r, 0, Math.PI*2);
-  ctx.save(); ctx.globalAlpha = 0.06; ctx.fillStyle = color; ctx.fill(); ctx.restore();
+  const x = box.x * sx;
+  const y = box.y * sy;
+  const w = box.width  * sx;
+  const h = box.height * sy;
+  const pad = 10;
+  // Outer glow border
+  ctx.strokeStyle = color+'33'; ctx.lineWidth = 8;
+  ctx.beginPath(); ctx.roundRect(x-pad-4, y-pad-4, w+pad*2+8, h+pad*2+8, 8); ctx.stroke();
+  // Main border
+  ctx.strokeStyle = color; ctx.lineWidth = 2.5;
+  ctx.beginPath(); ctx.roundRect(x-pad, y-pad, w+pad*2, h+pad*2, 6); ctx.stroke();
+  // Fill tint
+  ctx.save(); ctx.globalAlpha = 0.06; ctx.fillStyle = color;
+  ctx.beginPath(); ctx.roundRect(x-pad, y-pad, w+pad*2, h+pad*2, 6); ctx.fill();
+  ctx.restore();
+  // Corner accents
+  const cs = 14; ctx.strokeStyle = color; ctx.lineWidth = 3;
+  [[x-pad, y-pad],[x-pad+w+pad*2, y-pad],[x-pad, y-pad+h+pad*2],[x-pad+w+pad*2, y-pad+h+pad*2]].forEach(([cx2,cy2],i)=>{
+    const dx = i%2===0?1:-1, dy = i<2?1:-1;
+    ctx.beginPath(); ctx.moveTo(cx2+dx*cs, cy2); ctx.lineTo(cx2, cy2); ctx.lineTo(cx2, cy2+dy*cs); ctx.stroke();
+  });
   if(label){
-    const txtY = cy - r - 10;
+    const cx = x - pad + (w + pad*2)/2;
+    const txtY = y - pad - 8;
     ctx.font = 'bold 13px Space Grotesk,sans-serif';
     const tw = ctx.measureText(label).width;
-    ctx.save(); ctx.globalAlpha=0.75; ctx.fillStyle='#000';
+    ctx.save(); ctx.globalAlpha=0.80; ctx.fillStyle='#000';
     ctx.beginPath(); ctx.roundRect(cx-tw/2-6, txtY-14, tw+12, 20, 5); ctx.fill();
     ctx.restore();
     ctx.fillStyle = color; ctx.textAlign='center';
     ctx.fillText(label, cx, txtY); ctx.textAlign='left';
   }
-  return {cx, cy, r};
+  return {cx: x+w/2, cy: y+h/2, r: Math.max(w,h)/2};
 }
 
 // ── CHECK IN ──────────────────────────────────────────────────
@@ -1202,19 +1215,25 @@ async function detectFace(){
 }
 
 function drawRegCircle(box, color, label, sx, sy){
-  const cx = (box.x + box.width/2)  * sx;
-  const cy = (box.y + box.height/2) * sy;
-  const r  = Math.max(box.width, box.height) * 0.60 * ((sx+sy)/2);
-  ctx.beginPath(); ctx.arc(cx, cy, r+4, 0, Math.PI*2);
-  ctx.strokeStyle = color+'44'; ctx.lineWidth = 6; ctx.stroke();
-  ctx.beginPath(); ctx.arc(cx, cy, r, 0, Math.PI*2);
-  ctx.strokeStyle = color; ctx.lineWidth = 2.5; ctx.stroke();
-  ctx.beginPath(); ctx.arc(cx, cy, r, 0, Math.PI*2);
-  ctx.save(); ctx.globalAlpha=0.07; ctx.fillStyle=color; ctx.fill(); ctx.restore();
+  const x = box.x * sx, y = box.y * sy;
+  const w = box.width * sx, h = box.height * sy;
+  const pad = 10;
+  ctx.strokeStyle = color+'44'; ctx.lineWidth = 8;
+  ctx.beginPath(); ctx.roundRect(x-pad-4, y-pad-4, w+pad*2+8, h+pad*2+8, 8); ctx.stroke();
+  ctx.strokeStyle = color; ctx.lineWidth = 2.5;
+  ctx.beginPath(); ctx.roundRect(x-pad, y-pad, w+pad*2, h+pad*2, 6); ctx.stroke();
+  ctx.save(); ctx.globalAlpha=0.07; ctx.fillStyle=color;
+  ctx.beginPath(); ctx.roundRect(x-pad, y-pad, w+pad*2, h+pad*2, 6); ctx.fill();
+  ctx.restore();
+  const cs=14; ctx.strokeStyle=color; ctx.lineWidth=3;
+  [[x-pad,y-pad],[x-pad+w+pad*2,y-pad],[x-pad,y-pad+h+pad*2],[x-pad+w+pad*2,y-pad+h+pad*2]].forEach(([cx2,cy2],i)=>{
+    const dx=i%2===0?1:-1, dy=i<2?1:-1;
+    ctx.beginPath(); ctx.moveTo(cx2+dx*cs,cy2); ctx.lineTo(cx2,cy2); ctx.lineTo(cx2,cy2+dy*cs); ctx.stroke();
+  });
   if(label){
+    const cx=x-pad+(w+pad*2)/2, txtY=y-pad-8;
     ctx.font='bold 12px Space Grotesk,monospace';
     const tw=ctx.measureText(label).width;
-    const txtY = cy - r - 10;
     ctx.save(); ctx.globalAlpha=0.75; ctx.fillStyle='#000';
     ctx.beginPath(); ctx.roundRect(cx-tw/2-6,txtY-14,tw+12,20,5); ctx.fill();
     ctx.restore();
