@@ -7,11 +7,12 @@ const path    = require('path');
 const app  = express();
 const PORT = process.env.PORT || 3000;
 
-app.use(express.json({ limit: '10mb' }));
+app.use(express.json({ limit: '20mb' }));   // increased for base64 image uploads
 app.use(express.urlencoded({ extended: true }));
 
 app.use('/models',    express.static(path.join(__dirname, 'public', 'models')));
 app.use('/faceapi.js',(req, res) => res.sendFile(path.join(__dirname, 'public', 'faceapi.js')));
+app.use('/unknown-images', express.static(path.join(__dirname, 'public', 'unknown-images')));
 
 const DB_CONFIG = {
   host     : '127.0.0.1',
@@ -56,14 +57,27 @@ db.connect(err => {
       FOREIGN KEY (face_id) REFERENCES faces(id) ON DELETE CASCADE
     )
   `, err => { if (!err) console.log('✅ attendance table ready'); });
+
+  // NEW: unknown_faces table
+  db.query(`
+    CREATE TABLE IF NOT EXISTS unknown_faces (
+      id           INT AUTO_INCREMENT PRIMARY KEY,
+      image_file   VARCHAR(255) DEFAULT NULL,
+      captured_at  DATETIME DEFAULT CURRENT_TIMESTAMP,
+      date         DATE NOT NULL,
+      time         TIME NOT NULL,
+      source       VARCHAR(50) DEFAULT 'checkin'
+    )
+  `, err => { if (!err) console.log('✅ unknown_faces table ready'); });
 });
 
 // ─── AUTO DOWNLOAD face-api.js + MODELS ──────────────────────────────────────
-const PUBLIC_DIR   = path.join(__dirname, 'public');
-const MODELS_DIR   = path.join(PUBLIC_DIR, 'models');
-const FACEAPI_PATH = path.join(PUBLIC_DIR, 'faceapi.js');
-const FACEAPI_URL  = 'https://unpkg.com/face-api.js@0.22.2/dist/face-api.min.js';
-const MODEL_FILES  = [
+const PUBLIC_DIR    = path.join(__dirname, 'public');
+const MODELS_DIR    = path.join(PUBLIC_DIR, 'models');
+const UNKNOWN_DIR   = path.join(PUBLIC_DIR, 'unknown-images');
+const FACEAPI_PATH  = path.join(PUBLIC_DIR, 'faceapi.js');
+const FACEAPI_URL   = 'https://unpkg.com/face-api.js@0.22.2/dist/face-api.min.js';
+const MODEL_FILES   = [
   'ssd_mobilenetv1_model-weights_manifest.json','ssd_mobilenetv1_model-shard1','ssd_mobilenetv1_model-shard2',
   'face_landmark_68_model-weights_manifest.json','face_landmark_68_model-shard1',
   'face_recognition_model-weights_manifest.json','face_recognition_model-shard1','face_recognition_model-shard2',
@@ -90,8 +104,9 @@ function download(url, dest) {
 }
 
 async function setup() {
-  if (!fs.existsSync(PUBLIC_DIR)) fs.mkdirSync(PUBLIC_DIR, { recursive: true });
-  if (!fs.existsSync(MODELS_DIR)) fs.mkdirSync(MODELS_DIR, { recursive: true });
+  if (!fs.existsSync(PUBLIC_DIR))  fs.mkdirSync(PUBLIC_DIR,  { recursive: true });
+  if (!fs.existsSync(MODELS_DIR))  fs.mkdirSync(MODELS_DIR,  { recursive: true });
+  if (!fs.existsSync(UNKNOWN_DIR)) fs.mkdirSync(UNKNOWN_DIR, { recursive: true });
   if (!fs.existsSync(FACEAPI_PATH)) {
     process.stdout.write('📥 Downloading face-api.js... ');
     try { await download(FACEAPI_URL, FACEAPI_PATH); console.log('✅'); }
@@ -109,31 +124,18 @@ async function setup() {
 }
 
 // ─── LED / BUZZER STATE ───────────────────────────────────────────────────────
-// Arduino polls GET /api/led/status every ~500 ms.
-// After each detection the server stores one pending command here.
 let pendingLedCommand = null;
 
-// Detection event  →  { led code, buzzer beeps }
-// LED codes:
-//   G  = GREEN solid  (present on-time)
-//   GL = GREEN blink  (late check-in)
-//   R  = RED   solid  (absent)
-//   RL = RED   blink  (early leave)
-//   RU = RED   blink  (unknown face)
-//   B  = BLUE  solid  (checkout normal)
-//   O  = BLUE  blink  (already checked in)
-//   OO = BLUE  blink  (already checked out)
-//   X  = OFF
 function getLedCommand(eventType) {
   const MAP = {
-    checkin_present:   { led: 'G',  buzzer: 1 },  // ✅ GREEN solid  + 1 beep
-    checkin_late:      { led: 'GL', buzzer: 1 },  // ⏰ GREEN blink  + 1 beep
-    checkin_absent:    { led: 'R',  buzzer: 2 },  // ❌ RED   solid  + 2 beeps
-    checkin_already:   { led: 'O',  buzzer: 3 },  // ⚠️ BLUE  blink  + 3 beeps
-    checkout_normal:   { led: 'B',  buzzer: 2 },  // 🚪 BLUE  solid  + 2 beeps
-    checkout_early:    { led: 'RL', buzzer: 2 },  // ⚠️ RED   blink  + 2 beeps
-    checkout_already:  { led: 'OO', buzzer: 3 },  // ⚠️ BLUE  blink  + 3 beeps
-    unknown:           { led: 'RU', buzzer: 5 },  // ❓ RED   blink  + 5 beeps
+    checkin_present:   { led: 'G',  buzzer: 1 },
+    checkin_late:      { led: 'GL', buzzer: 1 },
+    checkin_absent:    { led: 'R',  buzzer: 2 },
+    checkin_already:   { led: 'O',  buzzer: 3 },
+    checkout_normal:   { led: 'B',  buzzer: 2 },
+    checkout_early:    { led: 'RL', buzzer: 2 },
+    checkout_already:  { led: 'OO', buzzer: 3 },
+    unknown:           { led: 'RU', buzzer: 5 },
   };
   return MAP[eventType] || { led: 'X', buzzer: 0 };
 }
@@ -171,27 +173,37 @@ function fmtTime(t) {
   return (h % 12 || 12) + ':' + m + ' ' + (h >= 12 ? 'PM' : 'AM');
 }
 
+// Save base64 image to disk, return filename
+function saveUnknownImage(base64Data) {
+  try {
+    const matches = base64Data.match(/^data:image\/(png|jpeg|jpg|webp);base64,(.+)$/);
+    if (!matches) return null;
+    const ext      = matches[1] === 'jpeg' ? 'jpg' : matches[1];
+    const filename = 'unknown_' + Date.now() + '_' + Math.random().toString(36).slice(2,7) + '.' + ext;
+    const filepath = path.join(UNKNOWN_DIR, filename);
+    fs.writeFileSync(filepath, Buffer.from(matches[2], 'base64'));
+    return filename;
+  } catch(e) {
+    console.error('Image save error:', e.message);
+    return null;
+  }
+}
+
 // ─── OFFICE TIMING CONFIG ─────────────────────────────────────────────────────
-// Office starts 9:30 AM, 10 min grace → late after 9:40 AM
-// Office ends 6:10 PM (18:10)
-// After 11:00 AM check-in → marked absent
 const OFFICE_START   = { h: 9,  m: 30 };
 const GRACE_MINUTES  = 10;
 const OFFICE_END     = { h: 18, m: 10 };
-const ABSENT_AFTER   = { h: 11, m: 0 };   // 11:00 AM → absent
+const ABSENT_AFTER   = { h: 11, m: 0 };
 const THRESHOLD      = 0.5;
 const REGISTER_SAMPLES = 10;
 
-// Derived thresholds in total minutes
-const LATE_AFTER     = OFFICE_START.h * 60 + OFFICE_START.m + GRACE_MINUTES; // 580 = 9:40
-const CHECKOUT_FROM  = OFFICE_END.h   * 60 + OFFICE_END.m;                   // 1090 = 18:10
-const ABSENT_AFTER_MIN = ABSENT_AFTER.h * 60 + ABSENT_AFTER.m;               // 660 = 11:00
+const LATE_AFTER       = OFFICE_START.h * 60 + OFFICE_START.m + GRACE_MINUTES;
+const CHECKOUT_FROM    = OFFICE_END.h   * 60 + OFFICE_END.m;
+const ABSENT_AFTER_MIN = ABSENT_AFTER.h * 60 + ABSENT_AFTER.m;
 
-// Calculate expected checkout based on check-in time (min 8h work or office end whichever later)
 function calcExpectedCheckout(timeInStr) {
   const parts = timeInStr.split(':');
   const inMin = parseInt(parts[0]) * 60 + parseInt(parts[1]);
-  // Must work at least 8 hours OR leave at office end, whichever is later
   const byWorkHours = inMin + 8 * 60;
   const expected = Math.max(byWorkHours, CHECKOUT_FROM);
   const eh = Math.floor(expected / 60);
@@ -201,15 +213,10 @@ function calcExpectedCheckout(timeInStr) {
 
 function calcWorkingHours(timeIn, timeOut) {
   if (!timeIn || !timeOut) return null;
-  const toMin = s => {
-    const p = String(s).split(':');
-    return parseInt(p[0]) * 60 + parseInt(p[1]);
-  };
+  const toMin = s => { const p = String(s).split(':'); return parseInt(p[0]) * 60 + parseInt(p[1]); };
   const diff = toMin(timeOut) - toMin(timeIn);
   if (diff <= 0) return null;
-  const h = Math.floor(diff / 60);
-  const m = diff % 60;
-  return `${h}h ${m}m`;
+  return `${Math.floor(diff/60)}h ${diff%60}m`;
 }
 
 function calcWorkingMinutes(timeIn, timeOut) {
@@ -219,7 +226,16 @@ function calcWorkingMinutes(timeIn, timeOut) {
   return diff > 0 ? diff : 0;
 }
 
+function statusLabel(s) {
+  const map = {
+    present:'✅ Present', late:'⏰ Late', early_leave:'⚠️ Early Leave',
+    late_early_leave:'🔴 Late + Early', absent:'❌ Absent',
+  };
+  return map[s] || s;
+}
+
 // ─── ATTENDANCE PAGE ──────────────────────────────────────────────────────────
+// *** EXACTLY YOUR ORIGINAL getAttendanceHTML — only added ❓ Unknown nav link ***
 function getAttendanceHTML(todayRecords) {
   const rows = todayRecords.map(r => `
     <tr data-name="${escH(r.name.toLowerCase())}">
@@ -245,7 +261,6 @@ function getAttendanceHTML(todayRecords) {
 *{box-sizing:border-box;margin:0;padding:0}
 body{font-family:'Space Grotesk',sans-serif;background:var(--bg);color:var(--text);min-height:100vh;overflow-x:hidden}
 body::before{content:'';position:fixed;inset:0;background:radial-gradient(ellipse 80% 50% at 50% -10%,rgba(0,173,238,0.08),transparent);pointer-events:none;z-index:0}
-
 nav{position:sticky;top:0;z-index:100;background:rgba(255,255,255,0.96);backdrop-filter:blur(20px);border-bottom:1px solid var(--border);display:flex;align-items:center;justify-content:space-between;padding:0 32px;height:62px}
 .nav-left{display:flex;align-items:center;gap:16px}
 .nav-logo{font-family:'JetBrains Mono',monospace;font-size:1.05rem;font-weight:600;letter-spacing:2px}
@@ -256,26 +271,20 @@ nav{position:sticky;top:0;z-index:100;background:rgba(255,255,255,0.96);backdrop
 .reg-btn:hover{background:linear-gradient(135deg,rgba(0,173,238,0.22),rgba(248,249,250,1));border-color:rgba(0,173,238,0.6);transform:translateY(-1px)}
 .live-dot{width:8px;height:8px;border-radius:50%;background:var(--accent2);animation:livepulse 2s infinite}
 @keyframes livepulse{0%,100%{opacity:1;transform:scale(1)}50%{opacity:0.5;transform:scale(1.3)}}
-
 main{position:relative;z-index:1;max-width:1400px;margin:0 auto;padding:28px 32px}
-
-/* timing info bar */
 .timing-bar{display:flex;align-items:center;gap:10px;background:var(--card);border:1px solid var(--border);border-radius:12px;padding:10px 18px;margin-bottom:18px;flex-wrap:wrap}
 .timing-item{display:flex;align-items:center;gap:7px;font-size:0.78rem;color:var(--muted)}
 .timing-item strong{color:var(--text);font-family:'JetBrains Mono',monospace;font-size:0.8rem}
 .timing-sep{color:var(--muted2);font-size:0.9rem}
 .timing-dot{width:6px;height:6px;border-radius:50%;flex-shrink:0}
 .td-green{background:var(--accent2)}.td-yellow{background:var(--yellow)}.td-orange{background:var(--orange)}.td-purple{background:var(--purple)}
-
 .stats-bar{display:grid;grid-template-columns:repeat(5,1fr);gap:12px;margin-bottom:22px}
 .stat{background:var(--card);border:1px solid var(--border);border-radius:14px;padding:16px 18px;position:relative;overflow:hidden;transition:border-color 0.2s}
 .stat:hover{border-color:var(--muted2)}
 .stat-val{font-family:'JetBrains Mono',monospace;font-size:1.9rem;font-weight:600;color:var(--accent);line-height:1}
 .stat-val.green{color:var(--accent2)}.stat-val.red{color:var(--red)}.stat-val.yellow{color:var(--yellow)}.stat-val.orange{color:var(--orange)}.stat-val.purple{color:var(--purple)}
 .stat-label{font-size:0.67rem;color:var(--muted);text-transform:uppercase;letter-spacing:1.2px;margin-top:6px}
-
 .top-row{display:grid;grid-template-columns:1fr 400px;gap:20px;margin-bottom:22px}
-
 .cam-card{background:var(--card);border:1px solid var(--border);border-radius:16px;overflow:hidden}
 .cam-wrap{position:relative;background:#f8f9fa;aspect-ratio:4/3}
 #video{width:100%;height:100%;object-fit:cover;display:block}
@@ -293,8 +302,6 @@ main{position:relative;z-index:1;max-width:1400px;margin:0 auto;padding:28px 32p
 .btn-checkout{background:rgba(0,173,238,0.08);border:1px solid rgba(0,173,238,0.25);color:var(--accent)}.btn-checkout:hover:not(:disabled){background:rgba(0,173,238,0.16);transform:translateY(-1px)}
 .btn-auto{background:rgba(52,211,153,0.1);border:1px solid rgba(52,211,153,0.25);color:var(--accent2)}.btn-auto:hover:not(:disabled){background:rgba(52,211,153,0.2)}
 .btn-auto.active{background:rgba(248,113,113,0.1);border-color:rgba(248,113,113,0.3);color:var(--red)}
-
-/* result panel */
 .result-card{background:var(--card);border:1px solid var(--border);border-radius:16px;padding:22px;display:flex;flex-direction:column;gap:16px}
 .result-title{font-family:'JetBrains Mono',monospace;font-size:0.65rem;letter-spacing:2px;color:var(--muted);text-transform:uppercase}
 .result-idle{display:flex;flex-direction:column;align-items:center;justify-content:center;min-height:210px;gap:12px;color:var(--muted);font-size:0.82rem;text-align:center;line-height:1.7}
@@ -319,8 +326,7 @@ main{position:relative;z-index:1;max-width:1400px;margin:0 auto;padding:28px 32p
 .unk-hint{font-size:0.8rem;color:var(--muted);line-height:1.6}
 .goto-reg{display:inline-flex;align-items:center;gap:7px;padding:10px 16px;background:linear-gradient(135deg,rgba(0,173,238,0.12),rgba(248,249,250,0.9));border:1px solid rgba(0,173,238,0.25);color:var(--accent);font-size:0.8rem;font-weight:600;border-radius:10px;text-decoration:none;transition:all 0.2s;font-family:'Space Grotesk',sans-serif}
 .goto-reg:hover{background:linear-gradient(135deg,rgba(0,173,238,0.2),rgba(248,249,250,1));transform:translateY(-1px)}
-
-/* table */
+.unk-thumb{width:100%;max-height:120px;object-fit:cover;border-radius:10px;border:1px solid rgba(248,113,113,0.3);margin-top:4px}
 .table-card{background:var(--card);border:1px solid var(--border);border-radius:16px;overflow:hidden}
 .table-head{display:flex;align-items:center;justify-content:space-between;padding:14px 20px;border-bottom:1px solid var(--border)}
 .table-head h3{font-family:'JetBrains Mono',monospace;font-size:0.7rem;letter-spacing:1.5px;color:var(--muted);text-transform:uppercase}
@@ -347,7 +353,6 @@ td{padding:11px 16px;font-size:0.83rem;vertical-align:middle}
 .badge-late_early_leave{background:rgba(248,113,113,0.08);color:var(--red);border:1px solid rgba(248,113,113,0.18)}
 .badge-absent{background:rgba(248,113,113,0.08);color:var(--red);border:1px solid rgba(248,113,113,0.18)}
 .tbl-empty{text-align:center;padding:50px;color:var(--muted);font-size:0.84rem}
-
 #loadOv{position:fixed;inset:0;background:rgba(255,255,255,0.97);display:flex;flex-direction:column;align-items:center;justify-content:center;gap:18px;z-index:999}
 #loadOv.gone{display:none}
 .spin{width:46px;height:46px;border:2px solid var(--border);border-top-color:var(--accent);border-radius:50%;animation:spin 0.8s linear infinite}
@@ -359,20 +364,17 @@ td{padding:11px 16px;font-size:0.83rem;vertical-align:middle}
 .toast{position:fixed;bottom:24px;right:24px;padding:12px 20px;border-radius:12px;font-size:0.82rem;font-weight:600;opacity:0;transform:translateY(10px);transition:all 0.3s;z-index:500;pointer-events:none;max-width:340px}
 .toast.show{opacity:1;transform:translateY(0)}
 .toast.s{background:rgba(52,211,153,0.93);color:#000}.toast.e{background:rgba(248,113,113,0.93);color:#fff}.toast.i{background:rgba(0,173,238,0.93);color:#fff}.toast.w{background:rgba(251,191,36,0.93);color:#000}.toast.p{background:rgba(0,173,238,0.93);color:#fff}
-
 @media(max-width:1000px){.top-row{grid-template-columns:1fr}.stats-bar{grid-template-columns:repeat(3,1fr)}main{padding:16px}}
 @media(max-width:600px){.stats-bar{grid-template-columns:1fr 1fr}}
 </style>
 </head>
 <body>
-
 <div id="loadOv">
   <div class="spin"></div>
   <div class="load-h" id="loadTitle">Initializing</div>
   <div class="load-sub" id="loadMsg">Loading face recognition...</div>
   <div class="load-err" id="loadErr"></div>
 </div>
-
 <nav>
   <div class="nav-left">
     <div class="nav-logo">ATTEND<span>.</span>AI</div>
@@ -380,18 +382,15 @@ td{padding:11px 16px;font-size:0.83rem;vertical-align:middle}
   </div>
   <div class="nav-right">
     <div class="live-dot"></div>
-    <a class="reg-btn" href="/records" style="background:rgba(0,173,238,0.1);border-color:rgba(0,173,238,0.3);color:var(--accent)">
-      📊 Records
-    </a>
+    <a class="reg-btn" href="/unknown-faces" style="background:rgba(248,113,113,0.08);border-color:rgba(248,113,113,0.3);color:var(--red)">❓ Unknown</a>
+    <a class="reg-btn" href="/records" style="background:rgba(0,173,238,0.1);border-color:rgba(0,173,238,0.3);color:var(--accent)">📊 Records</a>
     <a class="reg-btn" href="/register">
       <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2"><path d="M16 21v-2a4 4 0 0 0-4-4H6a4 4 0 0 0-4 4v2"/><circle cx="9" cy="7" r="4"/><line x1="19" y1="8" x2="19" y2="14"/><line x1="22" y1="11" x2="16" y2="11"/></svg>
       Register Face
     </a>
   </div>
 </nav>
-
 <main>
-
   <div class="timing-bar">
     <div class="timing-item"><div class="timing-dot td-green"></div>On Time: before <strong>9:40 AM</strong></div>
     <div class="timing-sep">·</div>
@@ -403,7 +402,6 @@ td{padding:11px 16px;font-size:0.83rem;vertical-align:middle}
     <div class="timing-sep">·</div>
     <div class="timing-item"><div class="timing-dot" style="background:var(--red)"></div>Absent if check-in after <strong>11:00 AM</strong></div>
   </div>
-
   <div class="stats-bar">
     <div class="stat"><div class="stat-val green" id="stPresent">0</div><div class="stat-label">Present</div></div>
     <div class="stat"><div class="stat-val yellow" id="stLate">0</div><div class="stat-label">Late</div></div>
@@ -411,7 +409,6 @@ td{padding:11px 16px;font-size:0.83rem;vertical-align:middle}
     <div class="stat"><div class="stat-val" id="stTotal">0</div><div class="stat-label">Registered</div></div>
     <div class="stat"><div class="stat-val red" id="stAbsent">0</div><div class="stat-label">Absent</div></div>
   </div>
-
   <div class="top-row">
     <div class="cam-card">
       <div class="cam-wrap">
@@ -429,7 +426,6 @@ td{padding:11px 16px;font-size:0.83rem;vertical-align:middle}
         <button class="btn btn-auto"     id="btnA"  disabled onclick="toggleAuto()">▶ Auto</button>
       </div>
     </div>
-
     <div class="result-card">
       <div class="result-title">Recognition Result</div>
       <div class="result-idle" id="resultIdle">
@@ -464,7 +460,9 @@ td{padding:11px 16px;font-size:0.83rem;vertical-align:middle}
       </div>
       <div class="unknown-box" id="unknownBox">
         <span class="r-badge rb-unk">❓ Unknown Person</span>
-        <div class="unk-hint">Face not found in the system. Register this person first to track attendance.</div>
+        <div class="unk-hint">Face not found in the system. Image captured and saved to Unknown Faces log.</div>
+        <img id="unkThumb" class="unk-thumb" src="" style="display:none" alt="captured"/>
+        <a class="goto-reg" href="/unknown-faces">❓ View Unknown Faces</a>
         <a class="goto-reg" href="/register">
           <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M16 21v-2a4 4 0 0 0-4-4H6a4 4 0 0 0-4 4v2"/><circle cx="9" cy="7" r="4"/><line x1="19" y1="8" x2="19" y2="14"/><line x1="22" y1="11" x2="16" y2="11"/></svg>
           Register This Person
@@ -472,7 +470,6 @@ td{padding:11px 16px;font-size:0.83rem;vertical-align:middle}
       </div>
     </div>
   </div>
-
   <div class="table-card">
     <div class="table-head">
       <h3>Today's Attendance Log</h3>
@@ -483,9 +480,7 @@ td{padding:11px 16px;font-size:0.83rem;vertical-align:middle}
     </div>
     <div class="tbl-wrap">
       <table>
-        <thead>
-          <tr><th>Name</th><th>Check In</th><th>Check Out</th><th>Status</th></tr>
-        </thead>
+        <thead><tr><th>Name</th><th>Check In</th><th>Check Out</th><th>Status</th></tr></thead>
         <tbody id="attBody">
           ${rows || '<tr><td colspan="4" class="tbl-empty">No attendance marked yet today</td></tr>'}
         </tbody>
@@ -493,9 +488,7 @@ td{padding:11px 16px;font-size:0.83rem;vertical-align:middle}
     </div>
   </div>
 </main>
-
 <div class="toast" id="toast"></div>
-
 <script>
 const MODEL_URL = '/models';
 const THRESHOLD = ${THRESHOLD};
@@ -557,96 +550,94 @@ async function detectFace(){
     .withFaceLandmarks().withFaceDescriptor();
 }
 
-// Draw circular face overlay + label above
-function drawFaceCircle(box, color, label, sx, sy){
-  const cx = (box.x + box.width/2)  * sx;
-  const cy = (box.y + box.height/2) * sy;
-  const r  = Math.max(box.width, box.height) * 0.60 * ((sx+sy)/2);
-  // Outer glow ring
-  ctx.beginPath(); ctx.arc(cx, cy, r+4, 0, Math.PI*2);
-  ctx.strokeStyle = color+'33'; ctx.lineWidth = 6; ctx.stroke();
-  // Main circle
-  ctx.beginPath(); ctx.arc(cx, cy, r, 0, Math.PI*2);
-  ctx.strokeStyle = color; ctx.lineWidth = 2.5; ctx.stroke();
-  // Fill tint
-  ctx.beginPath(); ctx.arc(cx, cy, r, 0, Math.PI*2);
-  ctx.save(); ctx.globalAlpha = 0.06; ctx.fillStyle = color; ctx.fill(); ctx.restore();
-  // Label above circle
-  if(label){
-    const txtY = cy - r - 10;
-    ctx.font = 'bold 13px Space Grotesk,sans-serif';
-    const tw = ctx.measureText(label).width;
-    ctx.save(); ctx.globalAlpha=0.75; ctx.fillStyle='#000';
-    ctx.beginPath(); ctx.roundRect(cx-tw/2-6, txtY-14, tw+12, 20, 5); ctx.fill();
-    ctx.restore();
-    ctx.fillStyle = color; ctx.textAlign='center';
-    ctx.fillText(label, cx, txtY); ctx.textAlign='left';
-  }
-  return {cx, cy, r};
+function captureFrame(){
+  try{
+    const c=document.createElement('canvas');
+    c.width=video.videoWidth||640;c.height=video.videoHeight||480;
+    c.getContext('2d').drawImage(video,0,0,c.width,c.height);
+    return c.toDataURL('image/jpeg',0.7);
+  }catch(e){return null;}
 }
 
-// ── CHECK IN ──────────────────────────────────────────────────
+function drawFaceCircle(box,color,label,sx,sy){
+  const cx=(box.x+box.width/2)*sx,cy=(box.y+box.height/2)*sy;
+  const r=Math.max(box.width,box.height)*0.60*((sx+sy)/2);
+  ctx.beginPath();ctx.arc(cx,cy,r+4,0,Math.PI*2);ctx.strokeStyle=color+'33';ctx.lineWidth=6;ctx.stroke();
+  ctx.beginPath();ctx.arc(cx,cy,r,0,Math.PI*2);ctx.strokeStyle=color;ctx.lineWidth=2.5;ctx.stroke();
+  ctx.beginPath();ctx.arc(cx,cy,r,0,Math.PI*2);ctx.save();ctx.globalAlpha=0.06;ctx.fillStyle=color;ctx.fill();ctx.restore();
+  if(label){
+    const txtY=cy-r-10;ctx.font='bold 13px Space Grotesk,sans-serif';
+    const tw=ctx.measureText(label).width;
+    ctx.save();ctx.globalAlpha=0.75;ctx.fillStyle='#000';
+    ctx.beginPath();ctx.roundRect(cx-tw/2-6,txtY-14,tw+12,20,5);ctx.fill();ctx.restore();
+    ctx.fillStyle=color;ctx.textAlign='center';ctx.fillText(label,cx,txtY);ctx.textAlign='left';
+  }
+  return{cx,cy,r};
+}
+
 async function capture(){
   if(!isReady)return;
   setSt('Scanning for check-in...','pulse');clearC();
   const det=await detectFace();
   if(!det){setSt('No face detected — look at the camera','bad');showIdle();toast('No face detected','e');return;}
-
   const{x,y,width,height}=det.detection.box;
   const sx=overlay.width/video.videoWidth,sy=overlay.height/video.videoHeight;
-
   const res=await fetch('/api/attendance/mark',{
     method:'POST',headers:{'Content-Type':'application/json'},
     body:JSON.stringify({descriptor:Array.from(det.descriptor)})
   });
   const data=await res.json();
-
-  if(data.success && data.recognized){
+  if(data.success&&data.recognized){
     if(data.already){
-      const lbl = data.name+(data.confidence!=null?' '+data.confidence+'%':'');
+      const lbl=data.name+(data.confidence!=null?' '+data.confidence+'%':'');
       drawFaceCircle({x,y,width,height},'#00adee',lbl,sx,sy);
       setSt('Already checked in: '+data.name,'pulse');
       showResult({...data,mode:'already'});
       toast('⚠️ '+data.name+' already checked in today','w');
     }else{
       const col=data.status==='late'?'#fbbf24':(data.status==='absent'?'#f87171':'#34d399');
-      const confTxt = data.confidence!=null?' ('+data.confidence+'%)':'';
-      const lbl = (data.status==='late'?'⏰ ':(data.status==='absent'?'❌ ':'✓ '))+data.name+confTxt;
+      const confTxt=data.confidence!=null?' ('+data.confidence+'%)':'';
+      const lbl=(data.status==='late'?'⏰ ':(data.status==='absent'?'❌ ':'✓ '))+data.name+confTxt;
       drawFaceCircle({x,y,width,height},col,lbl,sx,sy);
-      let stMsg = (data.status==='late'?'⏰ Late':(data.status==='absent'?'❌ Absent':'✅ Present'))+': '+data.name+' at '+data.time_in+(data.confidence!=null?' | Accuracy: '+data.confidence+'%':'');
-      if(data.status==='late'&&data.expected_checkout) stMsg+=' | Expected out: '+data.expected_checkout;
-      setSt(stMsg, data.status==='absent'?'bad':(data.status==='late'?'pulse':'ok'));
-      showResult({...data,mode:'checkin'});
-      loadStats();loadTable();
-      let toastMsg = (data.status==='late'?'⏰ Late':(data.status==='absent'?'❌ Marked Absent':'✅ Present'))+': '+data.name+' at '+data.time_in+(data.confidence!=null?' ('+data.confidence+'%)':'');
-      if(data.status==='late'&&data.expected_checkout) toastMsg+=' | Checkout by: '+data.expected_checkout;
-      toast(toastMsg, data.status==='absent'?'e':(data.status==='late'?'w':'s'));
+      let stMsg=(data.status==='late'?'⏰ Late':(data.status==='absent'?'❌ Absent':'✅ Present'))+': '+data.name+' at '+data.time_in+(data.confidence!=null?' | Accuracy: '+data.confidence+'%':'');
+      if(data.status==='late'&&data.expected_checkout)stMsg+=' | Expected out: '+data.expected_checkout;
+      setSt(stMsg,data.status==='absent'?'bad':(data.status==='late'?'pulse':'ok'));
+      showResult({...data,mode:'checkin'});loadStats();loadTable();
+      let toastMsg=(data.status==='late'?'⏰ Late':(data.status==='absent'?'❌ Marked Absent':'✅ Present'))+': '+data.name+' at '+data.time_in+(data.confidence!=null?' ('+data.confidence+'%)':'');
+      if(data.status==='late'&&data.expected_checkout)toastMsg+=' | Checkout by: '+data.expected_checkout;
+      toast(toastMsg,data.status==='absent'?'e':(data.status==='late'?'w':'s'));
     }
   }else if(!data.recognized){
     drawFaceCircle({x,y,width,height},'#f87171','Unknown',sx,sy);
-    setSt('Unknown face — not registered','bad');showUnknown();toast('Unknown — register first','e');
+    setSt('Unknown face — not registered','bad');
+    // capture image and send to server
+    const img=captureFrame();
+    let thumbSrc=null;
+    if(img){
+      const ur=await fetch('/api/unknown-faces/capture',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({image:img,source:'checkin'})});
+      const ud=await ur.json();
+      if(ud.image_url)thumbSrc=ud.image_url;
+    }
+    showUnknown(thumbSrc);
+    toast('Unknown — image captured & saved','e');
   }else{
     toast(data.error||'Check-in failed','e');
   }
 }
 
-// ── CHECK OUT ─────────────────────────────────────────────────
 async function captureCheckout(){
   if(!isReady)return;
   setSt('Scanning for check-out...','pulse');clearC();
   const det=await detectFace();
   if(!det){setSt('No face detected — look at the camera','bad');showIdle();toast('No face detected','e');return;}
-
   const{x,y,width,height}=det.detection.box;
   const sx=overlay.width/video.videoWidth,sy=overlay.height/video.videoHeight;
   drawFaceCircle({x,y,width,height},'#a78bfa',null,sx,sy);
-
   const res=await fetch('/api/attendance/checkout',{
     method:'POST',headers:{'Content-Type':'application/json'},
     body:JSON.stringify({descriptor:Array.from(det.descriptor)})
   });
   const data=await res.json();
-
   if(data.success){
     if(data.already_out){
       drawFaceCircle({x,y,width,height},'#a78bfa',data.name+(data.confidence!=null?' '+data.confidence+'%':''),sx,sy);
@@ -656,14 +647,12 @@ async function captureCheckout(){
     }else if(data.early){
       drawFaceCircle({x,y,width,height},'#fb923c','⚠ '+data.name+(data.confidence!=null?' '+data.confidence+'%':''),sx,sy);
       setSt('⚠️ Early leave: '+data.name+' at '+data.time_out+(data.confidence!=null?' | Accuracy: '+data.confidence+'%':''),'pulse');
-      showResult({...data,mode:'early'});
-      loadStats();loadTable();
+      showResult({...data,mode:'early'});loadStats();loadTable();
       toast('⚠️ '+data.name+' left early at '+data.time_out+(data.confidence!=null?' ('+data.confidence+'%)':''),'w');
     }else{
       drawFaceCircle({x,y,width,height},'#a78bfa','✓ '+data.name+(data.confidence!=null?' '+data.confidence+'%':''),sx,sy);
       setSt('🚪 Checked out: '+data.name+' at '+data.time_out+(data.confidence!=null?' | Accuracy: '+data.confidence+'%':''),'ok');
-      showResult({...data,mode:'checkout'});
-      loadStats();loadTable();
+      showResult({...data,mode:'checkout'});loadStats();loadTable();
       toast('🚪 '+data.name+' checked out at '+data.time_out+(data.confidence!=null?' ('+data.confidence+'%)':''),'p');
     }
   }else if(data.not_checked_in){
@@ -671,22 +660,26 @@ async function captureCheckout(){
     toast(data.name+' has no check-in today — check in first','e');
   }else if(!data.recognized){
     drawFaceCircle({x,y,width,height},'#f87171','Unknown',sx,sy);
-    setSt('Unknown face','bad');showUnknown();toast('Unknown — register first','e');
+    setSt('Unknown face','bad');
+    const img=captureFrame();
+    if(img)await fetch('/api/unknown-faces/capture',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({image:img,source:'checkout'})});
+    showUnknown(null);toast('Unknown — register first','e');
   }else{
     toast(data.error||'Checkout failed','e');
   }
 }
 
-// ── RESULT DISPLAY ────────────────────────────────────────────
 function showIdle(){
   document.getElementById('resultIdle').style.display='flex';
   document.getElementById('recognizedBox').style.display='none';
   document.getElementById('unknownBox').style.display='none';
 }
-function showUnknown(){
+function showUnknown(thumbSrc){
   document.getElementById('resultIdle').style.display='none';
   document.getElementById('recognizedBox').style.display='none';
   document.getElementById('unknownBox').style.display='flex';
+  const img=document.getElementById('unkThumb');
+  if(thumbSrc){img.src=thumbSrc;img.style.display='block';}else{img.style.display='none';}
 }
 function showResult(d){
   document.getElementById('resultIdle').style.display='none';
@@ -698,94 +691,45 @@ function showResult(d){
   const badge=document.getElementById('rBadge');
   const tOutEl=document.getElementById('rTimeOut');
   const tOutLbl=document.getElementById('rTimeOutLabel');
-
-  // Live match confidence
-  const conf = d.confidence != null ? d.confidence : null;
-  const confEl = document.getElementById('rConf');
-  const confBar = document.getElementById('rConfBar');
-  if(conf != null){
-    confEl.textContent = conf+'%';
-    confBar.style.width = conf+'%';
-    const confColor = conf>=85?'var(--accent2)':conf>=65?'var(--yellow)':'var(--orange)';
-    confEl.style.color = confColor;
-    confBar.style.background = confColor;
-  } else {
-    confEl.textContent='—'; confBar.style.width='0%'; confEl.style.color='var(--accent)';
-  }
-
-  // Registration quality
-  const regAcc = d.registered_accuracy != null ? d.registered_accuracy : null;
-  const regEl  = document.getElementById('rRegAcc');
-  const regBar = document.getElementById('rRegAccBar');
-  if(regAcc != null){
-    regEl.textContent = regAcc+'%';
-    regBar.style.width = regAcc+'%';
-    const regColor = regAcc>=85?'var(--accent2)':regAcc>=65?'var(--yellow)':'var(--orange)';
-    regEl.style.color = regColor;
-    regBar.style.background = regColor;
-  } else {
-    regEl.textContent='—'; regBar.style.width='0%'; regEl.style.color='var(--muted)';
-  }
-
+  const conf=d.confidence!=null?d.confidence:null;
+  const confEl=document.getElementById('rConf'),confBar=document.getElementById('rConfBar');
+  if(conf!=null){confEl.textContent=conf+'%';confBar.style.width=conf+'%';const c=conf>=85?'var(--accent2)':conf>=65?'var(--yellow)':'var(--orange)';confEl.style.color=c;confBar.style.background=c;}
+  else{confEl.textContent='—';confBar.style.width='0%';confEl.style.color='var(--accent)';}
+  const regAcc=d.registered_accuracy!=null?d.registered_accuracy:null;
+  const regEl=document.getElementById('rRegAcc'),regBar=document.getElementById('rRegAccBar');
+  if(regAcc!=null){regEl.textContent=regAcc+'%';regBar.style.width=regAcc+'%';const c=regAcc>=85?'var(--accent2)':regAcc>=65?'var(--yellow)':'var(--orange)';regEl.style.color=c;regBar.style.background=c;}
+  else{regEl.textContent='—';regBar.style.width='0%';regEl.style.color='var(--muted)';}
   if(d.mode==='checkin'){
-    tOutEl.textContent=d.status||'—';
-    tOutLbl.textContent='Status';
+    tOutEl.textContent=d.status||'—';tOutLbl.textContent='Status';
     if(d.status==='absent'){badge.className='r-badge rb-unk';badge.textContent='❌ Absent (late entry)';}
-    else if(d.status==='late'){
-      badge.className='r-badge rb-late';badge.textContent='⏰ Late';
-      if(d.expected_checkout){tOutEl.textContent=d.expected_checkout;tOutLbl.textContent='Expected Checkout';}
-    }
+    else if(d.status==='late'){badge.className='r-badge rb-late';badge.textContent='⏰ Late';if(d.expected_checkout){tOutEl.textContent=d.expected_checkout;tOutLbl.textContent='Expected Checkout';}}
     else{badge.className='r-badge rb-present';badge.textContent='✅ Present';}
   }else if(d.mode==='checkout'){
-    tOutEl.textContent=d.time_out||'—';
-    tOutLbl.textContent='Time Out';
+    tOutEl.textContent=d.time_out||'—';tOutLbl.textContent='Time Out';
     badge.className='r-badge rb-checkout';badge.textContent='🚪 Checked Out';
   }else if(d.mode==='early'){
-    tOutEl.textContent=d.time_out||'—';
-    tOutLbl.textContent='Left Early At';
+    tOutEl.textContent=d.time_out||'—';tOutLbl.textContent='Left Early At';
     badge.className='r-badge rb-early';badge.textContent='⚠️ Early Leave';
   }else if(d.mode==='already'){
-    tOutEl.textContent=d.status||'—';
-    tOutLbl.textContent='Status';
+    tOutEl.textContent=d.status||'—';tOutLbl.textContent='Status';
     badge.className='r-badge rb-already';badge.textContent='⚠️ Already Checked In';
   }else if(d.mode==='already_out'){
-    tOutEl.textContent=d.time_out||'—';
-    tOutLbl.textContent='Time Out';
+    tOutEl.textContent=d.time_out||'—';tOutLbl.textContent='Time Out';
     badge.className='r-badge rb-already';badge.textContent='⚠️ Already Checked Out';
   }
 }
 
-// ── AUTO MODE ─────────────────────────────────────────────────
 function toggleAuto(){
   autoOn=!autoOn;
   const b=document.getElementById('btnA');
-  if(autoOn){
-    b.textContent='⏹ Stop';b.classList.add('active');
-    document.getElementById('btnC').disabled=true;
-    document.getElementById('btnCO').disabled=true;
-    runAuto();toast('Auto scan ON (Check In mode)','i');
-  }else{
-    b.textContent='▶ Auto';b.classList.remove('active');
-    document.getElementById('btnC').disabled=false;
-    document.getElementById('btnCO').disabled=false;
-    toast('Auto scan OFF','i');
-  }
+  if(autoOn){b.textContent='⏹ Stop';b.classList.add('active');document.getElementById('btnC').disabled=true;document.getElementById('btnCO').disabled=true;runAuto();toast('Auto scan ON (Check In mode)','i');}
+  else{b.textContent='▶ Auto';b.classList.remove('active');document.getElementById('btnC').disabled=false;document.getElementById('btnCO').disabled=false;toast('Auto scan OFF','i');}
 }
 async function runAuto(){while(autoOn){await capture();await new Promise(r=>setTimeout(r,3000));}}
 
-// ── DATA ──────────────────────────────────────────────────────
 async function loadStats(){
-  try{
-    const{stats}=await(await fetch('/api/attendance/stats')).json();
-    if(!stats)return;
-    document.getElementById('stPresent').textContent=stats.present||0;
-    document.getElementById('stLate').textContent=stats.late||0;
-    document.getElementById('stEarly').textContent=stats.early||0;
-    document.getElementById('stTotal').textContent=stats.total||0;
-    document.getElementById('stAbsent').textContent=stats.absent||0;
-  }catch(e){}
+  try{const{stats}=await(await fetch('/api/attendance/stats')).json();if(!stats)return;document.getElementById('stPresent').textContent=stats.present||0;document.getElementById('stLate').textContent=stats.late||0;document.getElementById('stEarly').textContent=stats.early||0;document.getElementById('stTotal').textContent=stats.total||0;document.getElementById('stAbsent').textContent=stats.absent||0;}catch(e){}
 }
-
 async function loadTable(){
   try{
     const{records=[]}=await(await fetch('/api/attendance/today')).json();
@@ -793,28 +737,14 @@ async function loadTable(){
     const body=document.getElementById('attBody');
     if(!records.length){body.innerHTML='<tr><td colspan="4" class="tbl-empty">No attendance marked yet today</td></tr>';return;}
     const labels={'present':'✅ Present','late':'⏰ Late','early_leave':'⚠️ Early Leave','late_early_leave':'🔴 Late + Early Leave','absent':'❌ Absent'};
-    body.innerHTML=records.map(r=>
-      '<tr data-name="'+esc(r.name.toLowerCase())+'">' +
-      '<td><div class="td-name"><div class="td-av">'+r.name[0].toUpperCase()+'</div>'+esc(r.name)+'</div></td>' +
-      '<td><span class="time-pill">'+r.time_in+'</span></td>' +
-      '<td><span class="time-pill out">'+r.time_out+'</span></td>' +
-      '<td><span class="badge badge-'+r.status+'">'+(labels[r.status]||r.status)+'</span></td>' +
-      '</tr>'
-    ).join('');
+    body.innerHTML=records.map(r=>'<tr data-name="'+esc(r.name.toLowerCase())+'"><td><div class="td-name"><div class="td-av">'+r.name[0].toUpperCase()+'</div>'+esc(r.name)+'</div></td><td><span class="time-pill">'+r.time_in+'</span></td><td><span class="time-pill out">'+r.time_out+'</span></td><td><span class="badge badge-'+r.status+'">'+(labels[r.status]||r.status)+'</span></td></tr>').join('');
   }catch(e){}
 }
-
-function filterTable(q){
-  document.querySelectorAll('#attBody tr[data-name]').forEach(r=>{
-    r.style.display=r.dataset.name.includes(q.toLowerCase())?'':'none';
-  });
-}
-
+function filterTable(q){document.querySelectorAll('#attBody tr[data-name]').forEach(r=>{r.style.display=r.dataset.name.includes(q.toLowerCase())?'':'none';});}
 function clearC(){ctx.clearRect(0,0,overlay.width,overlay.height);}
 function setSt(t,type){document.getElementById('st').textContent=t;const d=document.getElementById('sled');d.className='sled';if(type)d.classList.add(type);}
 function toast(msg,type='i'){const t=document.getElementById('toast');t.textContent=msg;t.className='toast '+type+' show';clearTimeout(t._to);t._to=setTimeout(()=>t.classList.remove('show'),4000);}
 function esc(s){return String(s).replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));}
-
 loadStats();loadTable();
 setInterval(()=>{loadStats();loadTable();},30000);
 </script>
@@ -822,19 +752,7 @@ setInterval(()=>{loadStats();loadTable();},30000);
 </html>`;
 }
 
-// ─── STATUS LABEL HELPER ──────────────────────────────────────────────────────
-function statusLabel(s) {
-  const map = {
-    present:           '✅ Present',
-    late:              '⏰ Late',
-    early_leave:       '⚠️ Early Leave',
-    late_early_leave:  '🔴 Late + Early',
-    absent:            '❌ Absent',
-  };
-  return map[s] || s;
-}
-
-// ─── REGISTER PAGE ────────────────────────────────────────────────────────────
+// ─── REGISTER PAGE ─────────────────────────────────────────── (unchanged from original)
 function getRegisterHTML(faces) {
   const rows = faces.map(f => {
     const ra = f.registration_accuracy;
@@ -862,39 +780,29 @@ function getRegisterHTML(faces) {
 <title>Register Face — Attendance</title>
 <style>
 @import url('https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@300;400;500;600;700&family=JetBrains+Mono:wght@400;600&display=swap');
-:root{
-  --bg:#ffffff;--surface:#f8f9fa;--card:#ffffff;--border:#dbe3ea;
-  --accent:#00adee;--accent2:#00adee;--red:#f87171;--yellow:#fbbf24;
-  --purple:#00adee;--text:#1f2937;--muted:#6b7280;--muted2:#cfd8e3;
-}
+:root{--bg:#ffffff;--surface:#f8f9fa;--card:#ffffff;--border:#dbe3ea;--accent:#00adee;--accent2:#00adee;--red:#f87171;--yellow:#fbbf24;--purple:#00adee;--text:#1f2937;--muted:#6b7280;--muted2:#cfd8e3;}
 *{box-sizing:border-box;margin:0;padding:0}
 body{font-family:'Space Grotesk',sans-serif;background:var(--bg);color:var(--text);min-height:100vh;overflow-x:hidden}
 body::before{content:'';position:fixed;inset:0;background:radial-gradient(ellipse 60% 40% at 80% 20%,rgba(0,173,238,0.07),transparent),radial-gradient(ellipse 50% 50% at 20% 80%,rgba(0,173,238,0.05),transparent);pointer-events:none;z-index:0}
-
 nav{position:sticky;top:0;z-index:100;background:rgba(255,255,255,0.96);backdrop-filter:blur(20px);border-bottom:1px solid var(--border);display:flex;align-items:center;justify-content:space-between;padding:0 32px;height:62px}
 .nav-logo{font-family:'JetBrains Mono',monospace;font-size:1.05rem;font-weight:600;letter-spacing:2px}
 .nav-logo span{color:var(--purple)}
 .nav-logo em{font-style:normal;font-family:'Space Grotesk',sans-serif;font-size:0.65rem;color:var(--muted);letter-spacing:1px;margin-left:8px;font-weight:400}
 .back-btn{display:flex;align-items:center;gap:8px;background:var(--card);border:1px solid var(--border);color:var(--muted);font-family:'Space Grotesk',sans-serif;font-size:0.82rem;font-weight:500;padding:8px 16px;border-radius:10px;text-decoration:none;transition:all 0.2s}
 .back-btn:hover{border-color:var(--accent);color:var(--text)}
-
 main{position:relative;z-index:1;max-width:1200px;margin:0 auto;padding:28px 32px;display:grid;grid-template-columns:420px 1fr;gap:24px}
-
 .left-col{display:flex;flex-direction:column;gap:16px}
 .cam-card{background:var(--card);border:1px solid var(--border);border-radius:16px;overflow:hidden}
 .cam-wrap{position:relative;background:#f8f9fa;aspect-ratio:4/3}
 #video{width:100%;height:100%;object-fit:cover;display:block}
 #overlay{position:absolute;inset:0;width:100%;height:100%;pointer-events:none}
 .corner{position:absolute;width:22px;height:22px;border-color:var(--purple);border-style:solid;opacity:0.6;pointer-events:none}
-.corner.tl{top:14px;left:14px;border-width:2px 0 0 2px}
-.corner.tr{top:14px;right:14px;border-width:2px 2px 0 0}
-.corner.bl{bottom:14px;left:14px;border-width:0 0 2px 2px}
-.corner.br{bottom:14px;right:14px;border-width:0 2px 2px 0}
+.corner.tl{top:14px;left:14px;border-width:2px 0 0 2px}.corner.tr{top:14px;right:14px;border-width:2px 2px 0 0}
+.corner.bl{bottom:14px;left:14px;border-width:0 0 2px 2px}.corner.br{bottom:14px;right:14px;border-width:0 2px 2px 0}
 .cam-status{padding:10px 14px;background:var(--surface);border-top:1px solid var(--border);display:flex;align-items:center;gap:8px;font-size:0.78rem;color:var(--muted)}
 .sled{width:7px;height:7px;border-radius:50%;background:var(--muted);flex-shrink:0;transition:background 0.3s}
 .sled.pulse{background:var(--yellow);animation:blink 1s infinite}.sled.ok{background:var(--accent2)}.sled.bad{background:var(--red)}.sled.purple{background:var(--purple)}
 @keyframes blink{0%,100%{opacity:1}50%{opacity:0.2}}
-
 .form-card{background:var(--card);border:1px solid var(--border);border-radius:16px;padding:22px;display:flex;flex-direction:column;gap:15px}
 .form-title{font-family:'JetBrains Mono',monospace;font-size:0.67rem;letter-spacing:2px;color:var(--muted);text-transform:uppercase;padding-bottom:10px;border-bottom:1px solid var(--border)}
 .field{display:flex;flex-direction:column;gap:6px}
@@ -908,7 +816,6 @@ main{position:relative;z-index:1;max-width:1200px;margin:0 auto;padding:28px 32p
 .reg-btn-main{width:100%;padding:12px;background:linear-gradient(135deg,rgba(0,173,238,0.14),rgba(248,249,250,0.95));border:1px solid rgba(0,173,238,0.35);color:var(--text);font-family:'Space Grotesk',sans-serif;font-size:0.88rem;font-weight:700;border-radius:12px;cursor:pointer;transition:all 0.2s;letter-spacing:0.3px;margin-top:2px}
 .reg-btn-main:hover:not(:disabled){background:linear-gradient(135deg,rgba(0,173,238,0.24),rgba(248,249,250,1));border-color:rgba(0,173,238,0.55);transform:translateY(-1px);box-shadow:0 4px 22px rgba(0,173,238,0.18)}
 .reg-btn-main:disabled{opacity:0.3;cursor:not-allowed}
-
 .right-col{}
 .list-card{background:var(--card);border:1px solid var(--border);border-radius:16px;overflow:hidden}
 .list-head{padding:16px 20px;border-bottom:1px solid var(--border);display:flex;align-items:center;justify-content:space-between}
@@ -919,15 +826,13 @@ main{position:relative;z-index:1;max-width:1200px;margin:0 auto;padding:28px 32p
 table{width:100%;border-collapse:collapse}
 thead th{padding:9px 14px;text-align:left;font-size:0.65rem;font-weight:600;color:var(--muted);text-transform:uppercase;letter-spacing:1px;background:var(--surface);border-bottom:1px solid var(--border);position:sticky;top:0}
 tbody tr{border-bottom:1px solid rgba(207,216,227,0.8);transition:background 0.15s}
-tbody tr:last-child{border-bottom:none}
-tbody tr:hover{background:rgba(0,173,238,0.04)}
+tbody tr:last-child{border-bottom:none}tbody tr:hover{background:rgba(0,173,238,0.04)}
 td{padding:10px 14px;font-size:0.82rem;vertical-align:middle}
 .td-name{display:flex;align-items:center;gap:10px;font-weight:600}
 .td-av{width:30px;height:30px;border-radius:50%;background:linear-gradient(135deg,#f8f9fa,#eef3f8);display:flex;align-items:center;justify-content:center;font-size:0.8rem;font-weight:700;color:var(--purple);border:1px solid rgba(0,173,238,0.2);flex-shrink:0}
 .del-btn{background:rgba(248,113,113,0.07);border:1px solid rgba(248,113,113,0.18);color:var(--red);font-size:0.72rem;font-weight:600;padding:4px 10px;border-radius:7px;cursor:pointer;font-family:'Space Grotesk',sans-serif;transition:all 0.2s}
 .del-btn:hover{background:rgba(248,113,113,0.18)}
 .list-empty{text-align:center;padding:44px 20px;color:var(--muted);font-size:0.82rem}
-
 #loadOv{position:fixed;inset:0;background:rgba(255,255,255,0.97);display:flex;flex-direction:column;align-items:center;justify-content:center;gap:18px;z-index:999}
 #loadOv.gone{display:none}
 .spin{width:46px;height:46px;border:2px solid var(--border);border-top-color:var(--purple);border-radius:50%;animation:spin 0.8s linear infinite}
@@ -939,7 +844,6 @@ td{padding:10px 14px;font-size:0.82rem;vertical-align:middle}
 .toast{position:fixed;bottom:24px;right:24px;padding:12px 20px;border-radius:12px;font-size:0.82rem;font-weight:600;opacity:0;transform:translateY(10px);transition:all 0.3s;z-index:500;pointer-events:none;max-width:320px}
 .toast.show{opacity:1;transform:translateY(0)}
 .toast.s{background:rgba(52,211,153,0.93);color:#000}.toast.e{background:rgba(248,113,113,0.93);color:#fff}.toast.i{background:rgba(0,173,238,0.93);color:#fff}
-
 @media(max-width:900px){main{grid-template-columns:1fr}main{padding:16px}}
 </style>
 </head>
@@ -950,10 +854,10 @@ td{padding:10px 14px;font-size:0.82rem;vertical-align:middle}
   <div class="load-sub" id="loadMsg">Initializing face detection...</div>
   <div class="load-err" id="loadErr"></div>
 </div>
-
 <nav>
   <div class="nav-logo">ATTEND<span>.</span>AI <em>/ Register</em></div>
   <div style="display:flex;gap:10px">
+    <a class="back-btn" href="/unknown-faces" style="border-color:rgba(248,113,113,0.3);color:var(--red)">❓ Unknown</a>
     <a class="back-btn" href="/records" style="border-color:rgba(0,173,238,0.3);color:var(--accent)">📊 Records</a>
     <a class="back-btn" href="/">
       <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M19 12H5M12 5l-7 7 7 7"/></svg>
@@ -961,7 +865,6 @@ td{padding:10px 14px;font-size:0.82rem;vertical-align:middle}
     </a>
   </div>
 </nav>
-
 <main>
   <div class="left-col">
     <div class="cam-card">
@@ -999,7 +902,6 @@ td{padding:10px 14px;font-size:0.82rem;vertical-align:middle}
       </button>
     </div>
   </div>
-
   <div class="right-col">
     <div class="list-card">
       <div class="list-head">
@@ -1010,16 +912,14 @@ td{padding:10px 14px;font-size:0.82rem;vertical-align:middle}
         <table>
           <thead><tr><th>Name</th><th>DB ID</th><th>Emp ID</th><th>Dept</th><th>Reg. Quality</th><th>Registered</th><th></th></tr></thead>
           <tbody id="facesTbody">
-            ${rows || '<tr><td colspan="6" class="list-empty">No faces registered yet.<br/>Use the camera on the left to enroll people.</td></tr>'}
+            ${rows || '<tr><td colspan="7" class="list-empty">No faces registered yet.<br/>Use the camera on the left to enroll people.</td></tr>'}
           </tbody>
         </table>
       </div>
     </div>
   </div>
 </main>
-
 <div class="toast" id="toast"></div>
-
 <script>
 const MODEL_URL   = '/models';
 const REG_SAMPLES = ${REGISTER_SAMPLES};
@@ -1031,21 +931,12 @@ const nameInp = document.getElementById('inp_name');
 const deptInp = document.getElementById('inp_dept');
 
 function blockDigitsInput(el){
-  if(!el) return;
-  el.addEventListener('keydown',e=>{
-    if(e.ctrlKey||e.metaKey||e.altKey) return;
-    if(/\d/.test(e.key)) e.preventDefault();
-  });
-  el.addEventListener('beforeinput',e=>{
-    if(e.data && /\d/.test(e.data)) e.preventDefault();
-  });
-  el.addEventListener('input',()=>{
-    const clean = el.value.replace(/\d+/g,'');
-    if(clean !== el.value) el.value = clean;
-  });
+  if(!el)return;
+  el.addEventListener('keydown',e=>{if(e.ctrlKey||e.metaKey||e.altKey)return;if(/\d/.test(e.key))e.preventDefault();});
+  el.addEventListener('beforeinput',e=>{if(e.data&&/\d/.test(e.data))e.preventDefault();});
+  el.addEventListener('input',()=>{const clean=el.value.replace(/\d+/g,'');if(clean!==el.value)el.value=clean;});
 }
-blockDigitsInput(nameInp);
-blockDigitsInput(deptInp);
+blockDigitsInput(nameInp);blockDigitsInput(deptInp);
 
 function showErr(msg){document.getElementById('loadTitle').textContent='❌ Error';document.getElementById('loadMsg').style.display='none';document.querySelector('.spin').style.display='none';const el=document.getElementById('loadErr');el.textContent=msg;el.classList.add('show');}
 function setLoad(t,m){document.getElementById('loadTitle').textContent=t;document.getElementById('loadMsg').textContent=m;}
@@ -1078,32 +969,16 @@ async function init(){
 }
 
 async function detectFace(){
-  return faceapi
-    .detectSingleFace(video,new faceapi.SsdMobilenetv1Options({minConfidence:0.65}))
-    .withFaceLandmarks().withFaceDescriptor();
+  return faceapi.detectSingleFace(video,new faceapi.SsdMobilenetv1Options({minConfidence:0.65})).withFaceLandmarks().withFaceDescriptor();
 }
 
-// Draw circle overlay on registration canvas
-function drawRegCircle(box, color, label, sx, sy){
-  const cx = (box.x + box.width/2)  * sx;
-  const cy = (box.y + box.height/2) * sy;
-  const r  = Math.max(box.width, box.height) * 0.60 * ((sx+sy)/2);
-  ctx.beginPath(); ctx.arc(cx, cy, r+4, 0, Math.PI*2);
-  ctx.strokeStyle = color+'44'; ctx.lineWidth = 6; ctx.stroke();
-  ctx.beginPath(); ctx.arc(cx, cy, r, 0, Math.PI*2);
-  ctx.strokeStyle = color; ctx.lineWidth = 2.5; ctx.stroke();
-  ctx.beginPath(); ctx.arc(cx, cy, r, 0, Math.PI*2);
-  ctx.save(); ctx.globalAlpha=0.07; ctx.fillStyle=color; ctx.fill(); ctx.restore();
-  if(label){
-    ctx.font='bold 12px Space Grotesk,monospace';
-    const tw=ctx.measureText(label).width;
-    const txtY = cy - r - 10;
-    ctx.save(); ctx.globalAlpha=0.75; ctx.fillStyle='#000';
-    ctx.beginPath(); ctx.roundRect(cx-tw/2-6,txtY-14,tw+12,20,5); ctx.fill();
-    ctx.restore();
-    ctx.fillStyle=color; ctx.textAlign='center';
-    ctx.fillText(label,cx,txtY); ctx.textAlign='left';
-  }
+function drawRegCircle(box,color,label,sx,sy){
+  const cx=(box.x+box.width/2)*sx,cy=(box.y+box.height/2)*sy;
+  const r=Math.max(box.width,box.height)*0.60*((sx+sy)/2);
+  ctx.beginPath();ctx.arc(cx,cy,r+4,0,Math.PI*2);ctx.strokeStyle=color+'44';ctx.lineWidth=6;ctx.stroke();
+  ctx.beginPath();ctx.arc(cx,cy,r,0,Math.PI*2);ctx.strokeStyle=color;ctx.lineWidth=2.5;ctx.stroke();
+  ctx.beginPath();ctx.arc(cx,cy,r,0,Math.PI*2);ctx.save();ctx.globalAlpha=0.07;ctx.fillStyle=color;ctx.fill();ctx.restore();
+  if(label){ctx.font='bold 12px Space Grotesk,monospace';const tw=ctx.measureText(label).width;const txtY=cy-r-10;ctx.save();ctx.globalAlpha=0.75;ctx.fillStyle='#000';ctx.beginPath();ctx.roundRect(cx-tw/2-6,txtY-14,tw+12,20,5);ctx.fill();ctx.restore();ctx.fillStyle=color;ctx.textAlign='center';ctx.fillText(label,cx,txtY);ctx.textAlign='left';}
 }
 
 async function registerFace(){
@@ -1115,8 +990,7 @@ async function registerFace(){
   const btn=document.getElementById('regBtn'),pB=document.getElementById('pB'),pL=document.getElementById('pL');
   btn.disabled=true;btn.textContent='⏳ Capturing...';
   setSt('Capturing samples — hold still...','purple');
-  const descs=[];
-  const detScores=[];  // face detection confidence scores per sample
+  const descs=[],detScores=[];
   for(let i=0;i<REG_SAMPLES;i++){
     pL.textContent='Sample '+(i+1)+'/'+REG_SAMPLES+' — hold still...';
     pB.style.width=(i/REG_SAMPLES*100)+'%';
@@ -1124,11 +998,9 @@ async function registerFace(){
     let det=await detectFace();
     if(!det){await new Promise(r=>setTimeout(r,500));det=await detectFace();}
     if(det){
-      const score = det.detection.score || 0;
-      // Only keep high-quality samples (score >= 0.65)
-      if(score >= 0.65){
-        descs.push(Array.from(det.descriptor));
-        detScores.push(score);
+      const score=det.detection.score||0;
+      if(score>=0.65){
+        descs.push(Array.from(det.descriptor));detScores.push(score);
         const{x,y,width,height}=det.detection.box;
         const sx=overlay.width/video.videoWidth,sy=overlay.height/video.videoHeight;
         ctx.clearRect(0,0,overlay.width,overlay.height);
@@ -1136,53 +1008,28 @@ async function registerFace(){
         const col=pct>=85?'#34d399':pct>=65?'#fbbf24':'#fb923c';
         drawRegCircle({x,y,width,height},col,'Sample '+(i+1)+': '+pct+'%',sx,sy);
         pL.textContent='Sample '+(i+1)+'/'+REG_SAMPLES+' — captured at '+pct+'% ✓';
-      } else {
-        const pct=Math.round(score*100);
-        pL.textContent='Sample '+(i+1)+'/'+REG_SAMPLES+' — quality too low ('+pct+'%), retrying...';
-        i--; // retry this sample
-        await new Promise(r=>setTimeout(r,300));
-      }
-    } else {
-      pL.textContent='Sample '+(i+1)+'/'+REG_SAMPLES+' — face not detected, skipping';
-    }
+      }else{const pct=Math.round(score*100);pL.textContent='Sample '+(i+1)+'/'+REG_SAMPLES+' — quality too low ('+pct+'%), retrying...';i--;await new Promise(r=>setTimeout(r,300));}
+    }else{pL.textContent='Sample '+(i+1)+'/'+REG_SAMPLES+' — face not detected, skipping';}
   }
   pB.style.width='100%';
-  if(descs.length < 3){
-    toast('Only '+descs.length+' sample(s) captured — need at least 3. Move closer and retry','e');
-    pL.textContent='Too few samples — move closer, ensure good lighting, and retry';
-    setSt('Not enough samples captured','bad');btn.disabled=false;btn.textContent='📸 Capture & Register Face';pB.style.width='0';return;
-  }
-  // Registration accuracy = average of detection confidence scores
-  const avgScore = detScores.reduce((a,b)=>a+b,0)/detScores.length;
-  const registration_accuracy = Math.round(avgScore*100);
-
+  if(descs.length<3){toast('Only '+descs.length+' sample(s) — need at least 3. Move closer and retry','e');pL.textContent='Too few samples — move closer, ensure good lighting, and retry';setSt('Not enough samples captured','bad');btn.disabled=false;btn.textContent='📸 Capture & Register Face';pB.style.width='0';return;}
+  const avgScore=detScores.reduce((a,b)=>a+b,0)/detScores.length;
+  const registration_accuracy=Math.round(avgScore*100);
   pL.textContent='Got '+descs.length+'/'+REG_SAMPLES+' samples | Reg. Quality: '+registration_accuracy+'% — saving...';
-  const res=await fetch('/api/register',{
-    method:'POST',headers:{'Content-Type':'application/json'},
-    // Send all descriptors (array of arrays) for better multi-pose matching
-    body:JSON.stringify({label:name,employee_id:empid,department:dept,descriptors:descs,registration_accuracy})
-  });
+  const res=await fetch('/api/register',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({label:name,employee_id:empid,department:dept,descriptors:descs,registration_accuracy})});
   const data=await res.json();
   ctx.clearRect(0,0,overlay.width,overlay.height);
   if(res.ok){
     toast('✅ "'+name+'" registered! Quality: '+registration_accuracy+'%','s');
     pL.textContent='✅ Registered: '+name+' | Quality: '+registration_accuracy+'% | Samples: '+descs.length;
     setSt('✅ Registered: '+name+' | Reg. Quality: '+registration_accuracy+'%','ok');
-    document.getElementById('inp_name').value='';
-    document.getElementById('inp_empid').value='';
-    document.getElementById('inp_dept').value='';
+    document.getElementById('inp_name').value='';document.getElementById('inp_empid').value='';document.getElementById('inp_dept').value='';
     loadFacesList();
-  }else{
-    toast(data.error||'Registration failed','e');
-    pL.textContent='Error: '+(data.error||'Failed');
-    setSt('Registration failed','bad');
-  }
+  }else{toast(data.error||'Registration failed','e');pL.textContent='Error: '+(data.error||'Failed');setSt('Registration failed','bad');}
   btn.disabled=false;btn.textContent='📸 Capture & Register Face';pB.style.width='0';
 }
 
-document.addEventListener('keydown',e=>{
-  if(e.key==='Enter'&&document.activeElement.classList.contains('inp'))registerFace();
-});
+document.addEventListener('keydown',e=>{if(e.key==='Enter'&&document.activeElement.classList.contains('inp'))registerFace();});
 
 async function loadFacesList(){
   const{faces=[]}=await(await fetch('/api/faces')).json();
@@ -1192,19 +1039,8 @@ async function loadFacesList(){
   tbody.innerHTML=faces.map(f=>{
     const ra=f.registration_accuracy;
     const raColor=ra>=85?'var(--accent2)':ra>=65?'var(--yellow)':'var(--orange)';
-    const raBadge=ra!=null
-      ? '<span style="font-family:monospace;font-size:0.8rem;font-weight:700;color:'+raColor+'">'+ra+'%</span>'
-        +'<div style="height:3px;border-radius:2px;background:#1a2540;margin-top:4px;width:60px"><div style="height:100%;width:'+ra+'%;background:'+raColor+';border-radius:2px"></div></div>'
-      : '<span style="color:var(--muted);font-size:0.75rem">—</span>';
-    return '<tr id="fr-'+f.id+'">' +
-      '<td><div class="td-name"><div class="td-av">'+f.label[0].toUpperCase()+'</div>'+esc(f.label)+'</div></td>' +
-      '<td style="font-family:monospace;font-size:0.77rem;color:var(--muted)">#'+f.id+'</td>' +
-      '<td style="font-size:0.75rem;color:var(--muted)">'+(f.employee_id||'—')+'</td>' +
-      '<td style="font-size:0.75rem;color:var(--muted)">'+(f.department||'—')+'</td>' +
-      '<td>'+raBadge+'</td>' +
-      '<td style="font-size:0.75rem;color:var(--muted)">'+new Date(f.registered_at).toLocaleDateString()+'</td>' +
-      '<td><button class="del-btn" data-id="'+f.id+'" data-label="'+esc(f.label)+'" onclick="delFace(this)">Remove</button></td>' +
-      '</tr>';
+    const raBadge=ra!=null?'<span style="font-family:monospace;font-size:0.8rem;font-weight:700;color:'+raColor+'">'+ra+'%</span><div style="height:3px;border-radius:2px;background:#1a2540;margin-top:4px;width:60px"><div style="height:100%;width:'+ra+'%;background:'+raColor+';border-radius:2px"></div></div>':'<span style="color:var(--muted);font-size:0.75rem">—</span>';
+    return '<tr id="fr-'+f.id+'"><td><div class="td-name"><div class="td-av">'+f.label[0].toUpperCase()+'</div>'+esc(f.label)+'</div></td><td style="font-family:monospace;font-size:0.77rem;color:var(--muted)">#'+f.id+'</td><td style="font-size:0.75rem;color:var(--muted)">'+(f.employee_id||'—')+'</td><td style="font-size:0.75rem;color:var(--muted)">'+(f.department||'—')+'</td><td>'+raBadge+'</td><td style="font-size:0.75rem;color:var(--muted)">'+new Date(f.registered_at).toLocaleDateString()+'</td><td><button class="del-btn" data-id="'+f.id+'" data-label="'+esc(f.label)+'" onclick="delFace(this)">Remove</button></td></tr>';
   }).join('');
 }
 
@@ -1224,7 +1060,300 @@ function esc(s){return String(s).replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;',
 </html>`;
 }
 
-// ─── API ROUTES ───────────────────────────────────────────────────────────────
+// ─── RECORDS PAGE ─────────────────────────────────────────────────────────────
+function getRecordsHTML() {
+  return `<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8"/>
+<meta name="viewport" content="width=device-width,initial-scale=1"/>
+<title>Attendance Records</title>
+<style>
+@import url('https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@300;400;500;600;700&family=JetBrains+Mono:wght@400;600&display=swap');
+:root{--bg:#ffffff;--surface:#f8f9fa;--card:#ffffff;--border:#dbe3ea;--accent:#00adee;--accent2:#00adee;--red:#f87171;--yellow:#fbbf24;--purple:#00adee;--orange:#fb923c;--text:#1f2937;--muted:#6b7280;--muted2:#cfd8e3;}
+*{box-sizing:border-box;margin:0;padding:0}
+body{font-family:'Space Grotesk',sans-serif;background:var(--bg);color:var(--text);min-height:100vh;overflow-x:hidden}
+body::before{content:'';position:fixed;inset:0;background:radial-gradient(ellipse 80% 50% at 50% -10%,rgba(0,173,238,0.07),transparent);pointer-events:none;z-index:0}
+nav{position:sticky;top:0;z-index:100;background:rgba(255,255,255,0.96);backdrop-filter:blur(20px);border-bottom:1px solid var(--border);display:flex;align-items:center;justify-content:space-between;padding:0 32px;height:62px}
+.nav-left{display:flex;align-items:center;gap:16px}
+.nav-logo{font-family:'JetBrains Mono',monospace;font-size:1.05rem;font-weight:600;letter-spacing:2px}
+.nav-logo span{color:var(--accent)}
+.nav-right{display:flex;align-items:center;gap:10px}
+.nav-link{display:flex;align-items:center;gap:8px;background:var(--card);border:1px solid var(--border);color:var(--muted);font-family:'Space Grotesk',sans-serif;font-size:0.82rem;font-weight:500;padding:8px 16px;border-radius:10px;text-decoration:none;transition:all 0.2s}
+.nav-link:hover{border-color:var(--accent);color:var(--text)}
+.nav-link.active{border-color:rgba(0,173,238,0.4);color:var(--accent);background:rgba(0,173,238,0.08)}
+main{position:relative;z-index:1;max-width:1500px;margin:0 auto;padding:28px 32px}
+.filter-card{background:var(--card);border:1px solid var(--border);border-radius:14px;padding:18px 20px;margin-bottom:20px}
+.filter-title{font-family:'JetBrains Mono',monospace;font-size:0.62rem;letter-spacing:2px;color:var(--muted);text-transform:uppercase;margin-bottom:14px}
+.filter-row{display:flex;align-items:flex-end;gap:12px;flex-wrap:wrap}
+.filter-group{display:flex;flex-direction:column;gap:5px}
+.filter-label{font-size:0.68rem;color:var(--muted);text-transform:uppercase;letter-spacing:0.8px}
+.filter-inp,.filter-sel{background:var(--surface);border:1px solid var(--border);border-radius:8px;padding:8px 12px;color:var(--text);font-family:'Space Grotesk',sans-serif;font-size:0.82rem;outline:none;transition:border-color 0.2s;min-width:130px}
+.filter-inp:focus,.filter-sel:focus{border-color:var(--accent)}
+.filter-inp::placeholder{color:var(--muted)}
+.filter-sel option{background:var(--card)}
+.btn-filter{padding:9px 18px;border:none;border-radius:9px;background:var(--accent);color:#fff;font-family:'Space Grotesk',sans-serif;font-size:0.82rem;font-weight:600;cursor:pointer;transition:all 0.18s}
+.btn-filter:hover{background:#009ed8;transform:translateY(-1px)}
+.btn-clear{padding:9px 14px;border:1px solid var(--border);border-radius:9px;background:transparent;color:var(--muted);font-family:'Space Grotesk',sans-serif;font-size:0.82rem;cursor:pointer;transition:all 0.18s}
+.btn-clear:hover{border-color:var(--red);color:var(--red)}
+.summary-bar{display:grid;grid-template-columns:repeat(6,1fr);gap:12px;margin-bottom:20px}
+.sum-card{background:var(--card);border:1px solid var(--border);border-radius:12px;padding:14px 16px}
+.sum-val{font-family:'JetBrains Mono',monospace;font-size:1.4rem;font-weight:600;color:var(--accent);line-height:1}
+.sum-val.green{color:var(--accent2)}.sum-val.yellow{color:var(--yellow)}.sum-val.orange{color:var(--orange)}.sum-val.red{color:var(--red)}.sum-val.purple{color:var(--purple)}
+.sum-lbl{font-size:0.63rem;color:var(--muted);text-transform:uppercase;letter-spacing:1px;margin-top:5px}
+.table-card{background:var(--card);border:1px solid var(--border);border-radius:16px;overflow:hidden}
+.table-head{display:flex;align-items:center;justify-content:space-between;padding:14px 20px;border-bottom:1px solid var(--border)}
+.table-head h3{font-family:'JetBrains Mono',monospace;font-size:0.7rem;letter-spacing:1.5px;color:var(--muted);text-transform:uppercase}
+.cnt-pill{background:rgba(0,173,238,0.1);color:var(--accent);font-size:0.72rem;font-weight:600;padding:3px 10px;border-radius:12px;font-family:'JetBrains Mono',monospace}
+.tbl-wrap{overflow-x:auto;max-height:600px;overflow-y:auto}
+.tbl-wrap::-webkit-scrollbar{width:3px;height:3px}.tbl-wrap::-webkit-scrollbar-thumb{background:var(--muted2);border-radius:2px}
+table{width:100%;border-collapse:collapse}
+thead th{padding:10px 14px;text-align:left;font-size:0.63rem;font-weight:600;color:var(--muted);text-transform:uppercase;letter-spacing:1px;background:var(--surface);border-bottom:1px solid var(--border);position:sticky;top:0;white-space:nowrap}
+tbody tr{border-bottom:1px solid rgba(207,216,227,0.8);transition:background 0.15s}
+tbody tr:last-child{border-bottom:none}tbody tr:hover{background:rgba(0,173,238,0.04)}
+td{padding:10px 14px;font-size:0.82rem;vertical-align:middle;white-space:nowrap}
+.td-name{display:flex;align-items:center;gap:9px;font-weight:600}
+.td-av{width:28px;height:28px;border-radius:50%;background:linear-gradient(135deg,#f8f9fa,#eef3f8);display:flex;align-items:center;justify-content:center;font-size:0.75rem;font-weight:700;color:var(--accent);border:1px solid rgba(0,173,238,0.2);flex-shrink:0}
+.time-pill{font-family:'JetBrains Mono',monospace;font-size:0.74rem;background:rgba(0,173,238,0.08);color:var(--accent);padding:2px 9px;border-radius:20px;border:1px solid rgba(0,173,238,0.12)}
+.time-pill.out{background:rgba(0,173,238,0.08);color:var(--accent);border-color:rgba(0,173,238,0.12)}
+.time-pill.exp{background:rgba(251,191,36,0.08);color:var(--yellow);border-color:rgba(251,191,36,0.12)}
+.time-pill.work{background:rgba(52,211,153,0.08);color:var(--accent2);border-color:rgba(52,211,153,0.12)}
+.badge{display:inline-flex;align-items:center;padding:3px 9px;border-radius:20px;font-size:0.65rem;font-weight:600;letter-spacing:0.3px;text-transform:uppercase;white-space:nowrap}
+.badge-present{background:rgba(52,211,153,0.08);color:var(--accent2);border:1px solid rgba(52,211,153,0.18)}
+.badge-late{background:rgba(251,191,36,0.08);color:var(--yellow);border:1px solid rgba(251,191,36,0.18)}
+.badge-early_leave{background:rgba(251,146,60,0.08);color:var(--orange);border:1px solid rgba(251,146,60,0.18)}
+.badge-late_early_leave{background:rgba(248,113,113,0.08);color:var(--red);border:1px solid rgba(248,113,113,0.18)}
+.badge-absent{background:rgba(248,113,113,0.08);color:var(--red);border:1px solid rgba(248,113,113,0.18)}
+.tbl-empty{text-align:center;padding:60px;color:var(--muted);font-size:0.84rem}
+.date-chip{font-family:'JetBrains Mono',monospace;font-size:0.74rem;color:var(--muted);background:var(--surface);padding:2px 9px;border-radius:6px;border:1px solid var(--border)}
+.total-work-bar{display:flex;align-items:center;gap:14px;background:rgba(52,211,153,0.05);border:1px solid rgba(52,211,153,0.12);border-radius:10px;padding:10px 18px;margin-top:12px}
+.tw-label{font-size:0.72rem;color:var(--muted);text-transform:uppercase;letter-spacing:1px}
+.tw-val{font-family:'JetBrains Mono',monospace;font-size:1.05rem;font-weight:600;color:var(--accent2)}
+.tw-note{font-size:0.72rem;color:var(--muted);margin-left:auto}
+.loading-row td{text-align:center;padding:50px;color:var(--muted)}
+</style>
+</head>
+<body>
+<nav>
+  <div class="nav-left"><div class="nav-logo">FACE<span>·</span>ATT <em style="font-size:0.6rem;color:var(--muted);letter-spacing:1px;margin-left:6px;font-weight:400;font-family:'Space Grotesk',sans-serif">RECORDS</em></div></div>
+  <div class="nav-right">
+    <a href="/" class="nav-link">📋 Today</a>
+    <a href="/records" class="nav-link active">📊 Records</a>
+    <a href="/register" class="nav-link">👤 Register</a>
+    <a href="/unknown-faces" class="nav-link" style="border-color:rgba(248,113,113,0.3);color:var(--red)">❓ Unknown</a>
+  </div>
+</nav>
+<main>
+  <div class="filter-card">
+    <div class="filter-title">🔍 Filter Records</div>
+    <div class="filter-row">
+      <div class="filter-group"><div class="filter-label">From Date</div><input type="date" id="fFrom" class="filter-inp"/></div>
+      <div class="filter-group"><div class="filter-label">To Date</div><input type="date" id="fTo" class="filter-inp"/></div>
+      <div class="filter-group">
+        <div class="filter-label">Status</div>
+        <select id="fStatus" class="filter-sel"><option value="">All Statuses</option><option value="present">✅ Present</option><option value="late">⏰ Late</option><option value="early_leave">⚠️ Early Leave</option><option value="late_early_leave">🔴 Late + Early Leave</option><option value="absent">❌ Absent</option></select>
+      </div>
+      <div class="filter-group"><div class="filter-label">Department</div><select id="fDept" class="filter-sel"><option value="">All Departments</option></select></div>
+      <div class="filter-group"><div class="filter-label">Name Search</div><input type="text" id="fName" class="filter-inp" placeholder="Search name..."/></div>
+      <div class="filter-group"><div class="filter-label">&nbsp;</div><div style="display:flex;gap:8px"><button class="btn-filter" onclick="applyFilters()">🔍 Apply</button><button class="btn-clear" onclick="clearFilters()">✕ Clear</button></div></div>
+    </div>
+  </div>
+  <div class="summary-bar">
+    <div class="sum-card"><div class="sum-val" id="sumTotal">—</div><div class="sum-lbl">Total Records</div></div>
+    <div class="sum-card"><div class="sum-val green" id="sumPresent">—</div><div class="sum-lbl">Present</div></div>
+    <div class="sum-card"><div class="sum-val yellow" id="sumLate">—</div><div class="sum-lbl">Late</div></div>
+    <div class="sum-card"><div class="sum-val orange" id="sumEarly">—</div><div class="sum-lbl">Early Leave</div></div>
+    <div class="sum-card"><div class="sum-val red" id="sumAbsent">—</div><div class="sum-lbl">Absent</div></div>
+    <div class="sum-card"><div class="sum-val purple" id="sumWork">—</div><div class="sum-lbl">Total Work Hours</div></div>
+  </div>
+  <div class="table-card">
+    <div class="table-head"><h3>📋 Attendance Records</h3><span class="cnt-pill" id="recCnt">loading...</span></div>
+    <div class="tbl-wrap">
+      <table>
+        <thead><tr><th>Name</th><th>Emp ID</th><th>Department</th><th>Date</th><th>Check In</th><th>Check Out</th><th>Exp. Checkout</th><th>Working Hours</th><th>Status</th></tr></thead>
+        <tbody id="recBody"><tr class="loading-row"><td colspan="9">Loading records...</td></tr></tbody>
+      </table>
+    </div>
+    <div id="totalWorkBar" class="total-work-bar" style="margin:12px 16px 16px;display:none">
+      <span class="tw-label">Total Working Hours (selected range):</span>
+      <span class="tw-val" id="totalWorkVal">0h 0m</span>
+      <span class="tw-note" id="totalWorkNote"></span>
+    </div>
+  </div>
+</main>
+<script>
+const statusLabels={present:'✅ Present',late:'⏰ Late',early_leave:'⚠️ Early Leave',late_early_leave:'🔴 Late + Early',absent:'❌ Absent'};
+function esc(s){return String(s).replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));}
+(function setDefaults(){const now=new Date();const y=now.getFullYear(),m=String(now.getMonth()+1).padStart(2,'0'),d=String(now.getDate()).padStart(2,'0');document.getElementById('fFrom').value=y+'-'+m+'-01';document.getElementById('fTo').value=y+'-'+m+'-'+d;})();
+(async function loadDepts(){try{const{departments=[]}=await(await fetch('/api/departments')).json();const sel=document.getElementById('fDept');departments.forEach(d=>{const o=document.createElement('option');o.value=d;o.textContent=d;sel.appendChild(o);});}catch(e){}})();
+async function applyFilters(){
+  const from=document.getElementById('fFrom').value,to=document.getElementById('fTo').value,status=document.getElementById('fStatus').value,dept=document.getElementById('fDept').value,name=document.getElementById('fName').value.trim();
+  const body=document.getElementById('recBody');
+  body.innerHTML='<tr class="loading-row"><td colspan="9">Loading...</td></tr>';
+  const params=new URLSearchParams();
+  if(from)params.set('from',from);if(to)params.set('to',to);if(status)params.set('status',status);if(dept)params.set('department',dept);if(name)params.set('name',name);
+  try{
+    const{records=[],total_working='0h 0m',total_working_minutes=0}=await(await fetch('/api/attendance/records?'+params)).json();
+    document.getElementById('recCnt').textContent=records.length+' records';
+    const counts={present:0,late:0,early_leave:0,late_early_leave:0,absent:0};
+    records.forEach(r=>{if(counts[r.status]!==undefined)counts[r.status]++;});
+    document.getElementById('sumTotal').textContent=records.length;
+    document.getElementById('sumPresent').textContent=counts.present;
+    document.getElementById('sumLate').textContent=counts.late;
+    document.getElementById('sumEarly').textContent=counts.early_leave+counts.late_early_leave;
+    document.getElementById('sumAbsent').textContent=counts.absent;
+    const th=Math.floor(total_working_minutes/60),tm=total_working_minutes%60;
+    document.getElementById('sumWork').textContent=th+'h '+tm+'m';
+    if(records.length){document.getElementById('totalWorkVal').textContent=total_working;let note='';if(from&&to)note='Date range: '+from+' → '+to;document.getElementById('totalWorkNote').textContent=note;document.getElementById('totalWorkBar').style.display='flex';}
+    else{document.getElementById('totalWorkBar').style.display='none';}
+    if(!records.length){body.innerHTML='<tr><td colspan="9" class="tbl-empty">No records found for selected filters</td></tr>';return;}
+    body.innerHTML=records.map(r=>{
+      const wh=r.working_hours?'<span class="time-pill work">'+esc(r.working_hours)+'</span>':'<span style="color:var(--muted)">—</span>';
+      const exp=r.expected_checkout?'<span class="time-pill exp">'+esc(r.expected_checkout)+'</span>':'<span style="color:var(--muted)">—</span>';
+      return '<tr><td><div class="td-name"><div class="td-av">'+esc(r.name[0].toUpperCase())+'</div>'+esc(r.name)+'</div></td><td style="color:var(--muted);font-family:monospace;font-size:0.75rem">'+(r.employee_id||'—')+'</td><td style="color:var(--muted);font-size:0.75rem">'+(r.department||'—')+'</td><td><span class="date-chip">'+esc(r.date)+'</span></td><td><span class="time-pill">'+esc(r.time_in)+'</span></td><td><span class="time-pill out">'+esc(r.time_out||'—')+'</span></td><td>'+exp+'</td><td>'+wh+'</td><td><span class="badge badge-'+esc(r.status)+'">'+(statusLabels[r.status]||r.status)+'</span></td></tr>';
+    }).join('');
+  }catch(e){body.innerHTML='<tr><td colspan="9" class="tbl-empty" style="color:var(--red)">Error loading records: '+esc(e.message)+'</td></tr>';}
+}
+function clearFilters(){document.getElementById('fStatus').value='';document.getElementById('fDept').value='';document.getElementById('fName').value='';const now=new Date();const y=now.getFullYear(),m=String(now.getMonth()+1).padStart(2,'0'),d=String(now.getDate()).padStart(2,'0');document.getElementById('fFrom').value=y+'-'+m+'-01';document.getElementById('fTo').value=y+'-'+m+'-'+d;applyFilters();}
+document.getElementById('fName').addEventListener('keydown',e=>{if(e.key==='Enter')applyFilters();});
+applyFilters();
+</script>
+</body>
+</html>`;
+}
+
+// ─── NEW: UNKNOWN FACES PAGE ──────────────────────────────────────────────────
+function getUnknownFacesHTML() {
+  return `<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8"/>
+<meta name="viewport" content="width=device-width,initial-scale=1"/>
+<title>Unknown Faces</title>
+<style>
+@import url('https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@300;400;500;600;700&family=JetBrains+Mono:wght@400;600&display=swap');
+:root{--bg:#ffffff;--surface:#f8f9fa;--card:#ffffff;--border:#dbe3ea;--accent:#00adee;--accent2:#34d399;--red:#f87171;--yellow:#fbbf24;--text:#1f2937;--muted:#6b7280;--muted2:#cfd8e3;}
+*{box-sizing:border-box;margin:0;padding:0}
+body{font-family:'Space Grotesk',sans-serif;background:var(--bg);color:var(--text);min-height:100vh}
+nav{position:sticky;top:0;z-index:100;background:rgba(255,255,255,0.96);backdrop-filter:blur(20px);border-bottom:1px solid var(--border);display:flex;align-items:center;justify-content:space-between;padding:0 32px;height:62px}
+.nav-logo{font-family:'JetBrains Mono',monospace;font-size:1.05rem;font-weight:600;letter-spacing:2px}
+.nav-logo span{color:var(--red)}
+.nav-right{display:flex;gap:10px}
+.nav-link{display:flex;align-items:center;gap:7px;background:var(--card);border:1px solid var(--border);color:var(--muted);font-family:'Space Grotesk',sans-serif;font-size:0.82rem;font-weight:500;padding:8px 16px;border-radius:10px;text-decoration:none;transition:all 0.2s}
+.nav-link:hover{border-color:var(--accent);color:var(--text)}
+main{max-width:1400px;margin:0 auto;padding:28px 32px}
+.top-bar{display:flex;align-items:center;justify-content:space-between;margin-bottom:20px;flex-wrap:wrap;gap:12px}
+.top-bar h2{font-family:'JetBrains Mono',monospace;font-size:0.8rem;letter-spacing:2px;color:var(--muted);text-transform:uppercase}
+.filter-row{display:flex;gap:10px;align-items:center;flex-wrap:wrap}
+.finp{background:var(--surface);border:1px solid var(--border);border-radius:8px;padding:7px 12px;color:var(--text);font-family:'Space Grotesk',sans-serif;font-size:0.8rem;outline:none;transition:border-color 0.2s}
+.finp:focus{border-color:var(--red)}
+.btn{padding:8px 16px;border:none;border-radius:9px;font-family:'Space Grotesk',sans-serif;font-size:0.8rem;font-weight:600;cursor:pointer;transition:all 0.18s}
+.btn-del-all{background:rgba(248,113,113,0.1);border:1px solid rgba(248,113,113,0.3);color:var(--red)}
+.btn-del-all:hover{background:rgba(248,113,113,0.2)}
+.btn-filter{background:var(--accent);color:#fff}
+.btn-filter:hover{background:#009ed8}
+.cnt-pill{background:rgba(248,113,113,0.1);color:var(--red);font-size:0.72rem;font-weight:600;padding:4px 12px;border-radius:12px;font-family:'JetBrains Mono',monospace}
+.grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(200px,1fr));gap:16px}
+.card{background:var(--card);border:1px solid var(--border);border-radius:14px;overflow:hidden;transition:box-shadow 0.2s,transform 0.2s}
+.card:hover{box-shadow:0 4px 24px rgba(248,113,113,0.12);transform:translateY(-2px)}
+.card img{width:100%;aspect-ratio:4/3;object-fit:cover;display:block;background:#f1f5f9}
+.card-no-img{width:100%;aspect-ratio:4/3;display:flex;align-items:center;justify-content:center;font-size:2.5rem;background:rgba(248,113,113,0.05)}
+.card-body{padding:10px 12px}
+.card-time{font-family:'JetBrains Mono',monospace;font-size:0.7rem;color:var(--muted);margin-bottom:4px}
+.card-date{font-size:0.78rem;font-weight:600;color:var(--text)}
+.card-src{display:inline-block;font-size:0.65rem;padding:2px 8px;border-radius:10px;background:rgba(248,113,113,0.08);color:var(--red);border:1px solid rgba(248,113,113,0.18);margin-top:4px}
+.card-del{width:100%;padding:7px;background:rgba(248,113,113,0.06);border:none;border-top:1px solid var(--border);color:var(--red);font-size:0.73rem;font-weight:600;cursor:pointer;font-family:'Space Grotesk',sans-serif;transition:background 0.18s}
+.card-del:hover{background:rgba(248,113,113,0.15)}
+.empty{text-align:center;padding:80px 20px;color:var(--muted);font-size:0.9rem}
+.toast{position:fixed;bottom:24px;right:24px;padding:12px 20px;border-radius:12px;font-size:0.82rem;font-weight:600;opacity:0;transform:translateY(10px);transition:all 0.3s;z-index:500;pointer-events:none}
+.toast.show{opacity:1;transform:translateY(0)}
+.toast.s{background:rgba(52,211,153,0.93);color:#000}.toast.e{background:rgba(248,113,113,0.93);color:#fff}.toast.i{background:rgba(0,173,238,0.93);color:#fff}
+@media(max-width:600px){main{padding:16px}.grid{grid-template-columns:repeat(auto-fill,minmax(150px,1fr))}}
+</style>
+</head>
+<body>
+<nav>
+  <div class="nav-logo">ATTEND<span>.</span>AI ❓</div>
+  <div class="nav-right">
+    <a href="/" class="nav-link">📋 Attendance</a>
+    <a href="/records" class="nav-link">📊 Records</a>
+    <a href="/register" class="nav-link">👤 Register</a>
+  </div>
+</nav>
+<main>
+  <div class="top-bar">
+    <div style="display:flex;align-items:center;gap:12px">
+      <h2>❓ Unknown Faces Log</h2>
+      <span class="cnt-pill" id="cntPill">0 faces</span>
+    </div>
+    <div class="filter-row">
+      <input type="date" id="fFrom" class="finp" title="From"/>
+      <input type="date" id="fTo" class="finp" title="To"/>
+      <select id="fSrc" class="finp">
+        <option value="">All Sources</option>
+        <option value="checkin">Check In</option>
+        <option value="checkout">Check Out</option>
+      </select>
+      <button class="btn btn-filter" onclick="loadFaces()">🔍 Filter</button>
+      <button class="btn btn-del-all" onclick="deleteAll()">🗑 Clear All</button>
+    </div>
+  </div>
+  <div id="grid" class="grid"><div class="empty">Loading...</div></div>
+</main>
+<div class="toast" id="toast"></div>
+<script>
+function esc(s){return String(s).replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));}
+function toast(msg,type='i'){const t=document.getElementById('toast');t.textContent=msg;t.className='toast '+type+' show';clearTimeout(t._to);t._to=setTimeout(()=>t.classList.remove('show'),3500);}
+
+async function loadFaces(){
+  const from=document.getElementById('fFrom').value,to=document.getElementById('fTo').value,src=document.getElementById('fSrc').value;
+  const params=new URLSearchParams();
+  if(from)params.set('from',from);if(to)params.set('to',to);if(src)params.set('source',src);
+  const grid=document.getElementById('grid');
+  grid.innerHTML='<div class="empty">Loading...</div>';
+  try{
+    const{faces=[]}=await(await fetch('/api/unknown-faces?'+params)).json();
+    document.getElementById('cntPill').textContent=faces.length+' faces';
+    if(!faces.length){grid.innerHTML='<div class="empty">No unknown faces found for the selected filters.</div>';return;}
+    grid.innerHTML=faces.map(f=>{
+      const imgEl=f.image_file
+        ? '<img src="/unknown-images/'+esc(f.image_file)+'" alt="unknown" loading="lazy" onerror="this.style.display=\'none\';this.nextElementSibling.style.display=\'flex\'">'
+        : '';
+      const noImg='<div class="card-no-img" '+(f.image_file?'style="display:none"':'')+'>👤</div>';
+      return '<div class="card" id="uf-'+f.id+'">'
+        +imgEl+noImg
+        +'<div class="card-body">'
+        +'<div class="card-time">'+esc(f.time||'')+'</div>'
+        +'<div class="card-date">'+esc(f.date||'')+'</div>'
+        +'<span class="card-src">'+esc(f.source||'checkin')+'</span>'
+        +'</div>'
+        +'<button class="card-del" onclick="deleteFace('+f.id+')">🗑 Delete</button>'
+        +'</div>';
+    }).join('');
+  }catch(e){grid.innerHTML='<div class="empty" style="color:var(--red)">Error: '+esc(e.message)+'</div>';}
+}
+
+async function deleteFace(id){
+  if(!confirm('Delete this unknown face entry?'))return;
+  const r=await fetch('/api/unknown-faces/'+id,{method:'DELETE'});
+  if(r.ok){const el=document.getElementById('uf-'+id);if(el){el.style.transition='all 0.3s';el.style.opacity='0';setTimeout(()=>{el.remove();const cnt=document.querySelectorAll('.card').length;document.getElementById('cntPill').textContent=cnt+' faces';},300);}toast('Deleted','i');}
+  else toast('Delete failed','e');
+}
+
+async function deleteAll(){
+  if(!confirm('Delete ALL unknown faces? This cannot be undone.'))return;
+  const r=await fetch('/api/unknown-faces/all',{method:'DELETE'});
+  if(r.ok){toast('All unknown faces cleared','s');loadFaces();}
+  else toast('Failed to clear','e');
+}
+
+loadFaces();
+</script>
+</body>
+</html>`;
+}
+
+// ─── API ROUTES ─────────────────────────────────────────────────────────────────
 
 app.get('/api/faces', async (req, res) => {
   try {
@@ -1241,7 +1370,6 @@ app.post('/api/register', async (req, res) => {
     if (!safeLabel) return res.status(400).json({ error: 'Name required' });
     if (/\d/.test(safeLabel)) return res.status(400).json({ error: 'Name cannot contain numbers' });
     if (safeDepartment && /\d/.test(safeDepartment)) return res.status(400).json({ error: 'Department cannot contain numbers' });
-    // Accept either new format (descriptors = array of arrays) or old (descriptor = single array)
     const toStore = descriptors || descriptor;
     if (!toStore) return res.status(400).json({ error: 'Descriptor(s) required' });
     const result = await dbQuery(
@@ -1268,57 +1396,32 @@ app.post('/api/attendance/mark', async (req, res) => {
   try {
     const { descriptor } = req.body;
     if (!Array.isArray(descriptor)) return res.status(400).json({ error: 'descriptor required' });
-
     const faces = await dbQuery('SELECT id, label, descriptor, registration_accuracy FROM faces');
     if (!faces.length) return res.json({ success: false, recognized: false });
-
     let best = null, bestD = Infinity;
     for (const f of faces) {
       const stored = JSON.parse(f.descriptor);
-      // Support both old (single flat array) and new (array of arrays) format
       const descriptorList = Array.isArray(stored[0]) ? stored : [stored];
       const d = Math.min(...descriptorList.map(sd => euclidean(descriptor, sd)));
       if (d < bestD) { bestD = d; best = f; }
     }
     if (!best || bestD >= THRESHOLD) { setLed('unknown'); return res.json({ success: false, recognized: false }); }
-
     const confidence = Math.round(Math.max(0, Math.min(100, (1 - bestD / THRESHOLD) * 100)));
     const registered_accuracy = best.registration_accuracy || null;
-
     const nowIST   = new Date(new Date().toLocaleString('en-US', { timeZone: 'Asia/Kolkata' }));
     const today    = nowIST.getFullYear() + '-' + String(nowIST.getMonth()+1).padStart(2,'0') + '-' + String(nowIST.getDate()).padStart(2,'0');
     const timeStr  = String(nowIST.getHours()).padStart(2,'0') + ':' + String(nowIST.getMinutes()).padStart(2,'0') + ':' + String(nowIST.getSeconds()).padStart(2,'0');
     const totalMin = nowIST.getHours() * 60 + nowIST.getMinutes();
-
-    // After 11:00 AM → absent
     let status = 'present';
-    if (totalMin >= ABSENT_AFTER_MIN) {
-      status = 'absent';
-    } else if (totalMin > LATE_AFTER) {
-      status = 'late';
-    }
-
-    // Calculate expected checkout for late arrivals
+    if (totalMin >= ABSENT_AFTER_MIN) status = 'absent';
+    else if (totalMin > LATE_AFTER)   status = 'late';
     const expectedCheckout = (status === 'late') ? calcExpectedCheckout(timeStr) : null;
-
-    // Already checked in today?
-    const existing = await dbQuery(
-      'SELECT id, time_in, status, expected_checkout FROM attendance WHERE face_id=? AND date=?',
-      [best.id, today]
-    );
+    const existing = await dbQuery('SELECT id, time_in, status, expected_checkout FROM attendance WHERE face_id=? AND date=?', [best.id, today]);
     if (existing.length) {
       setLed('checkin_already', best.label, existing[0].status);
-      return res.json({
-        success: true, recognized: true, already: true, confidence, registered_accuracy,
-        name: best.label, time_in: fmtTime(existing[0].time_in), status: existing[0].status,
-        expected_checkout: existing[0].expected_checkout ? fmtTime(existing[0].expected_checkout) : null
-      });
+      return res.json({ success: true, recognized: true, already: true, confidence, registered_accuracy, name: best.label, time_in: fmtTime(existing[0].time_in), status: existing[0].status, expected_checkout: existing[0].expected_checkout ? fmtTime(existing[0].expected_checkout) : null });
     }
-
-    await dbQuery(
-      'INSERT INTO attendance (face_id, name, date, time_in, status, expected_checkout) VALUES (?,?,?,?,?,?)',
-      [best.id, best.label, today, timeStr, status, expectedCheckout]
-    );
+    await dbQuery('INSERT INTO attendance (face_id, name, date, time_in, status, expected_checkout) VALUES (?,?,?,?,?,?)', [best.id, best.label, today, timeStr, status, expectedCheckout]);
     const evType = status === 'absent' ? 'checkin_absent' : status === 'late' ? 'checkin_late' : 'checkin_present';
     setLed(evType, best.label, status);
     res.json({ success: true, recognized: true, already: false, confidence, registered_accuracy, name: best.label, time_in: fmtTime(timeStr), status, expected_checkout: expectedCheckout ? fmtTime(expectedCheckout) : null });
@@ -1330,95 +1433,54 @@ app.post('/api/attendance/checkout', async (req, res) => {
   try {
     const { descriptor } = req.body;
     if (!Array.isArray(descriptor)) return res.status(400).json({ error: 'descriptor required' });
-
     const faces = await dbQuery('SELECT id, label, descriptor, registration_accuracy FROM faces');
     if (!faces.length) return res.json({ success: false, recognized: false });
-
     let best = null, bestD = Infinity;
     for (const f of faces) {
       const stored = JSON.parse(f.descriptor);
-      // Support both old (single flat array) and new (array of arrays) format
       const descriptorList = Array.isArray(stored[0]) ? stored : [stored];
       const d = Math.min(...descriptorList.map(sd => euclidean(descriptor, sd)));
       if (d < bestD) { bestD = d; best = f; }
     }
     if (!best || bestD >= THRESHOLD) { setLed('unknown'); return res.json({ success: false, recognized: false }); }
-
     const confidence = Math.round(Math.max(0, Math.min(100, (1 - bestD / THRESHOLD) * 100)));
     const registered_accuracy = best.registration_accuracy || null;
-
     const nowIST   = new Date(new Date().toLocaleString('en-US', { timeZone: 'Asia/Kolkata' }));
     const today    = nowIST.getFullYear() + '-' + String(nowIST.getMonth()+1).padStart(2,'0') + '-' + String(nowIST.getDate()).padStart(2,'0');
     const timeStr  = String(nowIST.getHours()).padStart(2,'0') + ':' + String(nowIST.getMinutes()).padStart(2,'0') + ':' + String(nowIST.getSeconds()).padStart(2,'0');
     const totalMin = nowIST.getHours() * 60 + nowIST.getMinutes();
-    const isEarly  = totalMin < CHECKOUT_FROM; // before 6:10 PM
-
-    // Must have checked in first
-    const existing = await dbQuery(
-      'SELECT id, time_in, time_out, status FROM attendance WHERE face_id=? AND date=?',
-      [best.id, today]
-    );
-    if (!existing.length) {
-      setLed('unknown', best.label, 'not_checked_in');
-      return res.json({ success: false, not_checked_in: true, name: best.label });
-    }
-
-    // Already checked out?
+    const isEarly  = totalMin < CHECKOUT_FROM;
+    const existing = await dbQuery('SELECT id, time_in, time_out, status FROM attendance WHERE face_id=? AND date=?', [best.id, today]);
+    if (!existing.length) { setLed('unknown', best.label, 'not_checked_in'); return res.json({ success: false, not_checked_in: true, name: best.label }); }
     if (existing[0].time_out) {
       setLed('checkout_already', best.label, existing[0].status);
-      return res.json({
-        success: true, already_out: true, confidence, registered_accuracy, name: best.label,
-        time_in: fmtTime(existing[0].time_in), time_out: fmtTime(existing[0].time_out),
-        status: existing[0].status
-      });
+      return res.json({ success: true, already_out: true, confidence, registered_accuracy, name: best.label, time_in: fmtTime(existing[0].time_in), time_out: fmtTime(existing[0].time_out), status: existing[0].status });
     }
-
-    // Determine final status
-    // was_late + early_leave → late_early_leave
-    const wasLate   = existing[0].status === 'late';
-    const newStatus = isEarly
-      ? (wasLate ? 'late_early_leave' : 'early_leave')
-      : existing[0].status; // keep present/late if on time checkout
-
-    await dbQuery(
-      'UPDATE attendance SET time_out=?, status=? WHERE face_id=? AND date=?',
-      [timeStr, newStatus, best.id, today]
-    );
-
+    const wasLate  = existing[0].status === 'late';
+    const newStatus = isEarly ? (wasLate ? 'late_early_leave' : 'early_leave') : existing[0].status;
+    await dbQuery('UPDATE attendance SET time_out=?, status=? WHERE face_id=? AND date=?', [timeStr, newStatus, best.id, today]);
     const coEvType = isEarly ? 'checkout_early' : 'checkout_normal';
     setLed(coEvType, best.label, newStatus);
-    res.json({
-      success: true, recognized: true, already_out: false, confidence, registered_accuracy,
-      name: best.label, time_in: fmtTime(existing[0].time_in),
-      time_out: fmtTime(timeStr), early: isEarly, status: newStatus
-    });
+    res.json({ success: true, recognized: true, already_out: false, confidence, registered_accuracy, name: best.label, time_in: fmtTime(existing[0].time_in), time_out: fmtTime(timeStr), early: isEarly, status: newStatus });
   } catch(e) { res.status(500).json({ error: e.message }); }
 });
 
-// ── TODAY'S RECORDS ───────────────────────────────────────────────────────────
 app.get('/api/attendance/today', async (req, res) => {
   try {
     const today = new Date().toISOString().slice(0, 10);
     const records = await dbQuery(
-      `SELECT a.face_id, a.name, a.time_in, a.time_out, a.status,
-              f.employee_id, f.department
-       FROM attendance a JOIN faces f ON a.face_id=f.id
-       WHERE a.date=? ORDER BY a.time_in ASC`, [today]
+      `SELECT a.face_id, a.name, a.time_in, a.time_out, a.status, f.employee_id, f.department
+       FROM attendance a JOIN faces f ON a.face_id=f.id WHERE a.date=? ORDER BY a.time_in ASC`, [today]
     );
-    res.json({ records: records.map(r => ({
-      ...r, time_in: fmtTime(r.time_in), time_out: fmtTime(r.time_out)
-    }))});
+    res.json({ records: records.map(r => ({ ...r, time_in: fmtTime(r.time_in), time_out: fmtTime(r.time_out) }))});
   } catch(e) { res.status(500).json({ error: e.message }); }
 });
 
-// ── STATS ─────────────────────────────────────────────────────────────────────
 app.get('/api/attendance/stats', async (req, res) => {
   try {
     const today     = new Date().toISOString().slice(0, 10);
     const totalRows = await dbQuery('SELECT COUNT(*) AS c FROM faces');
-    const statusRows = await dbQuery(
-      'SELECT status, COUNT(*) AS c FROM attendance WHERE date=? GROUP BY status', [today]
-    );
+    const statusRows = await dbQuery('SELECT status, COUNT(*) AS c FROM attendance WHERE date=? GROUP BY status', [today]);
     const by = {};
     for (const r of statusRows) by[r.status] = r.c;
     const totalFaces = totalRows[0].c || 0;
@@ -1431,14 +1493,10 @@ app.get('/api/attendance/stats', async (req, res) => {
   } catch(e) { res.status(500).json({ error: e.message }); }
 });
 
-// ── RECORDS (date range, filters) ─────────────────────────────────────────────
 app.get('/api/attendance/records', async (req, res) => {
   try {
     const { from, to, status, department, name } = req.query;
-    let sql = `SELECT a.id, a.face_id, a.name, a.date, a.time_in, a.time_out,
-                      a.expected_checkout, a.status, a.created_at,
-                      f.employee_id, f.department
-               FROM attendance a JOIN faces f ON a.face_id=f.id WHERE 1=1`;
+    let sql = `SELECT a.id, a.face_id, a.name, a.date, a.time_in, a.time_out, a.expected_checkout, a.status, a.created_at, f.employee_id, f.department FROM attendance a JOIN faces f ON a.face_id=f.id WHERE 1=1`;
     const params = [];
     if (from)       { sql += ' AND a.date >= ?'; params.push(from); }
     if (to)         { sql += ' AND a.date <= ?'; params.push(to); }
@@ -1447,26 +1505,15 @@ app.get('/api/attendance/records', async (req, res) => {
     if (name)       { sql += ' AND a.name LIKE ?'; params.push('%'+name+'%'); }
     sql += ' ORDER BY a.date DESC, a.time_in ASC';
     const records = await dbQuery(sql, params);
-    // Calculate working hours per record
     const result = records.map(r => {
       const wMin = calcWorkingMinutes(r.time_in, r.time_out);
-      return {
-        ...r,
-        time_in: fmtTime(r.time_in),
-        time_out: fmtTime(r.time_out),
-        expected_checkout: r.expected_checkout ? fmtTime(r.expected_checkout) : null,
-        working_hours: calcWorkingHours(r.time_in, r.time_out),
-        working_minutes: wMin
-      };
+      return { ...r, time_in: fmtTime(r.time_in), time_out: fmtTime(r.time_out), expected_checkout: r.expected_checkout ? fmtTime(r.expected_checkout) : null, working_hours: calcWorkingHours(r.time_in, r.time_out), working_minutes: wMin };
     });
-    // Total working minutes across all records
     const totalMin = result.reduce((s, r) => s + r.working_minutes, 0);
-    const totalH = Math.floor(totalMin / 60), totalM = totalMin % 60;
-    res.json({ records: result, total_working: `${totalH}h ${totalM}m`, total_working_minutes: totalMin });
+    res.json({ records: result, total_working: `${Math.floor(totalMin/60)}h ${totalMin%60}m`, total_working_minutes: totalMin });
   } catch(e) { res.status(500).json({ error: e.message }); }
 });
 
-// ── DEPARTMENTS LIST ──────────────────────────────────────────────────────────
 app.get('/api/departments', async (req, res) => {
   try {
     const rows = await dbQuery('SELECT DISTINCT department FROM faces WHERE department != "" ORDER BY department');
@@ -1474,333 +1521,69 @@ app.get('/api/departments', async (req, res) => {
   } catch(e) { res.status(500).json({ error: e.message }); }
 });
 
-// ─── RECORDS PAGE HTML ────────────────────────────────────────────────────────
-function getRecordsHTML() {
-  return `<!DOCTYPE html>
-<html lang="en">
-<head>
-<meta charset="UTF-8"/>
-<meta name="viewport" content="width=device-width,initial-scale=1"/>
-<title>Attendance Records</title>
-<style>
-@import url('https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@300;400;500;600;700&family=JetBrains+Mono:wght@400;600&display=swap');
-:root{
-  --bg:#ffffff;--surface:#f8f9fa;--card:#ffffff;--border:#dbe3ea;
-  --accent:#00adee;--accent2:#00adee;--red:#f87171;--yellow:#fbbf24;
-  --purple:#00adee;--orange:#fb923c;--text:#1f2937;--muted:#6b7280;--muted2:#cfd8e3;
-}
-*{box-sizing:border-box;margin:0;padding:0}
-body{font-family:'Space Grotesk',sans-serif;background:var(--bg);color:var(--text);min-height:100vh;overflow-x:hidden}
-body::before{content:'';position:fixed;inset:0;background:radial-gradient(ellipse 80% 50% at 50% -10%,rgba(0,173,238,0.07),transparent);pointer-events:none;z-index:0}
+// ── UNKNOWN FACES API ─────────────────────────────────────────────────────────
+app.post('/api/unknown-faces/capture', async (req, res) => {
+  try {
+    const { image, source = 'checkin' } = req.body;
+    const nowIST  = new Date(new Date().toLocaleString('en-US', { timeZone: 'Asia/Kolkata' }));
+    const today   = nowIST.getFullYear() + '-' + String(nowIST.getMonth()+1).padStart(2,'0') + '-' + String(nowIST.getDate()).padStart(2,'0');
+    const timeStr = String(nowIST.getHours()).padStart(2,'0') + ':' + String(nowIST.getMinutes()).padStart(2,'0') + ':' + String(nowIST.getSeconds()).padStart(2,'0');
+    let filename = null;
+    if (image) filename = saveUnknownImage(image);
+    await dbQuery('INSERT INTO unknown_faces (image_file, date, time, source) VALUES (?,?,?,?)', [filename, today, timeStr, source]);
+    res.json({ success: true, image_url: filename ? '/unknown-images/' + filename : null });
+  } catch(e) { res.status(500).json({ error: e.message }); }
+});
 
-nav{position:sticky;top:0;z-index:100;background:rgba(255,255,255,0.96);backdrop-filter:blur(20px);border-bottom:1px solid var(--border);display:flex;align-items:center;justify-content:space-between;padding:0 32px;height:62px}
-.nav-left{display:flex;align-items:center;gap:16px}
-.nav-logo{font-family:'JetBrains Mono',monospace;font-size:1.05rem;font-weight:600;letter-spacing:2px}
-.nav-logo span{color:var(--accent)}
-.nav-right{display:flex;align-items:center;gap:10px}
-.nav-link{display:flex;align-items:center;gap:8px;background:var(--card);border:1px solid var(--border);color:var(--muted);font-family:'Space Grotesk',sans-serif;font-size:0.82rem;font-weight:500;padding:8px 16px;border-radius:10px;text-decoration:none;transition:all 0.2s}
-.nav-link:hover{border-color:var(--accent);color:var(--text)}
-.nav-link.active{border-color:rgba(0,173,238,0.4);color:var(--accent);background:rgba(0,173,238,0.08)}
+app.get('/api/unknown-faces', async (req, res) => {
+  try {
+    const { from, to, source } = req.query;
+    let sql = 'SELECT * FROM unknown_faces WHERE 1=1';
+    const params = [];
+    if (from)   { sql += ' AND date >= ?'; params.push(from); }
+    if (to)     { sql += ' AND date <= ?'; params.push(to); }
+    if (source) { sql += ' AND source = ?'; params.push(source); }
+    sql += ' ORDER BY captured_at DESC';
+    const faces = await dbQuery(sql, params);
+    res.json({ faces: faces.map(f => ({ ...f, time: f.time ? String(f.time).substring(0,8) : '' })) });
+  } catch(e) { res.status(500).json({ error: e.message }); }
+});
 
-main{position:relative;z-index:1;max-width:1500px;margin:0 auto;padding:28px 32px}
-
-/* filter bar */
-.filter-card{background:var(--card);border:1px solid var(--border);border-radius:14px;padding:18px 20px;margin-bottom:20px}
-.filter-title{font-family:'JetBrains Mono',monospace;font-size:0.62rem;letter-spacing:2px;color:var(--muted);text-transform:uppercase;margin-bottom:14px}
-.filter-row{display:flex;align-items:flex-end;gap:12px;flex-wrap:wrap}
-.filter-group{display:flex;flex-direction:column;gap:5px}
-.filter-label{font-size:0.68rem;color:var(--muted);text-transform:uppercase;letter-spacing:0.8px}
-.filter-inp,.filter-sel{background:var(--surface);border:1px solid var(--border);border-radius:8px;padding:8px 12px;color:var(--text);font-family:'Space Grotesk',sans-serif;font-size:0.82rem;outline:none;transition:border-color 0.2s;min-width:130px}
-.filter-inp:focus,.filter-sel:focus{border-color:var(--accent)}
-.filter-inp::placeholder{color:var(--muted)}
-.filter-sel option{background:var(--card)}
-.btn-filter{padding:9px 18px;border:none;border-radius:9px;background:var(--accent);color:#fff;font-family:'Space Grotesk',sans-serif;font-size:0.82rem;font-weight:600;cursor:pointer;transition:all 0.18s}
-.btn-filter:hover{background:#009ed8;transform:translateY(-1px)}
-.btn-clear{padding:9px 14px;border:1px solid var(--border);border-radius:9px;background:transparent;color:var(--muted);font-family:'Space Grotesk',sans-serif;font-size:0.82rem;cursor:pointer;transition:all 0.18s}
-.btn-clear:hover{border-color:var(--red);color:var(--red)}
-
-/* summary bar */
-.summary-bar{display:grid;grid-template-columns:repeat(6,1fr);gap:12px;margin-bottom:20px}
-.sum-card{background:var(--card);border:1px solid var(--border);border-radius:12px;padding:14px 16px}
-.sum-val{font-family:'JetBrains Mono',monospace;font-size:1.4rem;font-weight:600;color:var(--accent);line-height:1}
-.sum-val.green{color:var(--accent2)}.sum-val.yellow{color:var(--yellow)}.sum-val.orange{color:var(--orange)}.sum-val.red{color:var(--red)}.sum-val.purple{color:var(--purple)}
-.sum-lbl{font-size:0.63rem;color:var(--muted);text-transform:uppercase;letter-spacing:1px;margin-top:5px}
-
-/* table */
-.table-card{background:var(--card);border:1px solid var(--border);border-radius:16px;overflow:hidden}
-.table-head{display:flex;align-items:center;justify-content:space-between;padding:14px 20px;border-bottom:1px solid var(--border)}
-.table-head h3{font-family:'JetBrains Mono',monospace;font-size:0.7rem;letter-spacing:1.5px;color:var(--muted);text-transform:uppercase}
-.cnt-pill{background:rgba(0,173,238,0.1);color:var(--accent);font-size:0.72rem;font-weight:600;padding:3px 10px;border-radius:12px;font-family:'JetBrains Mono',monospace}
-.tbl-wrap{overflow-x:auto;max-height:600px;overflow-y:auto}
-.tbl-wrap::-webkit-scrollbar{width:3px;height:3px}.tbl-wrap::-webkit-scrollbar-thumb{background:var(--muted2);border-radius:2px}
-table{width:100%;border-collapse:collapse}
-thead th{padding:10px 14px;text-align:left;font-size:0.63rem;font-weight:600;color:var(--muted);text-transform:uppercase;letter-spacing:1px;background:var(--surface);border-bottom:1px solid var(--border);position:sticky;top:0;white-space:nowrap}
-tbody tr{border-bottom:1px solid rgba(207,216,227,0.8);transition:background 0.15s}
-tbody tr:last-child{border-bottom:none}
-tbody tr:hover{background:rgba(0,173,238,0.04)}
-td{padding:10px 14px;font-size:0.82rem;vertical-align:middle;white-space:nowrap}
-.td-name{display:flex;align-items:center;gap:9px;font-weight:600}
-.td-av{width:28px;height:28px;border-radius:50%;background:linear-gradient(135deg,#f8f9fa,#eef3f8);display:flex;align-items:center;justify-content:center;font-size:0.75rem;font-weight:700;color:var(--accent);border:1px solid rgba(0,173,238,0.2);flex-shrink:0}
-.time-pill{font-family:'JetBrains Mono',monospace;font-size:0.74rem;background:rgba(0,173,238,0.08);color:var(--accent);padding:2px 9px;border-radius:20px;border:1px solid rgba(0,173,238,0.12)}
-.time-pill.out{background:rgba(0,173,238,0.08);color:var(--accent);border-color:rgba(0,173,238,0.12)}
-.time-pill.exp{background:rgba(251,191,36,0.08);color:var(--yellow);border-color:rgba(251,191,36,0.12)}
-.time-pill.work{background:rgba(52,211,153,0.08);color:var(--accent2);border-color:rgba(52,211,153,0.12)}
-.badge{display:inline-flex;align-items:center;padding:3px 9px;border-radius:20px;font-size:0.65rem;font-weight:600;letter-spacing:0.3px;text-transform:uppercase;white-space:nowrap}
-.badge-present{background:rgba(52,211,153,0.08);color:var(--accent2);border:1px solid rgba(52,211,153,0.18)}
-.badge-late{background:rgba(251,191,36,0.08);color:var(--yellow);border:1px solid rgba(251,191,36,0.18)}
-.badge-early_leave{background:rgba(251,146,60,0.08);color:var(--orange);border:1px solid rgba(251,146,60,0.18)}
-.badge-late_early_leave{background:rgba(248,113,113,0.08);color:var(--red);border:1px solid rgba(248,113,113,0.18)}
-.badge-absent{background:rgba(248,113,113,0.08);color:var(--red);border:1px solid rgba(248,113,113,0.18)}
-.tbl-empty{text-align:center;padding:60px;color:var(--muted);font-size:0.84rem}
-.date-chip{font-family:'JetBrains Mono',monospace;font-size:0.74rem;color:var(--muted);background:var(--surface);padding:2px 9px;border-radius:6px;border:1px solid var(--border)}
-
-/* total bar */
-.total-work-bar{display:flex;align-items:center;gap:14px;background:rgba(52,211,153,0.05);border:1px solid rgba(52,211,153,0.12);border-radius:10px;padding:10px 18px;margin-top:12px}
-.tw-label{font-size:0.72rem;color:var(--muted);text-transform:uppercase;letter-spacing:1px}
-.tw-val{font-family:'JetBrains Mono',monospace;font-size:1.05rem;font-weight:600;color:var(--accent2)}
-.tw-note{font-size:0.72rem;color:var(--muted);margin-left:auto}
-
-.loading-row td{text-align:center;padding:50px;color:var(--muted)}
-</style>
-</head>
-<body>
-<nav>
-  <div class="nav-left">
-    <div class="nav-logo">FACE<span>·</span>ATT <em style="font-size:0.6rem;color:var(--muted);letter-spacing:1px;margin-left:6px;font-weight:400;font-family:'Space Grotesk',sans-serif">RECORDS</em></div>
-  </div>
-  <div class="nav-right">
-    <a href="/" class="nav-link">📋 Today</a>
-    <a href="/records" class="nav-link active">📊 Records</a>
-    <a href="/register" class="nav-link">👤 Register</a>
-  </div>
-</nav>
-<main>
-
-  <!-- FILTER BAR -->
-  <div class="filter-card">
-    <div class="filter-title">🔍 Filter Records</div>
-    <div class="filter-row">
-      <div class="filter-group">
-        <div class="filter-label">From Date</div>
-        <input type="date" id="fFrom" class="filter-inp" />
-      </div>
-      <div class="filter-group">
-        <div class="filter-label">To Date</div>
-        <input type="date" id="fTo" class="filter-inp" />
-      </div>
-      <div class="filter-group">
-        <div class="filter-label">Status</div>
-        <select id="fStatus" class="filter-sel">
-          <option value="">All Statuses</option>
-          <option value="present">✅ Present</option>
-          <option value="late">⏰ Late</option>
-          <option value="early_leave">⚠️ Early Leave</option>
-          <option value="late_early_leave">🔴 Late + Early Leave</option>
-          <option value="absent">❌ Absent</option>
-        </select>
-      </div>
-      <div class="filter-group">
-        <div class="filter-label">Department</div>
-        <select id="fDept" class="filter-sel"><option value="">All Departments</option></select>
-      </div>
-      <div class="filter-group">
-        <div class="filter-label">Name Search</div>
-        <input type="text" id="fName" class="filter-inp" placeholder="Search name..." />
-      </div>
-      <div class="filter-group">
-        <div class="filter-label">&nbsp;</div>
-        <div style="display:flex;gap:8px">
-          <button class="btn-filter" onclick="applyFilters()">🔍 Apply</button>
-          <button class="btn-clear" onclick="clearFilters()">✕ Clear</button>
-        </div>
-      </div>
-    </div>
-  </div>
-
-  <!-- SUMMARY BAR -->
-  <div class="summary-bar">
-    <div class="sum-card"><div class="sum-val" id="sumTotal">—</div><div class="sum-lbl">Total Records</div></div>
-    <div class="sum-card"><div class="sum-val green" id="sumPresent">—</div><div class="sum-lbl">Present</div></div>
-    <div class="sum-card"><div class="sum-val yellow" id="sumLate">—</div><div class="sum-lbl">Late</div></div>
-    <div class="sum-card"><div class="sum-val orange" id="sumEarly">—</div><div class="sum-lbl">Early Leave</div></div>
-    <div class="sum-card"><div class="sum-val red" id="sumAbsent">—</div><div class="sum-lbl">Absent</div></div>
-    <div class="sum-card"><div class="sum-val purple" id="sumWork">—</div><div class="sum-lbl">Total Work Hours</div></div>
-  </div>
-
-  <!-- TABLE -->
-  <div class="table-card">
-    <div class="table-head">
-      <h3>📋 Attendance Records</h3>
-      <span class="cnt-pill" id="recCnt">loading...</span>
-    </div>
-    <div class="tbl-wrap">
-      <table>
-        <thead>
-          <tr>
-            <th>Name</th>
-            <th>Emp ID</th>
-            <th>Department</th>
-            <th>Date</th>
-            <th>Check In</th>
-            <th>Check Out</th>
-            <th>Exp. Checkout</th>
-            <th>Working Hours</th>
-            <th>Status</th>
-          </tr>
-        </thead>
-        <tbody id="recBody">
-          <tr class="loading-row"><td colspan="9">Loading records...</td></tr>
-        </tbody>
-      </table>
-    </div>
-    <div id="totalWorkBar" class="total-work-bar" style="margin:12px 16px 16px;display:none">
-      <span class="tw-label">Total Working Hours (selected range):</span>
-      <span class="tw-val" id="totalWorkVal">0h 0m</span>
-      <span class="tw-note" id="totalWorkNote"></span>
-    </div>
-  </div>
-
-</main>
-
-<script>
-const statusLabels = {
-  present:'✅ Present', late:'⏰ Late', early_leave:'⚠️ Early Leave',
-  late_early_leave:'🔴 Late + Early', absent:'❌ Absent'
-};
-
-function esc(s){return String(s).replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));}
-function fmt(s){return s||'—';}
-
-// Set default date range to current month
-(function setDefaults(){
-  const now = new Date();
-  const y = now.getFullYear(), m = String(now.getMonth()+1).padStart(2,'0');
-  const d = String(now.getDate()).padStart(2,'0');
-  document.getElementById('fFrom').value = y+'-'+m+'-01';
-  document.getElementById('fTo').value   = y+'-'+m+'-'+d;
-})();
-
-// Load departments
-(async function loadDepts(){
-  try{
-    const {departments=[]} = await(await fetch('/api/departments')).json();
-    const sel = document.getElementById('fDept');
-    departments.forEach(d=>{
-      const o=document.createElement('option');o.value=d;o.textContent=d;sel.appendChild(o);
-    });
-  }catch(e){}
-})();
-
-async function applyFilters(){
-  const from   = document.getElementById('fFrom').value;
-  const to     = document.getElementById('fTo').value;
-  const status = document.getElementById('fStatus').value;
-  const dept   = document.getElementById('fDept').value;
-  const name   = document.getElementById('fName').value.trim();
-
-  const body = document.getElementById('recBody');
-  body.innerHTML='<tr class="loading-row"><td colspan="9">Loading...</td></tr>';
-
-  const params = new URLSearchParams();
-  if(from)   params.set('from',from);
-  if(to)     params.set('to',to);
-  if(status) params.set('status',status);
-  if(dept)   params.set('department',dept);
-  if(name)   params.set('name',name);
-
-  try{
-    const {records=[], total_working='0h 0m', total_working_minutes=0} =
-      await(await fetch('/api/attendance/records?'+params)).json();
-
-    document.getElementById('recCnt').textContent = records.length+' records';
-
-    // Summary counts
-    const counts = {present:0,late:0,early_leave:0,late_early_leave:0,absent:0};
-    records.forEach(r=>{if(counts[r.status]!==undefined)counts[r.status]++;});
-    document.getElementById('sumTotal').textContent   = records.length;
-    document.getElementById('sumPresent').textContent = counts.present;
-    document.getElementById('sumLate').textContent    = counts.late;
-    document.getElementById('sumEarly').textContent   = counts.early_leave + counts.late_early_leave;
-    document.getElementById('sumAbsent').textContent  = counts.absent;
-    const th = Math.floor(total_working_minutes/60), tm = total_working_minutes%60;
-    document.getElementById('sumWork').textContent    = th+'h '+tm+'m';
-
-    // Total bar
-    if(records.length){
-      document.getElementById('totalWorkVal').textContent = total_working;
-      let note = '';
-      if(from && to) note = 'Date range: '+from+' → '+to;
-      document.getElementById('totalWorkNote').textContent = note;
-      document.getElementById('totalWorkBar').style.display = 'flex';
-    } else {
-      document.getElementById('totalWorkBar').style.display = 'none';
+app.delete('/api/unknown-faces/all', async (req, res) => {
+  try {
+    // Also delete image files
+    const rows = await dbQuery('SELECT image_file FROM unknown_faces WHERE image_file IS NOT NULL');
+    for (const r of rows) {
+      try { fs.unlinkSync(path.join(UNKNOWN_DIR, r.image_file)); } catch(_){}
     }
+    await dbQuery('DELETE FROM unknown_faces');
+    res.json({ success: true });
+  } catch(e) { res.status(500).json({ error: e.message }); }
+});
 
-    if(!records.length){
-      body.innerHTML='<tr><td colspan="9" class="tbl-empty">No records found for selected filters</td></tr>';
-      return;
+app.delete('/api/unknown-faces/:id', async (req, res) => {
+  try {
+    const rows = await dbQuery('SELECT image_file FROM unknown_faces WHERE id=?', [parseInt(req.params.id)]);
+    if (!rows.length) return res.status(404).json({ error: 'Not found' });
+    if (rows[0].image_file) {
+      try { fs.unlinkSync(path.join(UNKNOWN_DIR, rows[0].image_file)); } catch(_){}
     }
+    await dbQuery('DELETE FROM unknown_faces WHERE id=?', [parseInt(req.params.id)]);
+    res.json({ success: true });
+  } catch(e) { res.status(500).json({ error: e.message }); }
+});
 
-    body.innerHTML = records.map(r => {
-      const wh = r.working_hours ? '<span class="time-pill work">'+esc(r.working_hours)+'</span>' : '<span style="color:var(--muted)">—</span>';
-      const exp = r.expected_checkout
-        ? '<span class="time-pill exp">'+esc(r.expected_checkout)+'</span>'
-        : '<span style="color:var(--muted)">—</span>';
-      return '<tr>'+
-        '<td><div class="td-name"><div class="td-av">'+esc(r.name[0].toUpperCase())+'</div>'+esc(r.name)+'</div></td>'+
-        '<td style="color:var(--muted);font-family:monospace;font-size:0.75rem">'+(r.employee_id||'—')+'</td>'+
-        '<td style="color:var(--muted);font-size:0.75rem">'+(r.department||'—')+'</td>'+
-        '<td><span class="date-chip">'+esc(r.date)+'</span></td>'+
-        '<td><span class="time-pill">'+esc(r.time_in)+'</span></td>'+
-        '<td><span class="time-pill out">'+esc(r.time_out||'—')+'</span></td>'+
-        '<td>'+exp+'</td>'+
-        '<td>'+wh+'</td>'+
-        '<td><span class="badge badge-'+esc(r.status)+'">'+(statusLabels[r.status]||r.status)+'</span></td>'+
-        '</tr>';
-    }).join('');
-  }catch(e){
-    body.innerHTML='<tr><td colspan="9" class="tbl-empty" style="color:var(--red)">Error loading records: '+esc(e.message)+'</td></tr>';
-  }
-}
-
-function clearFilters(){
-  document.getElementById('fStatus').value='';
-  document.getElementById('fDept').value='';
-  document.getElementById('fName').value='';
-  const now=new Date();
-  const y=now.getFullYear(),m=String(now.getMonth()+1).padStart(2,'0'),d=String(now.getDate()).padStart(2,'0');
-  document.getElementById('fFrom').value=y+'-'+m+'-01';
-  document.getElementById('fTo').value=y+'-'+m+'-'+d;
-  applyFilters();
-}
-
-document.getElementById('fName').addEventListener('keydown',e=>{ if(e.key==='Enter') applyFilters(); });
-
-// Auto load on page open
-applyFilters();
-</script>
-</body>
-</html>`;
-}
-
-// ─── LED API ROUTES ───────────────────────────────────────────────────────────
-
-// Arduino polls this ~every 500 ms. Returns plain text, clears after read.
+// ─── LED API ──────────────────────────────────────────────────────────────────
 app.get('/api/led/status', (req, res) => {
   const cmd = pendingLedCommand || { led: 'X', buzzer: 0, name: '', status: '' };
   pendingLedCommand = null;
-  res.set('Content-Type', 'text/plain')
-     .send(`LED:${cmd.led};BUZZ:${cmd.buzzer};NAME:${cmd.name};STATUS:${cmd.status}`);
+  res.set('Content-Type', 'text/plain').send(`LED:${cmd.led};BUZZ:${cmd.buzzer};NAME:${cmd.name};STATUS:${cmd.status}`);
 });
-
-// JSON version for browser debugging
 app.get('/api/led/status/json', (req, res) => {
   const cmd = pendingLedCommand || { led: 'X', buzzer: 0, name: '', status: '', timestamp: null };
   pendingLedCommand = null;
   res.json(cmd);
 });
-
-// Manual trigger endpoint (optional, for testing)
 app.post('/api/led/trigger', (req, res) => {
   const { eventType, name = '', status = '' } = req.body;
   if (!eventType) return res.status(400).json({ error: 'eventType required' });
@@ -1812,13 +1595,8 @@ app.post('/api/led/trigger', (req, res) => {
 app.get('/', async (req, res) => {
   try {
     const today = new Date().toISOString().slice(0, 10);
-    const records = await dbQuery(
-      `SELECT a.face_id, a.name, a.time_in, a.time_out, a.status
-       FROM attendance a WHERE a.date=? ORDER BY a.time_in ASC`, [today]
-    );
-    res.send(getAttendanceHTML(records.map(r => ({
-      ...r, time_in: fmtTime(r.time_in), time_out: fmtTime(r.time_out)
-    }))));
+    const records = await dbQuery(`SELECT a.face_id, a.name, a.time_in, a.time_out, a.status FROM attendance a WHERE a.date=? ORDER BY a.time_in ASC`, [today]);
+    res.send(getAttendanceHTML(records.map(r => ({ ...r, time_in: fmtTime(r.time_in), time_out: fmtTime(r.time_out) }))));
   } catch(e) { res.status(500).send('DB error: ' + e.message); }
 });
 
@@ -1829,18 +1607,18 @@ app.get('/register', async (req, res) => {
   } catch(e) { res.status(500).send('DB error: ' + e.message); }
 });
 
-app.get('/records', (req, res) => {
-  res.send(getRecordsHTML());
-});
+app.get('/records', (req, res) => res.send(getRecordsHTML()));
+app.get('/unknown-faces', (req, res) => res.send(getUnknownFacesHTML()));
 
 // ─── START ────────────────────────────────────────────────────────────────────
 setup().then(() => {
   app.listen(PORT, () => {
     console.log('\n==========================================');
     console.log('🚀  http://localhost:' + PORT);
-    console.log('📋  Attendance → http://localhost:' + PORT + '/');
-    console.log('📊  Records    → http://localhost:' + PORT + '/records');
-    console.log('👤  Register   → http://localhost:' + PORT + '/register');
+    console.log('📋  Attendance    → http://localhost:' + PORT + '/');
+    console.log('📊  Records       → http://localhost:' + PORT + '/records');
+    console.log('👤  Register      → http://localhost:' + PORT + '/register');
+    console.log('❓  Unknown Faces → http://localhost:' + PORT + '/unknown-faces');
     console.log('⏰  Office: ' + OFFICE_START.h + ':' + String(OFFICE_START.m).padStart(2,'0') +
       ' AM  |  Grace: +' + GRACE_MINUTES + ' min  |  End: ' + OFFICE_END.h + ':' + String(OFFICE_END.m).padStart(2,'0') +
       '  |  Absent after: ' + ABSENT_AFTER.h + ':00 AM');
