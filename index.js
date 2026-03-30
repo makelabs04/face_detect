@@ -2,24 +2,50 @@
  * FaceAttend SaaS — Multi-tenant Face Recognition Attendance
  * Roles: super_admin | admin (tenant) | user (employee)
  *
- * Changes:
- *  - Face registration now includes email + password → creates user account automatically
- *  - No separate Users tab (removed)
- *  - After user login, auto-show notification permission modal after 5 seconds
- *  - Portal page redesigned (same #00adee accent)
+ * v3.0 Changes:
+ *  - Multi-shift per person (face_shifts junction table)
+ *  - Hour-based shift duration display
+ *  - Mobile-first responsive redesign across all pages
+ *  - Admin: Export attendance (CSV)
+ *  - Scan: Shows detected name label live, pending shift modal before marking
+ *  - User: Push notification subscription modal fix (VAPID properly checked)
+ *  - Admin People tab: edit support, cleaner layout
+ *  - DB ALTER commands provided for existing installs
  *
- * Install:  npm install express mysql2 bcryptjs jsonwebtoken web-push
+ * DB ALTER (run once on existing DB):
+ *   ALTER TABLE `attendance`
+ *     DROP FOREIGN KEY attendance_ibfk_3,
+ *     DROP COLUMN shift_id;
+ *
+ *   CREATE TABLE IF NOT EXISTS face_shifts (
+ *     id INT AUTO_INCREMENT PRIMARY KEY,
+ *     face_id INT NOT NULL,
+ *     admin_id INT NOT NULL,
+ *     shift_id INT NOT NULL,
+ *     UNIQUE KEY uq_face_shift (face_id, shift_id),
+ *     FOREIGN KEY (face_id) REFERENCES faces(id) ON DELETE CASCADE,
+ *     FOREIGN KEY (shift_id) REFERENCES shifts(id) ON DELETE CASCADE,
+ *     FOREIGN KEY (admin_id) REFERENCES admins(id) ON DELETE CASCADE
+ *   ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+ *
+ *   ALTER TABLE `attendance`
+ *     ADD COLUMN shift_id INT DEFAULT NULL AFTER face_id,
+ *     ADD CONSTRAINT attendance_ibfk_3 FOREIGN KEY (shift_id) REFERENCES shifts(id) ON DELETE SET NULL;
+ *
+ *   ALTER TABLE `faces` DROP COLUMN IF EXISTS shift_id;
+ *
+ * Install: npm install express mysql2 bcryptjs jsonwebtoken web-push
  */
 
 'use strict';
 
-const express   = require('express');
-const mysql     = require('mysql2');
-const https     = require('https');
-const fs        = require('fs');
-const path      = require('path');
-const bcrypt    = require('bcryptjs');
-const jwt       = require('jsonwebtoken');
+const express = require('express');
+const mysql   = require('mysql2');
+const https   = require('https');
+const fs      = require('fs');
+const path    = require('path');
+const bcrypt  = require('bcryptjs');
+const jwt     = require('jsonwebtoken');
 let webpush;
 try { webpush = require('web-push'); } catch(e) { webpush = null; }
 
@@ -29,7 +55,6 @@ const PORT = process.env.PORT || 3000;
 app.use(express.json({ limit: '25mb' }));
 app.use(express.urlencoded({ extended: true }));
 
-// ── Static assets ─────────────────────────────────────────────────────────────
 const PUBLIC_DIR         = path.join(__dirname, 'public');
 const MODELS_DIR         = path.join(PUBLIC_DIR, 'models');
 const UNKNOWN_IMAGES_DIR = path.join(PUBLIC_DIR, 'unknown-images');
@@ -39,12 +64,12 @@ app.use('/models',         express.static(MODELS_DIR));
 app.use('/faceapi.js',    (_, res) => res.sendFile(FACEAPI_PATH));
 app.use('/unknown-images', express.static(UNKNOWN_IMAGES_DIR));
 
-// ── DB ────────────────────────────────────────────────────────────────────────
+// ── DB ─────────────────────────────────────────────────────────────────
 const DB_CONFIG = {
-  host     : process.env.DB_HOST     || '127.0.0.1',
-  user     : process.env.DB_USER     || 'u966260443_facedetect',
-  password : process.env.DB_PASS     || 'Makelabs@123',
-  database : process.env.DB_NAME     || 'u966260443_facedetect',
+  host     : process.env.DB_HOST || '127.0.0.1',
+  user     : process.env.DB_USER || 'u966260443_facedetect',
+  password : process.env.DB_PASS || 'Makelabs@123',
+  database : process.env.DB_NAME || 'u966260443_facedetect',
   multipleStatements: true
 };
 const db = mysql.createConnection(DB_CONFIG);
@@ -55,9 +80,8 @@ function dbQuery(sql, params = []) {
   );
 }
 
-// ── JWT / Session ─────────────────────────────────────────────────────────────
+// ── JWT ────────────────────────────────────────────────────────────────
 const JWT_SECRET = process.env.JWT_SECRET || 'faceattend_saas_secret_2025_change_in_prod';
-
 function signToken(payload) { return jwt.sign(payload, JWT_SECRET, { expiresIn: '8h' }); }
 function verifyToken(t)     { try { return jwt.verify(t, JWT_SECRET); } catch { return null; } }
 
@@ -73,7 +97,7 @@ function authMiddleware(role) {
   };
 }
 
-// ── VAPID / Web Push ──────────────────────────────────────────────────────────
+// ── VAPID ──────────────────────────────────────────────────────────────
 const VAPID = {
   public : process.env.VAPID_PUBLIC  || '',
   private: process.env.VAPID_PRIVATE || '',
@@ -99,15 +123,8 @@ async function sendPushToUser(userId, title, body, adminId) {
     );
     if (!rows.length || !rows[0].push_subscription) return;
     const sub = JSON.parse(rows[0].push_subscription);
-    await webpush.sendNotification(sub, JSON.stringify({
-      title, body,
-      icon: '/icon-192.png',
-      badge: '/icon-192.png'
-    }));
-    await dbQuery(
-      'INSERT INTO push_log (admin_id,user_id,title,body) VALUES (?,?,?,?)',
-      [adminId, userId, title, body]
-    );
+    await webpush.sendNotification(sub, JSON.stringify({ title, body, icon: '/icon-192.png', badge: '/icon-192.png' }));
+    await dbQuery('INSERT INTO push_log (admin_id,user_id,title,body) VALUES (?,?,?,?)', [adminId, userId, title, body]);
   } catch(e) {
     if (e.statusCode === 410 || e.statusCode === 404) {
       await dbQuery('UPDATE users SET push_subscription=NULL, notifications_enabled=0 WHERE id=?', [userId]);
@@ -116,7 +133,7 @@ async function sendPushToUser(userId, title, body, adminId) {
   }
 }
 
-// ── Helpers ───────────────────────────────────────────────────────────────────
+// ── Helpers ────────────────────────────────────────────────────────────
 function escH(s) {
   return String(s).replace(/[&<>"']/g, c =>
     ({ '&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;' }[c])
@@ -129,6 +146,14 @@ function fmtTime(t) {
   const h = parseInt(p[0]), m = p[1]||'00';
   return (h%12||12)+':'+m+' '+(h>=12?'PM':'AM');
 }
+function shiftHours(start, end) {
+  const [sh,sm] = start.split(':').map(Number);
+  const [eh,em] = end.split(':').map(Number);
+  let mins = (eh*60+em) - (sh*60+sm);
+  if (mins < 0) mins += 24*60;
+  const h = Math.floor(mins/60), m = mins%60;
+  return m ? `${h}h ${m}m` : `${h}h`;
+}
 
 const THRESHOLD        = 0.5;
 const REGISTER_SAMPLES = 10;
@@ -137,7 +162,7 @@ function euclidean(a, b) {
   let s = 0; for (let i=0;i<a.length;i++) s+=(a[i]-b[i])**2; return Math.sqrt(s);
 }
 
-// ── DB Init ───────────────────────────────────────────────────────────────────
+// ── DB Init ────────────────────────────────────────────────────────────
 db.connect(err => {
   if (err) { console.error('❌ MySQL error:', err.message); process.exit(1); }
   console.log('✅ MySQL connected →', DB_CONFIG.database);
@@ -185,14 +210,23 @@ async function initTables() {
       label VARCHAR(100) NOT NULL,
       employee_id VARCHAR(50) DEFAULT '',
       department VARCHAR(100) DEFAULT '',
-      shift_id INT DEFAULT NULL,
       user_email VARCHAR(191) DEFAULT NULL,
       descriptor LONGTEXT NOT NULL,
       registration_accuracy TINYINT UNSIGNED DEFAULT NULL,
       registered_at DATETIME DEFAULT CURRENT_TIMESTAMP,
       UNIQUE KEY uq_admin_label (admin_id, label),
-      FOREIGN KEY (admin_id) REFERENCES admins(id) ON DELETE CASCADE,
-      FOREIGN KEY (shift_id) REFERENCES shifts(id) ON DELETE SET NULL
+      FOREIGN KEY (admin_id) REFERENCES admins(id) ON DELETE CASCADE
+    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+
+    CREATE TABLE IF NOT EXISTS face_shifts (
+      id INT AUTO_INCREMENT PRIMARY KEY,
+      face_id INT NOT NULL,
+      admin_id INT NOT NULL,
+      shift_id INT NOT NULL,
+      UNIQUE KEY uq_face_shift (face_id, shift_id),
+      FOREIGN KEY (face_id) REFERENCES faces(id) ON DELETE CASCADE,
+      FOREIGN KEY (shift_id) REFERENCES shifts(id) ON DELETE CASCADE,
+      FOREIGN KEY (admin_id) REFERENCES admins(id) ON DELETE CASCADE
     ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
 
     CREATE TABLE IF NOT EXISTS users (
@@ -222,7 +256,7 @@ async function initTables() {
       status ENUM('present','absent') DEFAULT 'present',
       notification_sent TINYINT(1) DEFAULT 0,
       created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-      UNIQUE KEY uq_face_date (face_id, date),
+      UNIQUE KEY uq_face_date_shift (face_id, date, shift_id),
       FOREIGN KEY (admin_id) REFERENCES admins(id) ON DELETE CASCADE,
       FOREIGN KEY (face_id) REFERENCES faces(id) ON DELETE CASCADE,
       FOREIGN KEY (shift_id) REFERENCES shifts(id) ON DELETE SET NULL
@@ -269,7 +303,7 @@ async function initTables() {
   }
 }
 
-// ── Model / face-api download ─────────────────────────────────────────────────
+// ── Model download ─────────────────────────────────────────────────────
 const FACEAPI_URL    = 'https://unpkg.com/face-api.js@0.22.2/dist/face-api.min.js';
 const MODEL_BASE_URL = 'https://raw.githubusercontent.com/justadudewhohacks/face-api.js/master/weights/';
 const MODEL_FILES    = [
@@ -324,123 +358,238 @@ async function setup() {
   console.log('\n🚀 FaceAttend SaaS running on http://localhost:' + PORT + '\n');
 }
 
-// ═══════════════════════════════════════════════════════════════════════════════
+// ═══════════════════════════════════════════════════════════════════════
 //  SHARED CSS
-// ═══════════════════════════════════════════════════════════════════════════════
+// ═══════════════════════════════════════════════════════════════════════
 const SHARED_CSS = `
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@400;500;600;700&family=JetBrains+Mono:wght@400;600&display=swap">
 <style>
 :root{
-  --bg:#ffffff;--surface:#f8f9fa;--card:#ffffff;--border:#dbe3ea;
-  --accent:#00adee;--accent2:#00adee;--red:#f87171;--yellow:#fbbf24;
+  --bg:#f0f4f8;--surface:#e8edf3;--card:#ffffff;--border:#d1dbe8;
+  --accent:#00adee;--red:#f87171;--yellow:#fbbf24;
   --green:#34d399;--purple:#a78bfa;--orange:#fb923c;
-  --text:#1f2937;--muted:#6b7280;--muted2:#cfd8e3;
+  --text:#1a2332;--muted:#64748b;--muted2:#cbd5e1;
 }
 *{box-sizing:border-box;margin:0;padding:0}
+html{scroll-behavior:smooth}
 body{font-family:'Space Grotesk',sans-serif;background:var(--bg);color:var(--text);min-height:100vh;overflow-x:hidden}
-body::before{content:'';position:fixed;inset:0;background:radial-gradient(ellipse 80% 50% at 50% -10%,rgba(0,173,238,0.08),transparent);pointer-events:none;z-index:0}
-nav{position:sticky;top:0;z-index:100;background:rgba(255,255,255,0.96);backdrop-filter:blur(20px);border-bottom:1px solid var(--border);display:flex;align-items:center;justify-content:space-between;padding:0 20px;height:62px}
-.nav-logo{display:flex;align-items:center;gap:10px;font-family:'JetBrains Mono',monospace;font-size:0.9rem;font-weight:600;color:var(--text);text-decoration:none}
+body::before{content:'';position:fixed;inset:0;background:radial-gradient(ellipse 80% 40% at 50% -5%,rgba(0,173,238,0.07),transparent);pointer-events:none;z-index:0}
+
+/* ── NAV ── */
+nav{position:sticky;top:0;z-index:200;background:rgba(255,255,255,0.97);backdrop-filter:blur(20px);border-bottom:1px solid var(--border);display:flex;align-items:center;justify-content:space-between;padding:0 16px;height:56px;gap:8px}
+.nav-logo{display:flex;align-items:center;gap:8px;font-family:'JetBrains Mono',monospace;font-size:0.85rem;font-weight:600;color:var(--text);text-decoration:none;flex-shrink:0}
 .nav-logo span{color:var(--accent)}
-.nav-logo img{height:36px;border-radius:6px;object-fit:contain}
-.nav-right{display:flex;align-items:center;gap:10px}
-.badge{padding:3px 10px;border-radius:20px;font-size:0.65rem;font-weight:700;letter-spacing:0.5px;text-transform:uppercase}
+.nav-logo img{height:32px;border-radius:6px;object-fit:contain}
+.nav-right{display:flex;align-items:center;gap:6px;flex-wrap:wrap;justify-content:flex-end}
+.badge{padding:2px 8px;border-radius:20px;font-size:0.6rem;font-weight:700;letter-spacing:0.5px;text-transform:uppercase;white-space:nowrap}
 .badge-sa{background:rgba(167,139,250,0.15);color:#7c3aed}
 .badge-admin{background:rgba(0,173,238,0.12);color:var(--accent)}
 .badge-user{background:rgba(52,211,153,0.15);color:#059669}
-.btn{display:inline-flex;align-items:center;gap:6px;padding:8px 16px;border-radius:10px;font-family:'Space Grotesk',sans-serif;font-size:0.8rem;font-weight:600;cursor:pointer;border:none;text-decoration:none;transition:all 0.2s;white-space:nowrap}
+
+/* ── BUTTONS ── */
+.btn{display:inline-flex;align-items:center;gap:5px;padding:8px 14px;border-radius:10px;font-family:'Space Grotesk',sans-serif;font-size:0.78rem;font-weight:600;cursor:pointer;border:none;text-decoration:none;transition:all 0.2s;white-space:nowrap}
 .btn-primary{background:var(--accent);color:#fff}
-.btn-primary:hover{background:#009ed8;transform:translateY(-1px);box-shadow:0 4px 16px rgba(0,173,238,0.35)}
-.btn-outline{background:transparent;border:1px solid var(--border);color:var(--text)}
+.btn-primary:hover{background:#009ed8;transform:translateY(-1px);box-shadow:0 4px 14px rgba(0,173,238,0.35)}
+.btn-primary:disabled{opacity:0.5;cursor:not-allowed;transform:none;box-shadow:none}
+.btn-outline{background:#fff;border:1px solid var(--border);color:var(--text)}
 .btn-outline:hover{border-color:var(--accent);color:var(--accent)}
 .btn-danger{background:rgba(248,113,113,0.1);border:1px solid rgba(248,113,113,0.3);color:var(--red)}
 .btn-danger:hover{background:rgba(248,113,113,0.2)}
 .btn-success{background:rgba(52,211,153,0.1);border:1px solid rgba(52,211,153,0.3);color:#059669}
 .btn-success:hover{background:rgba(52,211,153,0.2)}
-.btn-sm{padding:5px 10px;font-size:0.72rem}
-main{max-width:1100px;margin:0 auto;padding:24px 16px;position:relative;z-index:1}
-.page-title{font-family:'JetBrains Mono',monospace;font-size:0.65rem;color:var(--muted);letter-spacing:2px;text-transform:uppercase;margin-bottom:18px}
-.card{background:var(--card);border:1px solid var(--border);border-radius:16px;padding:20px}
-.card-sm{padding:14px}
-.grid2{display:grid;grid-template-columns:1fr 1fr;gap:14px}
-.grid3{display:grid;grid-template-columns:repeat(3,1fr);gap:14px}
-.grid4{display:grid;grid-template-columns:repeat(4,1fr);gap:14px}
-.stat{background:var(--card);border:1px solid var(--border);border-radius:14px;padding:14px}
-.stat-val{font-family:'JetBrains Mono',monospace;font-size:1.6rem;font-weight:600;color:var(--accent);line-height:1}
-.stat-val.green{color:var(--green)}.stat-val.red{color:var(--red)}.stat-val.yellow{color:var(--yellow)}
-.stat-label{font-size:0.62rem;color:var(--muted);text-transform:uppercase;letter-spacing:1px;margin-top:5px}
-.form-group{margin-bottom:14px}
-.form-group label{display:block;font-size:0.7rem;color:var(--muted);text-transform:uppercase;letter-spacing:0.8px;margin-bottom:6px}
-.form-control{width:100%;background:var(--surface);border:1px solid var(--border);border-radius:9px;padding:9px 12px;color:var(--text);font-family:'Space Grotesk',sans-serif;font-size:0.85rem;outline:none;transition:border-color 0.2s}
-.form-control:focus{border-color:var(--accent)}
+.btn-warn{background:rgba(251,191,36,0.1);border:1px solid rgba(251,191,36,0.3);color:#92400e}
+.btn-warn:hover{background:rgba(251,191,36,0.2)}
+.btn-sm{padding:5px 10px;font-size:0.7rem}
+.btn-xs{padding:3px 8px;font-size:0.65rem}
+.btn-icon{padding:6px;border-radius:8px;width:32px;height:32px;justify-content:center}
+.btn-full{width:100%;justify-content:center}
+
+/* ── LAYOUT ── */
+main{max-width:1100px;margin:0 auto;padding:16px;position:relative;z-index:1}
+.page-title{font-family:'JetBrains Mono',monospace;font-size:0.6rem;color:var(--muted);letter-spacing:2px;text-transform:uppercase;margin-bottom:14px}
+
+/* ── CARDS ── */
+.card{background:var(--card);border:1px solid var(--border);border-radius:16px;padding:18px;box-shadow:0 1px 3px rgba(0,0,0,0.04)}
+.card-sm{padding:12px}
+.card-header{display:flex;align-items:center;justify-content:space-between;margin-bottom:14px;gap:8px;flex-wrap:wrap}
+.card-title{font-weight:700;font-size:0.9rem}
+
+/* ── GRID ── */
+.grid2{display:grid;grid-template-columns:1fr 1fr;gap:12px}
+.grid3{display:grid;grid-template-columns:repeat(3,1fr);gap:12px}
+.grid4{display:grid;grid-template-columns:repeat(4,1fr);gap:10px}
+
+/* ── STATS ── */
+.stat{background:var(--card);border:1px solid var(--border);border-radius:14px;padding:14px;text-align:center}
+.stat-val{font-family:'JetBrains Mono',monospace;font-size:1.5rem;font-weight:700;color:var(--accent);line-height:1}
+.stat-val.green{color:#059669}.stat-val.red{color:var(--red)}.stat-val.yellow{color:#92400e}
+.stat-label{font-size:0.58rem;color:var(--muted);text-transform:uppercase;letter-spacing:1px;margin-top:4px}
+
+/* ── FORMS ── */
+.form-group{margin-bottom:12px}
+.form-group label{display:block;font-size:0.65rem;color:var(--muted);text-transform:uppercase;letter-spacing:0.8px;margin-bottom:5px;font-weight:600}
+.form-control{width:100%;background:#f8fafc;border:1px solid var(--border);border-radius:9px;padding:9px 12px;color:var(--text);font-family:'Space Grotesk',sans-serif;font-size:0.83rem;outline:none;transition:border-color 0.2s,box-shadow 0.2s}
+.form-control:focus{border-color:var(--accent);box-shadow:0 0 0 3px rgba(0,173,238,0.1);background:#fff}
 select.form-control{cursor:pointer}
-.alert{padding:10px 14px;border-radius:10px;font-size:0.82rem;margin-bottom:14px}
-.alert-error{background:rgba(248,113,113,0.1);border:1px solid rgba(248,113,113,0.25);color:#dc2626}
-.alert-success{background:rgba(52,211,153,0.1);border:1px solid rgba(52,211,153,0.25);color:#059669}
-.alert-warn{background:rgba(251,191,36,0.1);border:1px solid rgba(251,191,36,0.25);color:#92400e}
-.alert-info{background:rgba(0,173,238,0.08);border:1px solid rgba(0,173,238,0.2);color:var(--accent)}
-table{width:100%;border-collapse:collapse;font-size:0.82rem}
-th{font-size:0.65rem;color:var(--muted);text-transform:uppercase;letter-spacing:0.8px;padding:8px 12px;text-align:left;border-bottom:1px solid var(--border)}
-td{padding:10px 12px;border-bottom:1px solid var(--surface);color:var(--text)}
+textarea.form-control{resize:vertical;min-height:80px}
+
+/* Multi-select shifts */
+.shift-checkboxes{display:flex;flex-direction:column;gap:6px;max-height:180px;overflow-y:auto;padding:4px 0}
+.shift-checkbox-item{display:flex;align-items:center;gap:8px;padding:8px 10px;border:1px solid var(--border);border-radius:8px;cursor:pointer;transition:all 0.15s;background:#f8fafc}
+.shift-checkbox-item:hover{border-color:var(--accent);background:rgba(0,173,238,0.04)}
+.shift-checkbox-item input[type=checkbox]{accent-color:var(--accent);width:15px;height:15px;cursor:pointer}
+.shift-checkbox-item.checked{border-color:var(--accent);background:rgba(0,173,238,0.06)}
+.shift-checkbox-label{flex:1;font-size:0.8rem;font-weight:500}
+.shift-checkbox-meta{font-size:0.65rem;color:var(--muted)}
+
+/* ── ALERTS ── */
+.alert{padding:10px 12px;border-radius:10px;font-size:0.8rem;margin-bottom:12px;line-height:1.4}
+.alert-error{background:rgba(248,113,113,0.08);border:1px solid rgba(248,113,113,0.25);color:#dc2626}
+.alert-success{background:rgba(52,211,153,0.08);border:1px solid rgba(52,211,153,0.25);color:#059669}
+.alert-warn{background:rgba(251,191,36,0.08);border:1px solid rgba(251,191,36,0.25);color:#92400e}
+.alert-info{background:rgba(0,173,238,0.06);border:1px solid rgba(0,173,238,0.18);color:#0369a1}
+
+/* ── TABLE ── */
+.table-wrap{overflow-x:auto;-webkit-overflow-scrolling:touch;border-radius:12px;border:1px solid var(--border)}
+table{width:100%;border-collapse:collapse;font-size:0.8rem;min-width:500px}
+th{font-size:0.6rem;color:var(--muted);text-transform:uppercase;letter-spacing:0.8px;padding:10px 12px;text-align:left;border-bottom:1px solid var(--border);background:#f8fafc;white-space:nowrap}
+td{padding:10px 12px;border-bottom:1px solid #f0f4f8;color:var(--text);vertical-align:middle}
 tr:last-child td{border-bottom:none}
-tr:hover td{background:var(--surface)}
-.chip{display:inline-block;padding:2px 8px;border-radius:20px;font-size:0.65rem;font-weight:600}
+tr:hover td{background:#f8fafc}
+
+/* ── CHIPS ── */
+.chip{display:inline-flex;align-items:center;gap:3px;padding:3px 8px;border-radius:20px;font-size:0.62rem;font-weight:600;white-space:nowrap}
 .chip-green{background:rgba(52,211,153,0.12);color:#059669}
 .chip-red{background:rgba(248,113,113,0.12);color:#dc2626}
 .chip-yellow{background:rgba(251,191,36,0.12);color:#92400e}
 .chip-blue{background:rgba(0,173,238,0.1);color:var(--accent)}
 .chip-gray{background:rgba(107,114,128,0.1);color:var(--muted)}
 .chip-purple{background:rgba(167,139,250,0.12);color:#7c3aed}
-.modal-backdrop{position:fixed;inset:0;background:rgba(0,0,0,0.45);z-index:800;display:none;align-items:center;justify-content:center;padding:16px}
+
+/* ── MODAL ── */
+.modal-backdrop{position:fixed;inset:0;background:rgba(15,23,42,0.5);z-index:800;display:none;align-items:flex-end;justify-content:center;padding:0;backdrop-filter:blur(4px)}
 .modal-backdrop.open{display:flex}
-.modal{background:var(--card);border:1px solid var(--border);border-radius:18px;padding:24px;width:100%;max-width:480px;box-shadow:0 20px 60px rgba(0,0,0,0.12)}
-.modal-title{font-family:'JetBrains Mono',monospace;font-size:0.65rem;letter-spacing:2px;color:var(--muted);text-transform:uppercase;margin-bottom:18px;display:flex;align-items:center;justify-content:space-between}
-.modal-close{background:none;border:none;cursor:pointer;color:var(--muted);font-size:1.2rem;line-height:1}
+.modal{background:var(--card);border:1px solid var(--border);border-radius:20px 20px 0 0;padding:20px;width:100%;max-width:520px;box-shadow:0 -8px 40px rgba(0,0,0,0.15);max-height:90vh;overflow-y:auto}
+@media(min-width:640px){
+  .modal-backdrop{align-items:center;padding:16px}
+  .modal{border-radius:20px;max-height:85vh}
+}
+.modal-handle{width:40px;height:4px;border-radius:2px;background:var(--border);margin:0 auto 16px}
+.modal-title{font-weight:700;font-size:0.95rem;margin-bottom:16px;display:flex;align-items:center;justify-content:space-between}
+.modal-close{background:none;border:none;cursor:pointer;color:var(--muted);font-size:1.2rem;line-height:1;padding:4px}
 .modal-close:hover{color:var(--red)}
-.tabs{display:flex;gap:4px;background:var(--surface);border-radius:10px;padding:4px;margin-bottom:18px}
-.tab{flex:1;text-align:center;padding:7px 10px;border-radius:8px;font-size:0.78rem;font-weight:600;cursor:pointer;border:none;background:transparent;color:var(--muted);transition:all 0.2s}
+
+/* ── TABS ── */
+.tabs{display:flex;gap:3px;background:var(--surface);border-radius:12px;padding:4px;margin-bottom:16px;overflow-x:auto;-webkit-overflow-scrolling:touch}
+.tab{flex-shrink:0;text-align:center;padding:8px 12px;border-radius:9px;font-size:0.75rem;font-weight:600;cursor:pointer;border:none;background:transparent;color:var(--muted);transition:all 0.2s;white-space:nowrap}
 .tab.active{background:var(--card);color:var(--accent);box-shadow:0 1px 4px rgba(0,0,0,0.08)}
-.cal-grid{display:grid;grid-template-columns:repeat(7,1fr);gap:3px}
-.cal-head{font-size:0.65rem;color:var(--muted);text-align:center;padding:4px;font-weight:600}
-.cal-day{min-height:56px;border:1px solid var(--border);border-radius:8px;padding:4px;font-size:0.7rem;cursor:pointer;transition:border-color 0.2s;position:relative;display:flex;flex-direction:column}
+
+/* ── CALENDAR ── */
+.cal-grid{display:grid;grid-template-columns:repeat(7,1fr);gap:2px}
+.cal-head{font-size:0.58rem;color:var(--muted);text-align:center;padding:4px 2px;font-weight:600}
+.cal-day{min-height:52px;border:1px solid var(--border);border-radius:8px;padding:4px;font-size:0.65rem;cursor:pointer;transition:border-color 0.2s;position:relative;display:flex;flex-direction:column;background:#fff}
 .cal-day:hover{border-color:var(--accent)}
 .cal-day.today{border-color:var(--accent);background:rgba(0,173,238,0.04)}
-.cal-day.holiday{background:rgba(251,191,36,0.08);border-color:var(--yellow)}
-.cal-day.other-month{opacity:0.35}
-.cal-day-num{font-family:'JetBrains Mono',monospace;font-size:0.72rem;font-weight:600;color:var(--text)}
-.cal-day.holiday .cal-day-num{color:#92400e}
+.cal-day.holiday{background:rgba(251,191,36,0.07);border-color:var(--yellow)}
+.cal-day.other-month{opacity:0.3;pointer-events:none}
+.cal-day-num{font-family:'JetBrains Mono',monospace;font-size:0.7rem;font-weight:600}
 .cal-day.today .cal-day-num{color:var(--accent)}
-.cal-event{font-size:0.58rem;border-radius:4px;padding:1px 4px;margin-top:2px;font-weight:600;display:block}
+.cal-day.holiday .cal-day-num{color:#92400e}
+.cal-event{font-size:0.55rem;border-radius:3px;padding:1px 3px;margin-top:2px;font-weight:600;display:block;line-height:1.3}
 .cal-present{background:rgba(52,211,153,0.2);color:#059669}
 .cal-absent{background:rgba(248,113,113,0.2);color:#dc2626}
 .cal-holiday-tag{background:rgba(251,191,36,0.25);color:#92400e}
+
+/* ── CAMERA ── */
 .cam-card{background:var(--card);border:1px solid var(--border);border-radius:16px;overflow:hidden}
-.cam-wrap{position:relative;background:#f8f9fa;aspect-ratio:4/3}
+.cam-wrap{position:relative;background:#1a2332;aspect-ratio:4/3}
 .cam-wrap video,.cam-wrap canvas{position:absolute;inset:0;width:100%;height:100%;object-fit:cover}
-.scan-line{position:absolute;left:0;right:0;height:2px;background:linear-gradient(90deg,transparent,var(--accent),transparent);animation:scan 3s ease-in-out infinite;opacity:0.4;pointer-events:none}
+.scan-line{position:absolute;left:0;right:0;height:2px;background:linear-gradient(90deg,transparent,var(--accent),transparent);animation:scan 3s ease-in-out infinite;opacity:0.5;pointer-events:none;z-index:5}
 @keyframes scan{0%{top:0}50%{top:calc(100% - 2px)}100%{top:0}}
-.cam-controls{padding:10px 12px;background:var(--surface);display:flex;gap:6px;align-items:center;flex-wrap:wrap}
-.btn-checkin{background:var(--accent);color:#fff}.btn-checkin:hover:not(:disabled){background:#009ed8;transform:translateY(-1px)}
-.btn-checkin:disabled,.btn-checkout:disabled{opacity:0.5;cursor:not-allowed}
-@keyframes livepulse{0%,100%{opacity:1}50%{opacity:0.4}}
-.live-dot{width:8px;height:8px;border-radius:50%;background:var(--accent);animation:livepulse 2s infinite;flex-shrink:0}
-.result-card{background:var(--card);border:1px solid var(--border);border-radius:16px;padding:18px}
-.result-title{font-family:'JetBrains Mono',monospace;font-size:0.62rem;letter-spacing:2px;color:var(--muted);text-transform:uppercase;margin-bottom:12px}
-.logo-preview{max-height:60px;max-width:150px;border-radius:8px;object-fit:contain;border:1px solid var(--border)}
-.notif-modal-icon{width:64px;height:64px;border-radius:50%;background:rgba(0,173,238,0.1);display:flex;align-items:center;justify-content:center;font-size:2rem;margin:0 auto 16px}
-.switch{position:relative;display:inline-block;width:42px;height:24px}
+.cam-controls{padding:10px 12px;background:#f8fafc;display:flex;gap:6px;align-items:center;flex-wrap:wrap;border-top:1px solid var(--border)}
+.live-dot{width:7px;height:7px;border-radius:50%;background:var(--accent);animation:livepulse 2s infinite;flex-shrink:0}
+@keyframes livepulse{0%,100%{opacity:1}50%{opacity:0.3}}
+
+/* Detected name overlay */
+.detected-label{position:absolute;bottom:8px;left:50%;transform:translateX(-50%);background:rgba(0,0,0,0.72);color:#fff;padding:5px 14px;border-radius:20px;font-size:0.78rem;font-weight:600;white-space:nowrap;z-index:10;backdrop-filter:blur(4px);transition:opacity 0.3s}
+.detected-label.green{background:rgba(5,150,105,0.85)}
+.detected-label.red{background:rgba(220,38,38,0.85)}
+.detected-label.yellow{background:rgba(146,64,14,0.85)}
+
+/* ── RESULT CARD ── */
+.result-card{background:var(--card);border:1px solid var(--border);border-radius:16px;padding:16px}
+.result-title{font-family:'JetBrains Mono',monospace;font-size:0.58rem;letter-spacing:2px;color:var(--muted);text-transform:uppercase;margin-bottom:10px}
+
+/* ── SWITCH ── */
+.switch{position:relative;display:inline-block;width:40px;height:22px;flex-shrink:0}
 .switch input{opacity:0;width:0;height:0}
-.slider{position:absolute;cursor:pointer;inset:0;background:#ccc;border-radius:24px;transition:0.3s}
-.slider:before{content:'';position:absolute;width:18px;height:18px;left:3px;bottom:3px;background:white;border-radius:50%;transition:0.3s}
+.slider{position:absolute;cursor:pointer;inset:0;background:#cbd5e1;border-radius:22px;transition:0.3s}
+.slider:before{content:'';position:absolute;width:16px;height:16px;left:3px;bottom:3px;background:white;border-radius:50%;transition:0.3s;box-shadow:0 1px 3px rgba(0,0,0,0.2)}
 input:checked+.slider{background:var(--accent)}
 input:checked+.slider:before{transform:translateX(18px)}
-@media(max-width:640px){.grid2,.grid3,.grid4{grid-template-columns:1fr}.cal-grid{gap:2px}.cal-day{min-height:44px}}
+
+/* ── LOGO PREVIEW ── */
+.logo-preview{max-height:50px;max-width:130px;border-radius:6px;object-fit:contain;border:1px solid var(--border)}
+
+/* ── PERSON CARD (people list) ── */
+.person-card{background:var(--card);border:1px solid var(--border);border-radius:12px;padding:12px;display:flex;align-items:flex-start;gap:10px;transition:border-color 0.2s}
+.person-card:hover{border-color:var(--accent)}
+.person-avatar{width:40px;height:40px;border-radius:10px;background:linear-gradient(135deg,rgba(0,173,238,0.15),rgba(0,173,238,0.05));display:flex;align-items:center;justify-content:center;font-size:1.1rem;flex-shrink:0;border:1px solid rgba(0,173,238,0.15)}
+.person-info{flex:1;min-width:0}
+.person-name{font-weight:700;font-size:0.85rem;margin-bottom:2px}
+.person-meta{font-size:0.7rem;color:var(--muted)}
+.person-shifts{display:flex;gap:3px;flex-wrap:wrap;margin-top:4px}
+.person-actions{display:flex;gap:4px;flex-shrink:0}
+
+/* ── EXPORT BAR ── */
+.export-bar{display:flex;align-items:center;gap:8px;flex-wrap:wrap;padding:10px 0;margin-bottom:12px;border-bottom:1px solid var(--border)}
+
+/* ── PROGRESS BAR ── */
+.progress-bar{height:6px;background:var(--border);border-radius:4px;overflow:hidden}
+.progress-fill{height:100%;background:var(--accent);border-radius:4px;transition:width 0.3s}
+
+/* ── EMPTY STATE ── */
+.empty-state{text-align:center;padding:32px 16px;color:var(--muted)}
+.empty-state .empty-icon{font-size:2.5rem;margin-bottom:10px}
+.empty-state p{font-size:0.82rem}
+
+/* ── TOAST ── */
+.toast{position:fixed;bottom:80px;left:50%;transform:translateX(-50%);background:#1a2332;color:white;padding:12px 20px;border-radius:12px;font-size:0.8rem;z-index:9999;box-shadow:0 8px 24px rgba(0,0,0,0.25);transition:opacity 0.4s;white-space:nowrap;max-width:90vw;overflow:hidden;text-overflow:ellipsis}
+
+/* ── MOBILE BOTTOM NAV ── */
+.mobile-nav{display:none;position:fixed;bottom:0;left:0;right:0;z-index:150;background:rgba(255,255,255,0.97);backdrop-filter:blur(20px);border-top:1px solid var(--border);padding:6px 0 8px}
+.mobile-nav-items{display:flex;justify-content:space-around}
+.mobile-nav-item{display:flex;flex-direction:column;align-items:center;gap:2px;padding:6px 12px;border:none;background:none;cursor:pointer;color:var(--muted);font-family:'Space Grotesk',sans-serif;font-size:0.55rem;font-weight:600;text-transform:uppercase;letter-spacing:0.5px;border-radius:8px;transition:color 0.2s;min-width:56px}
+.mobile-nav-item .nav-icon{font-size:1.2rem;line-height:1}
+.mobile-nav-item.active{color:var(--accent)}
+.has-mobile-nav main{padding-bottom:72px}
+
+/* ── RESPONSIVE ── */
+@media(max-width:768px){
+  .grid2,.grid3,.grid4{grid-template-columns:1fr}
+  .grid4.stats-grid{grid-template-columns:1fr 1fr}
+  .mobile-nav{display:block}
+  .has-mobile-nav main{padding-bottom:72px}
+  .desktop-tabs{display:none}
+  main{padding:12px}
+  .card{padding:14px;border-radius:14px}
+  nav{padding:0 12px;height:52px}
+  .cam-wrap{aspect-ratio:3/4}
+  .cal-day{min-height:40px}
+  .cal-event{display:none}
+  .cal-day.today .cal-event,.cal-day.holiday .cal-event{display:block}
+  .hide-mobile{display:none}
+}
+@media(min-width:769px){
+  .mobile-nav{display:none!important}
+  .show-mobile-only{display:none}
+}
 </style>`;
 
-// ═══════════════════════════════════════════════════════════════════════════════
+// ═══════════════════════════════════════════════════════════════════════
 //  SUPER ADMIN APIs
-// ═══════════════════════════════════════════════════════════════════════════════
+// ═══════════════════════════════════════════════════════════════════════
 app.get('/api/super-admin/exists', async (_, res) => {
   const rows = await dbQuery('SELECT COUNT(*) AS c FROM super_admins').catch(() => [{ c:0 }]);
   res.json({ exists: rows[0].c > 0 });
@@ -490,9 +639,9 @@ app.post('/api/super-admin/admin/:id/status', authMiddleware('super_admin'), asy
   res.json({ ok: true });
 });
 
-// ═══════════════════════════════════════════════════════════════════════════════
+// ═══════════════════════════════════════════════════════════════════════
 //  ADMIN APIs
-// ═══════════════════════════════════════════════════════════════════════════════
+// ═══════════════════════════════════════════════════════════════════════
 app.post('/api/admin/register', async (req, res) => {
   const { name, email, password, org_name, org_type, attendance_title, logo_base64 } = req.body;
   if (!name||!email||!password||!org_name) return res.json({ error: 'Required fields missing' });
@@ -522,7 +671,7 @@ app.get('/api/admin/me', authMiddleware('admin'), async (req, res) => {
   res.json(rows[0]);
 });
 
-// ── Shifts ────────────────────────────────────────────────────────────────────
+// ── Shifts ─────────────────────────────────────────────────────────────
 app.get('/api/admin/shifts', authMiddleware('admin'), async (req, res) => {
   const rows = await dbQuery('SELECT * FROM shifts WHERE admin_id=? ORDER BY start_time', [req.user.id]);
   res.json(rows);
@@ -538,41 +687,44 @@ app.delete('/api/admin/shifts/:id', authMiddleware('admin'), async (req, res) =>
   res.json({ ok: true });
 });
 
-// ── Faces (now creates user account too) ──────────────────────────────────────
+// ── Faces (multi-shift) ────────────────────────────────────────────────
 app.get('/api/admin/faces', authMiddleware('admin'), async (req, res) => {
-  const rows = await dbQuery(
-    `SELECT f.*,s.name as shift_name,
-       u.notifications_enabled,
-       u.id as user_id
+  const faces = await dbQuery(
+    `SELECT f.*, u.notifications_enabled, u.id as user_id
      FROM faces f
-     LEFT JOIN shifts s ON s.id=f.shift_id
      LEFT JOIN users u ON u.face_id=f.id AND u.admin_id=f.admin_id
      WHERE f.admin_id=? ORDER BY f.label`,
     [req.user.id]
   );
-  res.json(rows.map(r => ({ ...r, descriptor: JSON.parse(r.descriptor) })));
+  // Attach shifts per face
+  for (const face of faces) {
+    const shifts = await dbQuery(
+      `SELECT s.id, s.name, s.start_time, s.end_time
+       FROM face_shifts fs JOIN shifts s ON s.id=fs.shift_id
+       WHERE fs.face_id=? AND fs.admin_id=?`,
+      [face.id, req.user.id]
+    );
+    face.shifts = shifts;
+    face.descriptor = JSON.parse(face.descriptor);
+  }
+  res.json(faces);
 });
 
-// POST /api/admin/faces — register face AND create/update user account
 app.post('/api/admin/faces', authMiddleware('admin'), async (req, res) => {
-  const { label, employee_id, department, shift_id, user_email, user_password, descriptors, accuracy } = req.body;
+  const { label, employee_id, department, shift_ids, user_email, user_password, descriptors, accuracy } = req.body;
   if (!label||!descriptors?.length) return res.json({ error: 'Label and descriptors required' });
-  if (!user_email) return res.json({ error: 'Email is required for the employee account' });
+  if (!user_email) return res.json({ error: 'Email is required' });
   if (!user_password || user_password.length < 6) return res.json({ error: 'Password must be at least 6 characters' });
 
   try {
-    // Average descriptor across samples
-    const avg = descriptors[0].map((_, i) => descriptors.reduce((s, d) => s + d[i], 0) / descriptors.length);
-
-    // Upsert face
     const r = await dbQuery(
-      `INSERT INTO faces (admin_id,label,employee_id,department,shift_id,user_email,descriptor,registration_accuracy)
-       VALUES (?,?,?,?,?,?,?,?)
+      `INSERT INTO faces (admin_id,label,employee_id,department,user_email,descriptor,registration_accuracy)
+       VALUES (?,?,?,?,?,?,?)
        ON DUPLICATE KEY UPDATE
          employee_id=VALUES(employee_id),department=VALUES(department),
-         shift_id=VALUES(shift_id),user_email=VALUES(user_email),
-         descriptor=VALUES(descriptor),registration_accuracy=VALUES(registration_accuracy)`,
-      [req.user.id, label, employee_id||'', department||'', shift_id||null, user_email,
+         user_email=VALUES(user_email),descriptor=VALUES(descriptor),
+         registration_accuracy=VALUES(registration_accuracy)`,
+      [req.user.id, label, employee_id||'', department||'', user_email,
        JSON.stringify(descriptors), accuracy||null]
     );
 
@@ -580,26 +732,24 @@ app.post('/api/admin/faces', authMiddleware('admin'), async (req, res) => {
       'SELECT id FROM faces WHERE admin_id=? AND label=?', [req.user.id, label]
     ))[0]?.id;
 
-    // Create or update user account
-    const hash = await bcrypt.hash(user_password, 12);
-    const existingUser = await dbQuery(
-      'SELECT id FROM users WHERE email=? AND admin_id=?', [user_email, req.user.id]
-    );
-    if (existingUser.length) {
-      // Update existing user — link face, update password
-      await dbQuery(
-        'UPDATE users SET face_id=?, name=?, password=? WHERE email=? AND admin_id=?',
-        [faceId, label, hash, user_email, req.user.id]
-      );
-    } else {
-      await dbQuery(
-        'INSERT INTO users (admin_id,face_id,name,email,password) VALUES (?,?,?,?,?)',
-        [req.user.id, faceId, label, user_email, hash]
-      );
+    // Replace face_shifts
+    await dbQuery('DELETE FROM face_shifts WHERE face_id=? AND admin_id=?', [faceId, req.user.id]);
+    if (shift_ids && shift_ids.length) {
+      for (const sid of shift_ids) {
+        await dbQuery('INSERT IGNORE INTO face_shifts (face_id,admin_id,shift_id) VALUES (?,?,?)', [faceId, req.user.id, sid]);
+      }
     }
 
-    // Also back-link face → user
-    await dbQuery('UPDATE faces SET user_email=? WHERE id=?', [user_email, faceId]);
+    // Create or update user account
+    const hash = await bcrypt.hash(user_password, 12);
+    const existingUser = await dbQuery('SELECT id FROM users WHERE email=? AND admin_id=?', [user_email, req.user.id]);
+    if (existingUser.length) {
+      await dbQuery('UPDATE users SET face_id=?, name=?, password=? WHERE email=? AND admin_id=?',
+        [faceId, label, hash, user_email, req.user.id]);
+    } else {
+      await dbQuery('INSERT INTO users (admin_id,face_id,name,email,password) VALUES (?,?,?,?,?)',
+        [req.user.id, faceId, label, user_email, hash]);
+    }
 
     res.json({ ok: true });
   } catch(e) {
@@ -608,8 +758,23 @@ app.post('/api/admin/faces', authMiddleware('admin'), async (req, res) => {
   }
 });
 
+app.put('/api/admin/faces/:id', authMiddleware('admin'), async (req, res) => {
+  const { employee_id, department, shift_ids } = req.body;
+  try {
+    await dbQuery('UPDATE faces SET employee_id=?, department=? WHERE id=? AND admin_id=?',
+      [employee_id||'', department||'', req.params.id, req.user.id]);
+    await dbQuery('DELETE FROM face_shifts WHERE face_id=? AND admin_id=?', [req.params.id, req.user.id]);
+    if (shift_ids && shift_ids.length) {
+      for (const sid of shift_ids) {
+        await dbQuery('INSERT IGNORE INTO face_shifts (face_id,admin_id,shift_id) VALUES (?,?,?)',
+          [req.params.id, req.user.id, sid]);
+      }
+    }
+    res.json({ ok: true });
+  } catch(e) { res.json({ error: e.message }); }
+});
+
 app.delete('/api/admin/faces/:id', authMiddleware('admin'), async (req, res) => {
-  // Also delete linked user
   const face = await dbQuery('SELECT user_email FROM faces WHERE id=? AND admin_id=?', [req.params.id, req.user.id]);
   if (face.length && face[0].user_email) {
     await dbQuery('DELETE FROM users WHERE email=? AND admin_id=?', [face[0].user_email, req.user.id]);
@@ -618,7 +783,7 @@ app.delete('/api/admin/faces/:id', authMiddleware('admin'), async (req, res) => 
   res.json({ ok: true });
 });
 
-// ── Attendance (admin view) ───────────────────────────────────────────────────
+// ── Attendance (admin view + export) ──────────────────────────────────
 app.get('/api/admin/attendance', authMiddleware('admin'), async (req, res) => {
   const { date, month, year } = req.query;
   let where = 'a.admin_id=?', params = [req.user.id];
@@ -636,6 +801,37 @@ app.get('/api/admin/attendance', authMiddleware('admin'), async (req, res) => {
   res.json(rows);
 });
 
+// CSV export
+app.get('/api/admin/attendance/export', authMiddleware('admin'), async (req, res) => {
+  const { month, year, format } = req.query;
+  let where = 'a.admin_id=?', params = [req.user.id];
+  if (month && year) {
+    where += ' AND MONTH(a.date)=? AND YEAR(a.date)=?';
+    params.push(parseInt(month), parseInt(year));
+  }
+  const rows = await dbQuery(
+    `SELECT a.name, a.date, a.time_in, a.time_out, a.status,
+            s.name as shift_name, f.employee_id, f.department
+     FROM attendance a
+     LEFT JOIN shifts s ON s.id=a.shift_id
+     LEFT JOIN faces f ON f.id=a.face_id
+     WHERE ${where} ORDER BY a.date ASC, a.name ASC`,
+    params
+  );
+  const headers = ['Name','Employee ID','Department','Date','Shift','Time In','Time Out','Status'];
+  const csv = [
+    headers.join(','),
+    ...rows.map(r => [
+      `"${r.name}"`, `"${r.employee_id||''}"`, `"${r.department||''}"`,
+      r.date, `"${r.shift_name||'No Shift'}"`,
+      r.time_in||'', r.time_out||'', r.status
+    ].join(','))
+  ].join('\n');
+  res.setHeader('Content-Type','text/csv');
+  res.setHeader('Content-Disposition',`attachment; filename="attendance_${year||'all'}_${month||'all'}.csv"`);
+  res.send(csv);
+});
+
 app.get('/api/admin/calendar', authMiddleware('admin'), async (req, res) => {
   const { month, year } = req.query;
   const m = parseInt(month), y = parseInt(year);
@@ -651,7 +847,7 @@ app.get('/api/admin/calendar', authMiddleware('admin'), async (req, res) => {
   res.json({ attendance: attend, holidays });
 });
 
-// ── Holidays ──────────────────────────────────────────────────────────────────
+// ── Holidays ───────────────────────────────────────────────────────────
 app.post('/api/admin/holidays', authMiddleware('admin'), async (req, res) => {
   const { date, label } = req.body;
   if (!date) return res.json({ error: 'Date required' });
@@ -668,13 +864,14 @@ app.delete('/api/admin/holidays/:date', authMiddleware('admin'), async (req, res
   res.json({ ok: true });
 });
 
-// ── Scan ──────────────────────────────────────────────────────────────────────
-app.post('/api/admin/scan', authMiddleware('admin'), async (req, res) => {
-  const { descriptor: inDesc, mode } = req.body;
+// ── Scan (returns pending shifts for the person) ───────────────────────
+// GET: detect face, return pending shifts without marking
+app.post('/api/admin/detect', authMiddleware('admin'), async (req, res) => {
+  const { descriptor: inDesc } = req.body;
   if (!inDesc?.length) return res.json({ event: 'error', message: 'No descriptor' });
 
   const adminId = req.user.id;
-  const faces = await dbQuery('SELECT id,label,shift_id,user_email,descriptor FROM faces WHERE admin_id=?', [adminId]);
+  const faces = await dbQuery('SELECT id,label,user_email,descriptor FROM faces WHERE admin_id=?', [adminId]);
   if (!faces.length) return res.json({ event: 'no_faces', message: 'No faces registered' });
 
   let best = null, bestDist = Infinity;
@@ -689,42 +886,87 @@ app.post('/api/admin/scan', authMiddleware('admin'), async (req, res) => {
     return res.json({ event: 'unknown', message: 'Unknown face', distance: bestDist });
   }
 
+  // Get shifts assigned to this face
+  const shifts = await dbQuery(
+    `SELECT s.* FROM face_shifts fs JOIN shifts s ON s.id=fs.shift_id
+     WHERE fs.face_id=? AND fs.admin_id=?`,
+    [best.id, adminId]
+  );
+
+  // Get today's already-marked shifts
+  const today = new Date().toISOString().split('T')[0];
+  const markedShifts = await dbQuery(
+    'SELECT shift_id FROM attendance WHERE face_id=? AND date=?',
+    [best.id, today]
+  );
+  const markedIds = markedShifts.map(m => m.shift_id);
+
+  // Pending = assigned shifts not yet checked in today
+  const pendingShifts = shifts.filter(s => !markedIds.includes(s.id));
+
+  return res.json({
+    event: 'recognized',
+    name: best.label,
+    face_id: best.id,
+    distance: bestDist,
+    shifts,
+    pending_shifts: pendingShifts,
+    marked_today: markedShifts.length,
+    no_shift: shifts.length === 0
+  });
+});
+
+// POST: actual mark attendance for selected shift(s)
+app.post('/api/admin/scan', authMiddleware('admin'), async (req, res) => {
+  const { face_id, shift_id, mode } = req.body;
+  if (!face_id) return res.json({ event: 'error', message: 'face_id required' });
+
+  const adminId = req.user.id;
+  const faceRow = await dbQuery('SELECT * FROM faces WHERE id=? AND admin_id=?', [face_id, adminId]);
+  if (!faceRow.length) return res.json({ event: 'error', message: 'Face not found' });
+  const face = faceRow[0];
+
   const now = new Date();
   const dateStr = now.toISOString().split('T')[0];
   const timeStr = pad2(now.getHours())+':'+pad2(now.getMinutes())+':'+pad2(now.getSeconds());
-  const shiftRow = best.shift_id ? (await dbQuery('SELECT * FROM shifts WHERE id=?', [best.shift_id]))[0] : null;
-  const existing = await dbQuery('SELECT * FROM attendance WHERE face_id=? AND date=?', [best.id, dateStr]);
+  const shiftRow = shift_id ? (await dbQuery('SELECT * FROM shifts WHERE id=?', [shift_id]))[0] : null;
+
+  const existing = await dbQuery(
+    'SELECT * FROM attendance WHERE face_id=? AND date=? AND (shift_id=? OR (shift_id IS NULL AND ?=0))',
+    [face_id, dateStr, shift_id||null, shift_id?1:0]
+  );
 
   if (mode === 'checkout') {
-    if (!existing.length) return res.json({ event: 'not_checked_in', name: best.label });
-    if (existing[0].time_out) return res.json({ event: 'already_checked_out', name: best.label, time_out: existing[0].time_out });
-    await dbQuery('UPDATE attendance SET time_out=? WHERE id=?', [timeStr, existing[0].id]);
-    if (best.user_email) {
-      const user = await dbQuery('SELECT id FROM users WHERE email=? AND admin_id=?', [best.user_email, adminId]);
-      if (user.length) await sendPushToUser(user[0].id, '👋 Checked Out', `${best.label}, you checked out at ${fmtTime(timeStr)}`, adminId);
+    if (!existing.length) return res.json({ event: 'not_checked_in', name: face.label });
+    const rec = existing[0];
+    if (rec.time_out) return res.json({ event: 'already_checked_out', name: face.label, time_out: rec.time_out });
+    await dbQuery('UPDATE attendance SET time_out=? WHERE id=?', [timeStr, rec.id]);
+    if (face.user_email) {
+      const user = await dbQuery('SELECT id FROM users WHERE email=? AND admin_id=?', [face.user_email, adminId]);
+      if (user.length) await sendPushToUser(user[0].id, '👋 Checked Out', `${face.label}, you checked out at ${fmtTime(timeStr)}`, adminId);
     }
-    return res.json({ event: 'checkout', name: best.label, time_out: timeStr, shift: shiftRow?.name });
+    return res.json({ event: 'checkout', name: face.label, time_out: timeStr, shift: shiftRow?.name });
   }
 
   if (existing.length) {
-    return res.json({ event: 'already_checked_in', name: best.label, time_in: existing[0].time_in });
+    return res.json({ event: 'already_checked_in', name: face.label, time_in: existing[0].time_in, shift: shiftRow?.name });
   }
 
   const r = await dbQuery(
     'INSERT INTO attendance (admin_id,face_id,shift_id,name,date,time_in,status) VALUES (?,?,?,?,?,?,?)',
-    [adminId, best.id, best.shift_id||null, best.label, dateStr, timeStr, 'present']
+    [adminId, face_id, shift_id||null, face.label, dateStr, timeStr, 'present']
   );
 
-  if (best.user_email) {
-    const user = await dbQuery('SELECT id FROM users WHERE email=? AND admin_id=?', [best.user_email, adminId]);
+  if (face.user_email) {
+    const user = await dbQuery('SELECT id FROM users WHERE email=? AND admin_id=?', [face.user_email, adminId]);
     if (user.length) {
-      const shiftInfo = shiftRow ? ` (${shiftRow.name} shift)` : '';
-      await sendPushToUser(user[0].id, '✅ Attendance Marked', `${best.label}, your attendance was recorded at ${fmtTime(timeStr)}${shiftInfo}`, adminId);
+      const shiftInfo = shiftRow ? ` (${shiftRow.name})` : '';
+      await sendPushToUser(user[0].id, '✅ Attendance Marked', `${face.label}, your attendance was recorded at ${fmtTime(timeStr)}${shiftInfo}`, adminId);
       await dbQuery('UPDATE attendance SET notification_sent=1 WHERE id=?', [r.insertId]);
     }
   }
 
-  res.json({ event: 'checkin', name: best.label, time_in: timeStr, status: 'present', shift: shiftRow?.name, distance: bestDist });
+  res.json({ event: 'checkin', name: face.label, time_in: timeStr, status: 'present', shift: shiftRow?.name, distance: 0 });
 });
 
 app.post('/api/admin/unknown-face', authMiddleware('admin'), async (req, res) => {
@@ -744,9 +986,9 @@ app.post('/api/admin/unknown-face', authMiddleware('admin'), async (req, res) =>
   res.json({ ok: true });
 });
 
-// ═══════════════════════════════════════════════════════════════════════════════
+// ═══════════════════════════════════════════════════════════════════════
 //  USER APIs
-// ═══════════════════════════════════════════════════════════════════════════════
+// ═══════════════════════════════════════════════════════════════════════
 app.post('/api/user/login', async (req, res) => {
   const { email, password } = req.body;
   const rows = await dbQuery(`
@@ -768,6 +1010,7 @@ app.post('/api/user/login', async (req, res) => {
 
 app.post('/api/user/push-subscribe', authMiddleware('user'), async (req, res) => {
   const { subscription } = req.body;
+  if (!subscription) return res.json({ error: 'No subscription data' });
   await dbQuery(
     'UPDATE users SET push_subscription=?, notifications_enabled=1 WHERE id=? AND admin_id=?',
     [JSON.stringify(subscription), req.user.id, req.user.admin_id]
@@ -796,12 +1039,12 @@ app.get('/api/user/attendance', authMiddleware('user'), async (req, res) => {
        FROM attendance a
        JOIN faces f ON f.id=a.face_id
        LEFT JOIN shifts s ON s.id=a.shift_id
-       WHERE ${where} ORDER BY a.date DESC`,
+       WHERE ${where} ORDER BY a.date DESC, a.time_in DESC`,
       params
     ),
     dbQuery(
       'SELECT date, label FROM holidays WHERE admin_id=? AND MONTH(date)=? AND YEAR(date)=?',
-      [req.user.admin_id, parseInt(month), parseInt(year)]
+      [req.user.admin_id, parseInt(month)||new Date().getMonth()+1, parseInt(year)||new Date().getFullYear()]
     )
   ]);
   res.json({ attendance: attend, holidays });
@@ -812,9 +1055,9 @@ app.get('/api/user/notif-status', authMiddleware('user'), async (req, res) => {
   res.json({ enabled: rows[0]?.notifications_enabled === 1 });
 });
 
-app.get('/api/vapid-public', (_, res) => res.json({ key: VAPID.public }));
+app.get('/api/vapid-public', (_, res) => res.json({ key: VAPID.public, enabled: pushEnabled }));
 
-// ── Service worker + icon ─────────────────────────────────────────────────────
+// ── Service Worker & icon ──────────────────────────────────────────────
 app.get('/sw.js', (_, res) => {
   res.setHeader('Content-Type', 'application/javascript');
   res.send(`
@@ -844,12 +1087,13 @@ app.get('/icon-192.png', (_, res) => {
   </svg>`);
 });
 
-// ═══════════════════════════════════════════════════════════════════════════════
+// ═══════════════════════════════════════════════════════════════════════
 //  HTML helpers
-// ═══════════════════════════════════════════════════════════════════════════════
+// ═══════════════════════════════════════════════════════════════════════
 function htmlBase(title, body, extraHead='') {
   return `<!DOCTYPE html><html lang="en"><head>
 <meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<meta name="theme-color" content="#00adee">
 <title>${escH(title)} — FaceAttend</title>
 ${SHARED_CSS}${extraHead}
 </head><body>${body}</body></html>`;
@@ -857,289 +1101,106 @@ ${SHARED_CSS}${extraHead}
 
 app.get('/', (_, res) => res.redirect('/portal'));
 
-// ═══════════════════════════════════════════════════════════════════════════════
-//  PORTAL PAGE — Redesigned
-// ═══════════════════════════════════════════════════════════════════════════════
+// ═══════════════════════════════════════════════════════════════════════
+//  PORTAL PAGE
+// ═══════════════════════════════════════════════════════════════════════
 app.get('/portal', (_, res) => {
   res.send(`<!DOCTYPE html><html lang="en"><head>
 <meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<meta name="theme-color" content="#00adee">
 <title>FaceAttend — Portal</title>
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Syne:wght@400;700;800&family=DM+Sans:wght@300;400;500;600&family=JetBrains+Mono:wght@400;700&display=swap">
 <style>
-  *{box-sizing:border-box;margin:0;padding:0}
-  :root{
-    --accent:#00adee;
-    --accent-dark:#0090c8;
-    --accent-glow:rgba(0,173,238,0.25);
-    --text:#0f172a;
-    --muted:#64748b;
-    --surface:#f0f9ff;
-    --border:rgba(0,173,238,0.15);
-    --card:#ffffff;
-  }
-
-  body{
-    font-family:'DM Sans',sans-serif;
-    background:#f8fcff;
-    color:var(--text);
-    min-height:100vh;
-    overflow-x:hidden;
-  }
-
-  /* Animated background mesh */
-  .bg-mesh{
-    position:fixed;inset:0;z-index:0;
-    background:
-      radial-gradient(ellipse 60% 40% at 20% 10%, rgba(0,173,238,0.12) 0%, transparent 60%),
-      radial-gradient(ellipse 50% 60% at 80% 80%, rgba(0,173,238,0.08) 0%, transparent 60%),
-      radial-gradient(ellipse 40% 30% at 50% 50%, rgba(0,173,238,0.04) 0%, transparent 70%);
-    pointer-events:none;
-  }
-
-  /* Grid overlay */
-  .bg-grid{
-    position:fixed;inset:0;z-index:0;
-    background-image:
-      linear-gradient(rgba(0,173,238,0.04) 1px, transparent 1px),
-      linear-gradient(90deg, rgba(0,173,238,0.04) 1px, transparent 1px);
-    background-size:40px 40px;
-    pointer-events:none;
-    mask-image:radial-gradient(ellipse 80% 80% at 50% 50%, black 30%, transparent 100%);
-  }
-
-  .portal-wrap{
-    position:relative;z-index:1;
-    min-height:100vh;
-    display:flex;
-    flex-direction:column;
-    align-items:center;
-    justify-content:center;
-    padding:40px 20px;
-  }
-
-  /* Top bar */
-  .top-bar{
-    position:fixed;top:0;left:0;right:0;z-index:10;
-    display:flex;align-items:center;justify-content:space-between;
-    padding:0 32px;height:60px;
-    background:rgba(248,252,255,0.85);
-    backdrop-filter:blur(16px);
-    border-bottom:1px solid rgba(0,173,238,0.1);
-  }
-  .top-brand{
-    display:flex;align-items:center;gap:10px;
-    font-family:'Syne',sans-serif;font-weight:800;font-size:1.1rem;color:var(--text);
-    text-decoration:none;letter-spacing:-0.5px;
-  }
-  .brand-icon{
-    width:32px;height:32px;border-radius:8px;
-    background:var(--accent);
-    display:flex;align-items:center;justify-content:center;
-    font-size:1rem;color:white;
-    box-shadow:0 4px 12px var(--accent-glow);
-  }
-  .top-version{
-    font-family:'JetBrains Mono',monospace;font-size:0.65rem;
-    color:var(--accent);background:rgba(0,173,238,0.1);
-    padding:3px 10px;border-radius:20px;letter-spacing:1px;
-  }
-
-  /* Hero section */
-  .hero{
-    text-align:center;
-    margin-bottom:52px;
-    animation:fadeUp 0.7s ease both;
-  }
-  .hero-eyebrow{
-    font-family:'JetBrains Mono',monospace;font-size:0.65rem;
-    color:var(--accent);letter-spacing:3px;text-transform:uppercase;
-    margin-bottom:16px;
-    display:inline-flex;align-items:center;gap:8px;
-  }
-  .hero-eyebrow::before,.hero-eyebrow::after{
-    content:'';display:block;width:24px;height:1px;background:var(--accent);opacity:0.5;
-  }
-  .hero-title{
-    font-family:'Syne',sans-serif;font-weight:800;
-    font-size:clamp(2.4rem,5vw,3.6rem);
-    line-height:1.05;
-    letter-spacing:-2px;
-    color:var(--text);
-    margin-bottom:16px;
-  }
-  .hero-title .hl{color:var(--accent);}
-  .hero-sub{
-    font-size:1rem;color:var(--muted);font-weight:400;
-    max-width:440px;margin:0 auto;line-height:1.6;
-  }
-
-  /* Portal cards */
-  .cards-row{
-    display:flex;gap:20px;flex-wrap:wrap;justify-content:center;
-    animation:fadeUp 0.7s 0.15s ease both;
-  }
-
-  .portal-card{
-    background:var(--card);
-    border:1px solid rgba(0,173,238,0.12);
-    border-radius:20px;
-    padding:28px 24px;
-    width:220px;
-    text-align:center;
-    text-decoration:none;
-    cursor:pointer;
-    position:relative;
-    overflow:hidden;
-    transition:transform 0.25s, box-shadow 0.25s, border-color 0.25s;
-    box-shadow:0 2px 12px rgba(0,0,0,0.04);
-  }
-  .portal-card::before{
-    content:'';position:absolute;inset:0;
-    background:radial-gradient(circle at 50% 0%, rgba(0,173,238,0.07), transparent 70%);
-    opacity:0;transition:opacity 0.3s;
-  }
-  .portal-card:hover{
-    transform:translateY(-6px);
-    box-shadow:0 16px 40px rgba(0,173,238,0.15),0 4px 12px rgba(0,0,0,0.06);
-    border-color:rgba(0,173,238,0.4);
-  }
-  .portal-card:hover::before{opacity:1;}
-
-  .card-icon-wrap{
-    width:60px;height:60px;border-radius:16px;
-    margin:0 auto 16px;
-    display:flex;align-items:center;justify-content:center;
-    font-size:1.6rem;
-    position:relative;
-    transition:transform 0.25s;
-  }
-  .portal-card:hover .card-icon-wrap{transform:scale(1.1);}
-
-  .icon-sa{background:linear-gradient(135deg,rgba(167,139,250,0.2),rgba(139,92,246,0.12));border:1px solid rgba(139,92,246,0.2);}
-  .icon-admin{background:linear-gradient(135deg,rgba(0,173,238,0.2),rgba(0,173,238,0.08));border:1px solid rgba(0,173,238,0.2);}
-  .icon-user{background:linear-gradient(135deg,rgba(52,211,153,0.2),rgba(52,211,153,0.08));border:1px solid rgba(52,211,153,0.2);}
-
-  .card-title{
-    font-family:'Syne',sans-serif;font-weight:700;font-size:1rem;
-    color:var(--text);margin-bottom:6px;letter-spacing:-0.3px;
-  }
-  .card-desc{
-    font-size:0.75rem;color:var(--muted);line-height:1.5;
-  }
-  .card-cta{
-    display:inline-flex;align-items:center;gap:5px;
-    margin-top:16px;padding:7px 16px;border-radius:8px;
-    font-size:0.75rem;font-weight:600;
-    transition:all 0.2s;color:white;
-  }
-  .cta-sa{background:linear-gradient(135deg,#7c3aed,#a78bfa);}
-  .cta-admin{background:linear-gradient(135deg,#009ed8,var(--accent));}
-  .cta-user{background:linear-gradient(135deg,#059669,#34d399);}
-  .portal-card:hover .card-cta{filter:brightness(1.1);}
-
-  /* Feature pills */
-  .features{
-    display:flex;gap:10px;flex-wrap:wrap;justify-content:center;
-    margin-top:48px;
-    animation:fadeUp 0.7s 0.3s ease both;
-  }
-  .feat{
-    display:flex;align-items:center;gap:6px;
-    padding:6px 14px;border-radius:20px;
-    background:white;border:1px solid rgba(0,173,238,0.12);
-    font-size:0.72rem;color:var(--muted);font-weight:500;
-    box-shadow:0 1px 4px rgba(0,0,0,0.04);
-  }
-  .feat-dot{width:6px;height:6px;border-radius:50%;background:var(--accent);}
-
-  /* Footer */
-  .portal-footer{
-    margin-top:48px;font-size:0.7rem;color:var(--muted);
-    display:flex;align-items:center;gap:6px;
-    animation:fadeUp 0.7s 0.4s ease both;
-  }
-  .portal-footer a{color:var(--accent);text-decoration:none;}
-
-  @keyframes fadeUp{
-    from{opacity:0;transform:translateY(20px);}
-    to{opacity:1;transform:translateY(0);}
-  }
-
-  @media(max-width:640px){
-    .cards-row{gap:14px;}
-    .portal-card{width:100%;max-width:320px;padding:22px 20px;}
-  }
+*{box-sizing:border-box;margin:0;padding:0}
+:root{--accent:#00adee;--text:#0f172a;--muted:#64748b;--card:#ffffff;--border:rgba(0,173,238,0.15)}
+body{font-family:'DM Sans',sans-serif;background:#f0f9ff;color:var(--text);min-height:100vh;overflow-x:hidden}
+.bg-mesh{position:fixed;inset:0;z-index:0;background:radial-gradient(ellipse 60% 40% at 20% 10%,rgba(0,173,238,0.12) 0%,transparent 60%),radial-gradient(ellipse 50% 60% at 80% 80%,rgba(0,173,238,0.08) 0%,transparent 60%);pointer-events:none}
+.bg-grid{position:fixed;inset:0;z-index:0;background-image:linear-gradient(rgba(0,173,238,0.04) 1px,transparent 1px),linear-gradient(90deg,rgba(0,173,238,0.04) 1px,transparent 1px);background-size:40px 40px;pointer-events:none;mask-image:radial-gradient(ellipse 80% 80% at 50% 50%,black 30%,transparent 100%)}
+.top-bar{position:fixed;top:0;left:0;right:0;z-index:10;display:flex;align-items:center;justify-content:space-between;padding:0 20px;height:56px;background:rgba(240,249,255,0.9);backdrop-filter:blur(16px);border-bottom:1px solid rgba(0,173,238,0.1)}
+.top-brand{display:flex;align-items:center;gap:8px;font-family:'Syne',sans-serif;font-weight:800;font-size:1rem;color:var(--text);text-decoration:none}
+.brand-icon{width:30px;height:30px;border-radius:8px;background:var(--accent);display:flex;align-items:center;justify-content:center;font-size:0.9rem;color:white;box-shadow:0 4px 12px rgba(0,173,238,0.3)}
+.top-version{font-family:'JetBrains Mono',monospace;font-size:0.6rem;color:var(--accent);background:rgba(0,173,238,0.1);padding:3px 9px;border-radius:20px;letter-spacing:1px}
+.portal-wrap{position:relative;z-index:1;min-height:100vh;display:flex;flex-direction:column;align-items:center;justify-content:center;padding:80px 16px 40px}
+.hero{text-align:center;margin-bottom:40px;animation:fadeUp 0.7s ease both}
+.hero-eyebrow{font-family:'JetBrains Mono',monospace;font-size:0.6rem;color:var(--accent);letter-spacing:3px;text-transform:uppercase;margin-bottom:14px;display:inline-flex;align-items:center;gap:8px}
+.hero-eyebrow::before,.hero-eyebrow::after{content:'';display:block;width:20px;height:1px;background:var(--accent);opacity:0.5}
+.hero-title{font-family:'Syne',sans-serif;font-weight:800;font-size:clamp(2rem,6vw,3.2rem);line-height:1.05;letter-spacing:-2px;color:var(--text);margin-bottom:14px}
+.hero-title .hl{color:var(--accent)}
+.hero-sub{font-size:0.9rem;color:var(--muted);max-width:380px;margin:0 auto;line-height:1.6}
+.cards-row{display:flex;gap:16px;flex-wrap:wrap;justify-content:center;animation:fadeUp 0.7s 0.15s ease both}
+.portal-card{background:var(--card);border:1px solid rgba(0,173,238,0.12);border-radius:18px;padding:24px 20px;width:200px;text-align:center;text-decoration:none;cursor:pointer;position:relative;overflow:hidden;transition:transform 0.25s,box-shadow 0.25s,border-color 0.25s;box-shadow:0 2px 12px rgba(0,0,0,0.04)}
+.portal-card:hover{transform:translateY(-5px);box-shadow:0 14px 36px rgba(0,173,238,0.14),0 4px 12px rgba(0,0,0,0.06);border-color:rgba(0,173,238,0.4)}
+.card-icon-wrap{width:56px;height:56px;border-radius:14px;margin:0 auto 14px;display:flex;align-items:center;justify-content:center;font-size:1.5rem;transition:transform 0.25s}
+.portal-card:hover .card-icon-wrap{transform:scale(1.1)}
+.icon-sa{background:linear-gradient(135deg,rgba(167,139,250,0.2),rgba(139,92,246,0.12));border:1px solid rgba(139,92,246,0.2)}
+.icon-admin{background:linear-gradient(135deg,rgba(0,173,238,0.2),rgba(0,173,238,0.08));border:1px solid rgba(0,173,238,0.2)}
+.icon-user{background:linear-gradient(135deg,rgba(52,211,153,0.2),rgba(52,211,153,0.08));border:1px solid rgba(52,211,153,0.2)}
+.card-title{font-family:'Syne',sans-serif;font-weight:700;font-size:0.95rem;color:var(--text);margin-bottom:5px}
+.card-desc{font-size:0.7rem;color:var(--muted);line-height:1.5}
+.card-cta{display:inline-flex;align-items:center;gap:4px;margin-top:14px;padding:6px 14px;border-radius:8px;font-size:0.7rem;font-weight:600;transition:all 0.2s;color:white}
+.cta-sa{background:linear-gradient(135deg,#7c3aed,#a78bfa)}
+.cta-admin{background:linear-gradient(135deg,#009ed8,var(--accent))}
+.cta-user{background:linear-gradient(135deg,#059669,#34d399)}
+.features{display:flex;gap:8px;flex-wrap:wrap;justify-content:center;margin-top:36px;animation:fadeUp 0.7s 0.3s ease both}
+.feat{display:flex;align-items:center;gap:5px;padding:5px 12px;border-radius:20px;background:white;border:1px solid rgba(0,173,238,0.12);font-size:0.68rem;color:var(--muted);font-weight:500}
+.feat-dot{width:5px;height:5px;border-radius:50%;background:var(--accent)}
+.portal-footer{margin-top:36px;font-size:0.68rem;color:var(--muted);display:flex;align-items:center;gap:5px;animation:fadeUp 0.7s 0.4s ease both}
+.portal-footer a{color:var(--accent);text-decoration:none}
+@keyframes fadeUp{from{opacity:0;transform:translateY(20px)}to{opacity:1;transform:translateY(0)}}
+@media(max-width:480px){.cards-row{flex-direction:column;align-items:center}.portal-card{width:100%;max-width:300px}.hero-title{font-size:2rem}}
 </style>
 </head>
 <body>
-  <div class="bg-mesh"></div>
-  <div class="bg-grid"></div>
-
-  <div class="top-bar">
-    <a class="top-brand" href="/portal">
-      <div class="brand-icon">👁</div>
-      FaceAttend
+<div class="bg-mesh"></div>
+<div class="bg-grid"></div>
+<div class="top-bar">
+  <a class="top-brand" href="/portal"><div class="brand-icon">👁</div>FaceAttend</a>
+  <span class="top-version">SaaS v3.0</span>
+</div>
+<div class="portal-wrap">
+  <div class="hero">
+    <div class="hero-eyebrow">Multi-tenant Platform</div>
+    <h1 class="hero-title">Face Recognition<br><span class="hl">Attendance</span> System</h1>
+    <p class="hero-sub">Automated attendance tracking with real-time face recognition. Choose your portal below.</p>
+  </div>
+  <div class="cards-row">
+    <a href="/super-admin" class="portal-card">
+      <div class="card-icon-wrap icon-sa">🛡️</div>
+      <div class="card-title">Super Admin</div>
+      <div class="card-desc">Platform control, admin approvals &amp; oversight.</div>
+      <div class="card-cta cta-sa">Enter →</div>
     </a>
-    <span class="top-version">SaaS v2.0</span>
+    <a href="/admin" class="portal-card">
+      <div class="card-icon-wrap icon-admin">🏢</div>
+      <div class="card-title">Admin</div>
+      <div class="card-desc">Manage faces, shifts, scan attendance &amp; calendar.</div>
+      <div class="card-cta cta-admin">Enter →</div>
+    </a>
+    <a href="/user" class="portal-card">
+      <div class="card-icon-wrap icon-user">👤</div>
+      <div class="card-title">Employee</div>
+      <div class="card-desc">View your attendance calendar &amp; notifications.</div>
+      <div class="card-cta cta-user">Enter →</div>
+    </a>
   </div>
-
-  <div class="portal-wrap">
-    <div class="hero">
-      <div class="hero-eyebrow">Multi-tenant Platform</div>
-      <h1 class="hero-title">
-        Face Recognition<br>
-        <span class="hl">Attendance</span> System
-      </h1>
-      <p class="hero-sub">Automated attendance tracking powered by real-time face recognition. Choose your portal to get started.</p>
-    </div>
-
-    <div class="cards-row">
-      <a href="/super-admin" class="portal-card">
-        <div class="card-icon-wrap icon-sa">🛡️</div>
-        <div class="card-title">Super Admin</div>
-        <div class="card-desc">Platform control, admin approvals &amp; system-wide oversight.</div>
-        <div class="card-cta cta-sa">Enter Portal →</div>
-      </a>
-
-      <a href="/admin" class="portal-card">
-        <div class="card-icon-wrap icon-admin">🏢</div>
-        <div class="card-title">Admin</div>
-        <div class="card-desc">Manage faces, shifts, attendance scanning &amp; calendar.</div>
-        <div class="card-cta cta-admin">Enter Portal →</div>
-      </a>
-
-      <a href="/user" class="portal-card">
-        <div class="card-icon-wrap icon-user">👤</div>
-        <div class="card-title">Employee</div>
-        <div class="card-desc">View your attendance calendar and enable push notifications.</div>
-        <div class="card-cta cta-user">Enter Portal →</div>
-      </a>
-    </div>
-
-    <div class="features">
-      <div class="feat"><div class="feat-dot"></div>Real-time Face Recognition</div>
-      <div class="feat"><div class="feat-dot"></div>Web Push Notifications</div>
-      <div class="feat"><div class="feat-dot"></div>Multi-tenant SaaS</div>
-      <div class="feat"><div class="feat-dot"></div>Shift Management</div>
-      <div class="feat"><div class="feat-dot"></div>Holiday Calendar</div>
-    </div>
-
-    <div class="portal-footer">
-      <span>Powered by</span>
-      <a href="#">face-api.js</a>
-      <span>·</span>
-      <a href="#">Node.js</a>
-      <span>·</span>
-      <a href="#">MySQL</a>
-    </div>
+  <div class="features">
+    <div class="feat"><div class="feat-dot"></div>Real-time Face Recognition</div>
+    <div class="feat"><div class="feat-dot"></div>Multi-Shift Support</div>
+    <div class="feat"><div class="feat-dot"></div>Push Notifications</div>
+    <div class="feat"><div class="feat-dot"></div>CSV Export</div>
+    <div class="feat"><div class="feat-dot"></div>Holiday Calendar</div>
   </div>
+  <div class="portal-footer">
+    <span>Powered by</span><a href="#">face-api.js</a><span>·</span><a href="#">Node.js</a><span>·</span><a href="#">MySQL</a>
+  </div>
+</div>
 </body></html>`);
 });
 
-// ═══════════════════════════════════════════════════════════════════════════════
+// ═══════════════════════════════════════════════════════════════════════
 //  SUPER ADMIN PAGE
-// ═══════════════════════════════════════════════════════════════════════════════
+// ═══════════════════════════════════════════════════════════════════════
 app.get('/super-admin', (_, res) => {
   res.send(htmlBase('Super Admin', `
 <nav>
@@ -1147,33 +1208,33 @@ app.get('/super-admin', (_, res) => {
   <div class="nav-right" id="navRight"></div>
 </nav>
 <main id="app">
-  <div id="setupForm" style="display:none;max-width:440px;margin:40px auto">
-    <div class="page-title">🛡️ First-time Setup — Create Super Admin</div>
+  <div id="setupForm" style="display:none;max-width:420px;margin:40px auto">
+    <div class="page-title">🛡️ First-time Setup</div>
     <div class="card">
       <div id="setupErr" class="alert alert-error" style="display:none"></div>
       <div class="form-group"><label>Full Name</label><input class="form-control" id="saName" placeholder="Super Admin Name"></div>
       <div class="form-group"><label>Email</label><input class="form-control" id="saEmail" type="email" placeholder="admin@example.com"></div>
       <div class="form-group"><label>Password</label><input class="form-control" id="saPass" type="password" placeholder="••••••••"></div>
-      <button class="btn btn-primary" style="width:100%" onclick="doSetup()">Create Super Admin Account</button>
+      <button class="btn btn-primary btn-full" onclick="doSetup()">Create Super Admin</button>
     </div>
   </div>
-  <div id="loginForm" style="display:none;max-width:400px;margin:40px auto">
+  <div id="loginForm" style="display:none;max-width:380px;margin:40px auto">
     <div class="page-title">🛡️ Super Admin Login</div>
     <div class="card">
       <div id="loginErr" class="alert alert-error" style="display:none"></div>
       <div class="form-group"><label>Email</label><input class="form-control" id="saLoginEmail" type="email"></div>
       <div class="form-group"><label>Password</label><input class="form-control" id="saLoginPass" type="password"></div>
-      <button class="btn btn-primary" style="width:100%" onclick="doLogin()">Login</button>
+      <button class="btn btn-primary btn-full" onclick="doLogin()">Login</button>
     </div>
   </div>
   <div id="dashboard" style="display:none">
     <div class="page-title">🛡️ Super Admin Dashboard</div>
-    <div id="statsRow" class="grid4" style="margin-bottom:18px"></div>
+    <div id="statsRow" class="grid4 stats-grid" style="margin-bottom:16px"></div>
     <div class="card">
-      <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:14px">
-        <span style="font-weight:700">Registered Admins</span>
+      <div class="card-header">
+        <span class="card-title">Registered Organisations</span>
       </div>
-      <div id="adminTable"></div>
+      <div class="table-wrap" id="adminTable"></div>
     </div>
   </div>
 </main>
@@ -1191,18 +1252,18 @@ async function init(){
 async function doSetup(){
   const n=document.getElementById('saName').value,e=document.getElementById('saEmail').value,p=document.getElementById('saPass').value;
   const r=await fetch('/api/super-admin/setup',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({name:n,email:e,password:p})}).then(x=>x.json());
-  if(r.error){document.getElementById('setupErr').textContent=r.error;document.getElementById('setupErr').style.display='block';return;}
+  if(r.error){showErr('setupErr',r.error);return;}
   location.reload();
 }
 
 async function doLogin(){
   const e=document.getElementById('saLoginEmail').value,p=document.getElementById('saLoginPass').value;
   const r=await fetch('/api/super-admin/login',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({email:e,password:p})}).then(x=>x.json());
-  if(r.error){document.getElementById('loginErr').textContent=r.error;document.getElementById('loginErr').style.display='block';return;}
-  saToken=r.token;localStorage.setItem(TOKEN_KEY,saToken);
-  loadDashboard();
+  if(r.error){showErr('loginErr',r.error);return;}
+  saToken=r.token;localStorage.setItem(TOKEN_KEY,saToken);loadDashboard();
 }
 
+function showErr(id,msg){const el=document.getElementById(id);el.textContent=msg;el.style.display='block';}
 function logout(){localStorage.removeItem(TOKEN_KEY);location.reload();}
 
 async function loadDashboard(){
@@ -1211,36 +1272,28 @@ async function loadDashboard(){
   document.getElementById('navRight').innerHTML='<span class="badge badge-sa">Super Admin</span><button class="btn btn-sm btn-outline" onclick="logout()">Logout</button>';
   const admins=await fetch('/api/super-admin/admins',{headers:{'x-token':saToken}}).then(x=>x.json());
   if(admins.error){localStorage.removeItem(TOKEN_KEY);location.reload();return;}
-
   const total=admins.length,approved=admins.filter(a=>a.status==='approved').length,
-        pending=admins.filter(a=>a.status==='pending').length,
-        totalUsers=admins.reduce((s,a)=>s+(a.user_count||0),0);
-  document.getElementById('statsRow').innerHTML=\`
-    <div class="stat"><div class="stat-val">\${total}</div><div class="stat-label">Total Admins</div></div>
-    <div class="stat"><div class="stat-val green">\${approved}</div><div class="stat-label">Approved</div></div>
-    <div class="stat"><div class="stat-val yellow">\${pending}</div><div class="stat-label">Pending</div></div>
-    <div class="stat"><div class="stat-val">\${totalUsers}</div><div class="stat-label">Total Employees</div></div>
-  \`;
-  const rows=admins.map(a=>\`
-    <tr>
-      <td><strong>\${a.org_name}</strong><br><span style="color:var(--muted);font-size:0.72rem">\${a.email}</span></td>
-      <td>\${a.org_type}</td>
-      <td><span class="chip chip-\${a.status==='approved'?'green':a.status==='pending'?'yellow':a.status==='rejected'?'red':'gray'}">\${a.status}</span></td>
-      <td style="font-family:'JetBrains Mono',monospace">\${a.face_count||0} faces / \${a.user_count||0} users</td>
-      <td><span class="chip chip-blue">\${a.notif_count||0} notif</span></td>
-      <td>\${a.today_attendance||0} today</td>
-      <td>
-        \${a.status!=='approved'?'<button class="btn btn-sm btn-success" onclick="setStatus('+a.id+',\\'approved\\')">Approve</button>':
-          '<button class="btn btn-sm btn-danger" onclick="setStatus('+a.id+',\\'suspended\\')">Suspend</button>'}
-        \${a.status==='pending'||a.status==='suspended'?'<button class="btn btn-sm btn-danger" onclick="setStatus('+a.id+',\\'rejected\\')">Reject</button>':''}
-      </td>
-    </tr>
-  \`).join('');
-  document.getElementById('adminTable').innerHTML=\`
-    <table>
-      <thead><tr><th>Organisation</th><th>Type</th><th>Status</th><th>Faces/Users</th><th>Notifications</th><th>Today</th><th>Action</th></tr></thead>
-      <tbody>\${rows||'<tr><td colspan="7" style="text-align:center;color:var(--muted);padding:30px">No admins yet</td></tr>'}</tbody>
-    </table>\`;
+    pending=admins.filter(a=>a.status==='pending').length,
+    totalUsers=admins.reduce((s,a)=>s+(a.user_count||0),0);
+  document.getElementById('statsRow').innerHTML=
+    '<div class="stat"><div class="stat-val">'+total+'</div><div class="stat-label">Total Orgs</div></div>'+
+    '<div class="stat"><div class="stat-val green">'+approved+'</div><div class="stat-label">Approved</div></div>'+
+    '<div class="stat"><div class="stat-val yellow">'+pending+'</div><div class="stat-label">Pending</div></div>'+
+    '<div class="stat"><div class="stat-val">'+totalUsers+'</div><div class="stat-label">Employees</div></div>';
+  const rows=admins.map(a=>'<tr>'+
+    '<td><strong>'+a.org_name+'</strong><br><span style="color:var(--muted);font-size:0.7rem">'+a.email+'</span></td>'+
+    '<td class="hide-mobile">'+a.org_type+'</td>'+
+    '<td><span class="chip chip-'+(a.status==='approved'?'green':a.status==='pending'?'yellow':a.status==='rejected'?'red':'gray')+'">'+a.status+'</span></td>'+
+    '<td class="hide-mobile" style="font-family:\'JetBrains Mono\',monospace;font-size:0.75rem">'+(a.face_count||0)+' / '+(a.user_count||0)+'</td>'+
+    '<td><span class="chip chip-blue">'+(a.today_attendance||0)+' today</span></td>'+
+    '<td>'+
+      (a.status!=='approved'?'<button class="btn btn-xs btn-success" onclick="setStatus('+a.id+',\'approved\')">Approve</button> ':
+        '<button class="btn btn-xs btn-danger" onclick="setStatus('+a.id+',\'suspended\')">Suspend</button> ')+
+      (a.status==='pending'||a.status==='suspended'?'<button class="btn btn-xs btn-danger" onclick="setStatus('+a.id+',\'rejected\')">Reject</button>':'')+
+    '</td></tr>').join('');
+  document.getElementById('adminTable').innerHTML=
+    '<table><thead><tr><th>Organisation</th><th class="hide-mobile">Type</th><th>Status</th><th class="hide-mobile">Faces/Users</th><th>Today</th><th>Action</th></tr></thead>'+
+    '<tbody>'+(rows||'<tr><td colspan="6" style="text-align:center;color:var(--muted);padding:30px">No admins yet</td></tr>')+'</tbody></table>';
 }
 
 async function setStatus(id,status){
@@ -1252,9 +1305,9 @@ init();
 </script>`));
 });
 
-// ═══════════════════════════════════════════════════════════════════════════════
-//  ADMIN PAGE — faces tab now collects email+password, no Users tab
-// ═══════════════════════════════════════════════════════════════════════════════
+// ═══════════════════════════════════════════════════════════════════════
+//  ADMIN PAGE
+// ═══════════════════════════════════════════════════════════════════════
 app.get('/admin', (_, res) => {
   res.send(htmlBase('Admin Portal', `
 <nav>
@@ -1262,17 +1315,18 @@ app.get('/admin', (_, res) => {
   <div class="nav-right" id="navRight"></div>
 </nav>
 <main id="app">
-  <!-- Auth Section -->
-  <div id="authSection" style="max-width:460px;margin:30px auto">
+
+  <!-- AUTH -->
+  <div id="authSection" style="max-width:460px;margin:24px auto">
     <div class="tabs">
       <button class="tab active" onclick="switchAuthTab('login',this)">Login</button>
-      <button class="tab" onclick="switchAuthTab('register',this)">Register Organisation</button>
+      <button class="tab" onclick="switchAuthTab('register',this)">Register Org</button>
     </div>
     <div id="loginPanel" class="card">
       <div id="loginErr" class="alert alert-error" style="display:none"></div>
       <div class="form-group"><label>Email</label><input class="form-control" id="aEmail" type="email"></div>
-      <div class="form-group"><label>Password</label><input class="form-control" id="aPass" type="password"></div>
-      <button class="btn btn-primary" style="width:100%" onclick="doAdminLogin()">Login</button>
+      <div class="form-group"><label>Password</label><input class="form-control" id="aPass" type="password" onkeydown="if(event.key==='Enter')doAdminLogin()"></div>
+      <button class="btn btn-primary btn-full" onclick="doAdminLogin()">Login</button>
     </div>
     <div id="registerPanel" class="card" style="display:none">
       <div id="regErr" class="alert alert-error" style="display:none"></div>
@@ -1283,11 +1337,10 @@ app.get('/admin', (_, res) => {
       </div>
       <div class="grid2">
         <div class="form-group"><label>Password</label><input class="form-control" id="rPass" type="password"></div>
-        <div class="form-group"><label>Organisation Name</label><input class="form-control" id="rOrg" placeholder="ABC School"></div>
+        <div class="form-group"><label>Organisation</label><input class="form-control" id="rOrg" placeholder="ABC School"></div>
       </div>
       <div class="grid2">
-        <div class="form-group">
-          <label>Organisation Type</label>
+        <div class="form-group"><label>Org Type</label>
           <select class="form-control" id="rType">
             <option value="office">Office</option><option value="school">School</option>
             <option value="hospital">Hospital</option><option value="factory">Factory</option>
@@ -1297,110 +1350,140 @@ app.get('/admin', (_, res) => {
         <div class="form-group"><label>System Title</label><input class="form-control" id="rTitle" placeholder="Daily Attendance"></div>
       </div>
       <div class="form-group">
-        <label>Organisation Logo</label>
+        <label>Logo</label>
         <input type="file" accept="image/*" id="rLogo" class="form-control" onchange="previewLogo(this)">
         <img id="logoPreview" class="logo-preview" style="display:none;margin-top:8px">
       </div>
-      <button class="btn btn-primary" style="width:100%" onclick="doRegister()">Submit for Approval</button>
+      <button class="btn btn-primary btn-full" onclick="doRegister()">Submit for Approval</button>
     </div>
   </div>
 
-  <!-- Dashboard -->
+  <!-- DASHBOARD -->
   <div id="dashboard" style="display:none">
-    <div class="tabs" id="dashTabs">
+    <!-- Desktop tabs -->
+    <div class="tabs desktop-tabs" id="dashTabs">
       <button class="tab active" onclick="switchTab('scan',this)">📷 Scan</button>
-      <button class="tab" onclick="switchTab('faces',this)">👥 People</button>
+      <button class="tab" onclick="switchTab('people',this)">👥 People</button>
       <button class="tab" onclick="switchTab('shifts',this)">⏰ Shifts</button>
+      <button class="tab" onclick="switchTab('attendance',this)">📋 Records</button>
       <button class="tab" onclick="switchTab('calendar',this)">📅 Calendar</button>
     </div>
 
     <!-- SCAN TAB -->
     <div id="tab-scan">
-      <div class="grid2" style="gap:14px;align-items:start">
+      <div class="grid2" style="align-items:start">
         <div>
           <div class="cam-card">
-            <div class="cam-wrap">
+            <div class="cam-wrap" id="scanCamWrap">
               <video id="video" autoplay muted playsinline></video>
               <canvas id="overlay"></canvas>
               <div class="scan-line"></div>
+              <div class="detected-label" id="detectedLabel" style="display:none"></div>
             </div>
             <div class="cam-controls">
-              <div style="flex:1;display:flex;align-items:center;gap:8px;font-size:0.74rem;color:var(--muted)">
-                <div class="live-dot" id="statusDot" style="background:var(--muted)"></div>
+              <div style="flex:1;display:flex;align-items:center;gap:6px;font-size:0.72rem;color:var(--muted)">
+                <div class="live-dot" id="statusDot" style="background:var(--muted2)"></div>
                 <span id="statusText">Starting camera...</span>
               </div>
-              <select class="form-control" id="scanMode" style="width:auto;padding:6px 10px;font-size:0.75rem">
+              <select class="form-control" id="scanMode" style="width:auto;padding:6px 10px;font-size:0.73rem">
                 <option value="checkin">Check In</option>
                 <option value="checkout">Check Out</option>
               </select>
-              <button class="btn btn-checkin" id="scanBtn" onclick="doScan()" disabled>Scan</button>
-              <button class="btn btn-outline btn-sm" id="autoBtn" onclick="toggleAuto()">Auto</button>
+              <button class="btn btn-primary btn-sm" id="detectBtn" onclick="doDetect()" disabled>Detect</button>
+              <button class="btn btn-outline btn-sm" id="autoBtn" onclick="toggleAuto()" title="Auto scan every 3s">Auto</button>
             </div>
           </div>
-          <div style="display:grid;grid-template-columns:repeat(4,1fr);gap:8px;margin-top:10px" id="todayStats"></div>
+          <div class="grid4 stats-grid" style="margin-top:10px" id="todayStats"></div>
         </div>
+
+        <!-- Pending shift + result -->
         <div>
+          <!-- Shift selection card (shown after detect) -->
+          <div class="card" id="shiftSelectCard" style="display:none;margin-bottom:12px">
+            <div class="card-title" style="margin-bottom:4px" id="detectedName"></div>
+            <div style="font-size:0.72rem;color:var(--muted);margin-bottom:10px" id="detectedMeta"></div>
+            <div id="pendingShiftsList"></div>
+            <div style="display:flex;gap:6px;margin-top:10px;flex-wrap:wrap" id="shiftActionBtns"></div>
+          </div>
+
           <div class="result-card" id="resultCard">
             <div class="result-title">Last Result</div>
-            <div id="resultBody" style="color:var(--muted);font-size:0.82rem">Scan a face to see results here.</div>
+            <div id="resultBody" style="color:var(--muted);font-size:0.82rem;text-align:center;padding:16px">
+              <div style="font-size:2rem;margin-bottom:6px">📷</div>
+              Scan a face to see results.
+            </div>
           </div>
           <div class="card" style="margin-top:12px">
-            <div style="font-size:0.72rem;font-weight:700;margin-bottom:10px">Today's Attendance</div>
-            <div id="todayList" style="max-height:300px;overflow-y:auto;font-size:0.8rem"></div>
+            <div class="card-header" style="margin-bottom:10px">
+              <span style="font-weight:700;font-size:0.85rem">Today's Attendance</span>
+              <span id="todayCount" class="chip chip-blue"></span>
+            </div>
+            <div id="todayList" style="max-height:260px;overflow-y:auto"></div>
           </div>
         </div>
       </div>
     </div>
 
-    <!-- PEOPLE TAB — face registration WITH email+password -->
-    <div id="tab-faces" style="display:none">
-      <div class="grid2" style="gap:14px;align-items:start">
+    <!-- PEOPLE TAB -->
+    <div id="tab-people" style="display:none">
+      <div class="grid2" style="align-items:start">
+        <!-- Register form -->
         <div class="card">
-          <div style="font-weight:700;margin-bottom:14px">Register New Person</div>
-          <div class="alert alert-info" style="font-size:0.75rem;margin-bottom:14px">
-            📌 Fill in all details below — this creates both the <strong>face profile</strong> and the <strong>employee login account</strong> in one step.
+          <div class="card-header">
+            <span class="card-title">Register Person</span>
+            <span id="regModeLabel" class="chip chip-blue">New</span>
           </div>
-          <div class="cam-card" style="margin-bottom:12px">
+          <div class="alert alert-info" style="font-size:0.73rem;margin-bottom:12px">
+            📌 Registers face profile + creates employee login in one step.
+          </div>
+          <div class="cam-card" style="margin-bottom:10px">
             <div class="cam-wrap"><video id="regVideo" autoplay muted playsinline></video><canvas id="regOverlay"></canvas></div>
             <div class="cam-controls" style="justify-content:space-between">
-              <span id="regStatus" style="font-size:0.72rem;color:var(--muted)">Camera ready</span>
-              <button class="btn btn-primary btn-sm" id="captureBtn" onclick="captureSample()" disabled>Capture Sample</button>
+              <span id="regStatus" style="font-size:0.7rem;color:var(--muted)">Camera ready</span>
+              <button class="btn btn-primary btn-sm" id="captureBtn" onclick="captureSample()" disabled>Capture</button>
             </div>
           </div>
           <div class="grid2">
-            <div class="form-group"><label>Full Name</label><input class="form-control" id="fName" placeholder="Employee / Student Name"></div>
+            <div class="form-group"><label>Full Name *</label><input class="form-control" id="fName" placeholder="Employee Name"></div>
             <div class="form-group"><label>Employee ID</label><input class="form-control" id="fEmpId" placeholder="EMP001"></div>
           </div>
-          <div class="grid2">
-            <div class="form-group"><label>Department</label><input class="form-control" id="fDept" placeholder="Engineering"></div>
-            <div class="form-group">
-              <label>Shift</label>
-              <select class="form-control" id="fShift"><option value="">No Shift</option></select>
+          <div class="form-group"><label>Department</label><input class="form-control" id="fDept" placeholder="Engineering"></div>
+
+          <div class="form-group">
+            <label>Assign Shifts (select one or more)</label>
+            <div class="shift-checkboxes" id="fShiftCheckboxes">
+              <div style="color:var(--muted);font-size:0.78rem;padding:8px">No shifts created yet. Add shifts first.</div>
             </div>
           </div>
-          <div style="border-top:1px solid var(--border);padding-top:12px;margin-bottom:12px">
-            <div style="font-size:0.7rem;color:var(--muted);text-transform:uppercase;letter-spacing:0.8px;margin-bottom:10px">Login Account (for Employee Portal)</div>
+
+          <div style="border-top:1px solid var(--border);padding-top:12px;margin:4px 0 12px">
+            <div style="font-size:0.62rem;color:var(--muted);text-transform:uppercase;letter-spacing:0.8px;margin-bottom:8px;font-weight:600">Employee Login Account</div>
             <div class="grid2">
-              <div class="form-group"><label>Email</label><input class="form-control" id="fUserEmail" type="email" placeholder="emp@company.com"></div>
-              <div class="form-group"><label>Password</label><input class="form-control" id="fUserPassword" type="password" placeholder="Min. 6 chars"></div>
+              <div class="form-group"><label>Email *</label><input class="form-control" id="fUserEmail" type="email" placeholder="emp@company.com"></div>
+              <div class="form-group"><label>Password *</label><input class="form-control" id="fUserPassword" type="password" placeholder="Min 6 chars"></div>
             </div>
           </div>
-          <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:8px">
-            <span id="sampleCount" style="font-size:0.75rem;color:var(--muted)">0 / 10 samples</span>
-            <button class="btn btn-outline btn-sm" onclick="clearSamples()">Clear Samples</button>
+
+          <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:6px">
+            <span id="sampleCount" style="font-size:0.73rem;color:var(--muted)">0 / 10 samples</span>
+            <button class="btn btn-outline btn-xs" onclick="clearSamples()">Clear</button>
           </div>
-          <div id="regSampleBar" style="height:6px;background:var(--border);border-radius:4px;margin-bottom:12px">
-            <div id="sampleProgress" style="height:100%;background:var(--accent);border-radius:4px;width:0%;transition:width 0.3s"></div>
-          </div>
+          <div class="progress-bar" style="margin-bottom:10px"><div class="progress-fill" id="sampleProgress" style="width:0%"></div></div>
           <div id="regErr" class="alert alert-error" style="display:none"></div>
           <div id="regOk2" class="alert alert-success" style="display:none"></div>
-          <button class="btn btn-primary" style="width:100%" id="saveBtn" onclick="saveFace()" disabled>Save Person &amp; Create Account</button>
-        </div>
-        <div class="card">
-          <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:14px">
-            <span style="font-weight:700">Registered People</span>
-            <span id="faceCount" class="chip chip-blue"></span>
+          <div style="display:flex;gap:8px">
+            <button class="btn btn-outline" id="cancelEditBtn" style="display:none" onclick="cancelEdit()">Cancel</button>
+            <button class="btn btn-primary" style="flex:1" id="saveBtn" onclick="saveFace()" disabled>Save Person &amp; Create Account</button>
           </div>
+        </div>
+
+        <!-- People list -->
+        <div class="card">
+          <div class="card-header">
+            <span class="card-title">Registered People</span>
+            <span id="faceCount" class="chip chip-blue">0</span>
+          </div>
+          <input class="form-control" id="peopleSearch" placeholder="🔍 Search by name, email, dept..." oninput="filterPeople()" style="margin-bottom:10px">
           <div id="faceList"></div>
         </div>
       </div>
@@ -1408,52 +1491,83 @@ app.get('/admin', (_, res) => {
 
     <!-- SHIFTS TAB -->
     <div id="tab-shifts" style="display:none">
-      <div class="grid2" style="gap:14px;align-items:start">
+      <div class="grid2" style="align-items:start">
         <div class="card">
-          <div style="font-weight:700;margin-bottom:14px">Add Shift</div>
-          <div class="form-group"><label>Shift Name</label><input class="form-control" id="shName" placeholder="Morning / Night / A / B"></div>
+          <div class="card-title" style="margin-bottom:14px">Add Shift</div>
+          <div class="form-group"><label>Shift Name</label><input class="form-control" id="shName" placeholder="Morning / Night / A-Shift"></div>
           <div class="grid2">
             <div class="form-group"><label>Start Time</label><input class="form-control" id="shStart" type="time"></div>
             <div class="form-group"><label>End Time</label><input class="form-control" id="shEnd" type="time"></div>
           </div>
           <div id="shErr" class="alert alert-error" style="display:none"></div>
-          <button class="btn btn-primary" style="width:100%" onclick="addShift()">Add Shift</button>
+          <button class="btn btn-primary btn-full" onclick="addShift()">Add Shift</button>
         </div>
         <div class="card">
-          <div style="font-weight:700;margin-bottom:14px">Your Shifts</div>
+          <div class="card-title" style="margin-bottom:14px">Your Shifts</div>
           <div id="shiftList"></div>
         </div>
+      </div>
+    </div>
+
+    <!-- ATTENDANCE RECORDS TAB -->
+    <div id="tab-attendance" style="display:none">
+      <div class="card">
+        <div class="card-header">
+          <span class="card-title">Attendance Records</span>
+          <div style="display:flex;gap:6px;flex-wrap:wrap">
+            <select class="form-control" id="expMonth" style="width:auto;padding:6px 10px;font-size:0.75rem"></select>
+            <select class="form-control" id="expYear" style="width:auto;padding:6px 10px;font-size:0.75rem"></select>
+            <button class="btn btn-success btn-sm" onclick="loadAttendanceRecords()">Load</button>
+            <button class="btn btn-outline btn-sm" onclick="exportCSV()">⬇️ Export CSV</button>
+          </div>
+        </div>
+        <div id="attendanceSummary" style="margin-bottom:12px"></div>
+        <div class="table-wrap" id="attendanceTable"></div>
       </div>
     </div>
 
     <!-- CALENDAR TAB -->
     <div id="tab-calendar" style="display:none">
       <div class="card">
-        <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:16px">
+        <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:14px;gap:10px">
           <button class="btn btn-outline btn-sm" onclick="changeMonth(-1)">&#8249; Prev</button>
           <span id="calTitle" style="font-weight:700"></span>
           <button class="btn btn-outline btn-sm" onclick="changeMonth(1)">Next &#8250;</button>
         </div>
-        <div style="font-size:0.72rem;color:var(--muted);margin-bottom:10px">Click a date to manage holidays.</div>
+        <div style="font-size:0.7rem;color:var(--muted);margin-bottom:8px">Tap a date to add/remove holidays.</div>
         <div class="cal-grid" id="calHead"></div>
-        <div class="cal-grid" style="margin-top:4px" id="calGrid"></div>
-      </div>
-      <div id="calModal" class="modal-backdrop">
-        <div class="modal">
-          <div class="modal-title">
-            <span id="calModalDate">Date</span>
-            <button class="modal-close" onclick="closeCalModal()">✕</button>
-          </div>
-          <div id="calModalBody"></div>
-          <div style="display:flex;gap:8px;margin-top:14px">
-            <button class="btn btn-success" id="holidayAddBtn" onclick="toggleHoliday()">Make Holiday</button>
-            <button class="btn btn-outline" onclick="closeCalModal()">Close</button>
-          </div>
-        </div>
+        <div class="cal-grid" style="margin-top:3px" id="calGrid"></div>
       </div>
     </div>
   </div>
 </main>
+
+<!-- Calendar Modal -->
+<div id="calModal" class="modal-backdrop">
+  <div class="modal">
+    <div class="modal-handle"></div>
+    <div class="modal-title">
+      <span id="calModalDate">Date</span>
+      <button class="modal-close" onclick="closeCalModal()">✕</button>
+    </div>
+    <div id="calModalBody"></div>
+    <div style="display:flex;gap:8px;margin-top:14px;flex-wrap:wrap">
+      <button class="btn btn-success" id="holidayAddBtn" onclick="toggleHoliday()">Make Holiday</button>
+      <button class="btn btn-outline" onclick="closeCalModal()">Close</button>
+    </div>
+  </div>
+</div>
+
+<!-- Mobile Bottom Nav -->
+<nav class="mobile-nav" id="mobileNav" style="display:none">
+  <div class="mobile-nav-items">
+    <button class="mobile-nav-item active" onclick="mobileTab('scan',this)"><span class="nav-icon">📷</span>Scan</button>
+    <button class="mobile-nav-item" onclick="mobileTab('people',this)"><span class="nav-icon">👥</span>People</button>
+    <button class="mobile-nav-item" onclick="mobileTab('shifts',this)"><span class="nav-icon">⏰</span>Shifts</button>
+    <button class="mobile-nav-item" onclick="mobileTab('attendance',this)"><span class="nav-icon">📋</span>Records</button>
+    <button class="mobile-nav-item" onclick="mobileTab('calendar',this)"><span class="nav-icon">📅</span>Calendar</button>
+  </div>
+</nav>
 
 <script src="/faceapi.js"></script>
 <script>
@@ -1462,9 +1576,12 @@ let adminToken=localStorage.getItem(TOKEN_KEY);
 let adminShifts=[],adminFaces=[],regSamples=[],autoMode=false,autoTimer=null;
 let calYear=new Date().getFullYear(),calMonth=new Date().getMonth()+1;
 let calData={attendance:[],holidays:[]},selectedCalDate=null;
+let editingFaceId=null,detectedFace=null;
+let allFacesCache=[];
 
+// ── Auth tab switch ──
 function switchAuthTab(t,btn){
-  document.querySelectorAll('.tabs .tab').forEach(b=>b.classList.remove('active'));
+  document.querySelectorAll('#authSection .tab').forEach(b=>b.classList.remove('active'));
   btn.classList.add('active');
   document.getElementById('loginPanel').style.display=t==='login'?'block':'none';
   document.getElementById('registerPanel').style.display=t==='register'?'block':'none';
@@ -1473,77 +1590,104 @@ function switchAuthTab(t,btn){
 function previewLogo(input){
   const f=input.files[0];if(!f)return;
   const r=new FileReader();
-  r.onload=e=>{const img=document.getElementById('logoPreview');img.src=e.target.result;img.style.display='block';};
+  r.onload=e=>{const img=document.getElementById('logoPreview');img.src=e.target.result;img.style.display='block'};
   r.readAsDataURL(f);
 }
 
 async function doAdminLogin(){
   const e=document.getElementById('aEmail').value,p=document.getElementById('aPass').value;
   const r=await fetch('/api/admin/login',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({email:e,password:p})}).then(x=>x.json());
-  if(r.error){document.getElementById('loginErr').textContent=r.error;document.getElementById('loginErr').style.display='block';return;}
-  adminToken=r.token;localStorage.setItem(TOKEN_KEY,adminToken);
-  showDashboard(r);
+  if(r.error){showMsg('loginErr','error',r.error);return;}
+  adminToken=r.token;localStorage.setItem(TOKEN_KEY,adminToken);showDashboard(r);
 }
 
 async function doRegister(){
   const logo=document.getElementById('logoPreview').src||null;
-  const body={
-    name:document.getElementById('rName').value,
-    email:document.getElementById('rEmail').value,
-    password:document.getElementById('rPass').value,
-    org_name:document.getElementById('rOrg').value,
-    org_type:document.getElementById('rType').value,
-    attendance_title:document.getElementById('rTitle').value,
-    logo_base64:logo&&logo.startsWith('data:')?logo:null
-  };
+  const body={name:document.getElementById('rName').value,email:document.getElementById('rEmail').value,
+    password:document.getElementById('rPass').value,org_name:document.getElementById('rOrg').value,
+    org_type:document.getElementById('rType').value,attendance_title:document.getElementById('rTitle').value,
+    logo_base64:logo&&logo.startsWith('data:')?logo:null};
   const r=await fetch('/api/admin/register',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)}).then(x=>x.json());
-  if(r.error){document.getElementById('regErr').textContent=r.error;document.getElementById('regErr').style.display='block';return;}
-  document.getElementById('regOk').textContent=r.message||'Submitted! Await approval.';
-  document.getElementById('regOk').style.display='block';
+  if(r.error){showMsg('regErr','error',r.error);return;}
+  showMsg('regOk','success',r.message||'Submitted! Await approval.');
 }
 
 function adminLogout(){localStorage.removeItem(TOKEN_KEY);location.reload();}
 
+function showMsg(id,type,msg){
+  const el=document.getElementById(id);if(!el)return;
+  el.className='alert alert-'+type;el.textContent=msg;el.style.display='block';
+  if(type==='success') setTimeout(()=>el.style.display='none',4000);
+}
+
+function showToast(msg,type='info'){
+  const t=document.createElement('div');
+  t.className='toast';
+  const colors={info:'#1a2332',success:'#059669',error:'#dc2626',warn:'#92400e'};
+  t.style.background=colors[type]||colors.info;
+  t.textContent=msg;document.body.appendChild(t);
+  setTimeout(()=>{t.style.opacity='0';setTimeout(()=>t.remove(),400)},3500);
+}
+
 async function showDashboard(r){
   document.getElementById('authSection').style.display='none';
   document.getElementById('dashboard').style.display='block';
+  document.getElementById('mobileNav').style.display='block';
+  document.body.classList.add('has-mobile-nav');
   const me=r||await fetch('/api/admin/me',{headers:{'x-token':adminToken}}).then(x=>x.json()).catch(()=>null);
   if(!me||me.error){localStorage.removeItem(TOKEN_KEY);location.reload();return;}
   let logoHtml='';
-  if(me.logo_base64) logoHtml=\`<img src="\${me.logo_base64}" class="logo-preview" style="height:32px;margin-right:6px">\`;
+  if(me.logo_base64) logoHtml='<img src="'+me.logo_base64+'" style="height:28px;border-radius:5px;margin-right:6px">';
   document.getElementById('navLogo').innerHTML=logoHtml+'Face<span style="color:var(--accent)">Attend</span>';
-  document.getElementById('navRight').innerHTML=\`
-    <span style="font-size:0.75rem;color:var(--muted)">\${me.org_name||''}</span>
-    <span class="badge badge-admin">Admin</span>
-    <button class="btn btn-sm btn-outline" onclick="adminLogout()">Logout</button>\`;
-  loadShifts();loadFaceList();loadScanTab();startCamera('video','overlay',true);
+  document.getElementById('navRight').innerHTML=
+    '<span style="font-size:0.72rem;color:var(--muted);max-width:100px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">'+
+    (me.org_name||'')+'</span><span class="badge badge-admin">Admin</span>'+
+    '<button class="btn btn-sm btn-outline" onclick="adminLogout()">Logout</button>';
+  await loadShifts();
+  await loadFaceList();
+  loadScanTab();
+  startCamera('video','overlay',true);
+  populateExportMonthYear();
 }
 
+// ── Tab switching ──
 function switchTab(t,btn){
   document.querySelectorAll('#dashTabs .tab').forEach(b=>b.classList.remove('active'));
-  btn.classList.add('active');
-  ['scan','faces','shifts','calendar'].forEach(tab=>{
-    document.getElementById('tab-'+tab).style.display=tab===t?'block':'none';
+  if(btn) btn.classList.add('active');
+  ['scan','people','shifts','attendance','calendar'].forEach(tab=>{
+    const el=document.getElementById('tab-'+tab);
+    if(el) el.style.display=tab===t?'block':'none';
   });
-  if(t==='faces') startCamera('regVideo','regOverlay',false);
+  if(t==='people') startCamera('regVideo','regOverlay',false);
   if(t==='calendar') renderCalendar();
 }
 
+function mobileTab(t,btn){
+  document.querySelectorAll('.mobile-nav-item').forEach(b=>b.classList.remove('active'));
+  btn.classList.add('active');
+  switchTab(t,null);
+}
+
+// ── Camera ──
 let streams={};
 async function startCamera(videoId,overlayId,isScan){
   if(streams[videoId]) return;
   try{
-    const stream=await navigator.mediaDevices.getUserMedia({video:{facingMode:'user'}});
+    const stream=await navigator.mediaDevices.getUserMedia({video:{facingMode:'user',width:{ideal:640},height:{ideal:480}}});
     streams[videoId]=stream;
-    const v=document.getElementById(videoId);v.srcObject=stream;
+    const v=document.getElementById(videoId);
+    if(!v)return;
+    v.srcObject=stream;
     await new Promise(r=>v.addEventListener('loadedmetadata',r,{once:true}));
     if(isScan){
-      document.getElementById('scanBtn').disabled=false;
+      document.getElementById('detectBtn').disabled=false;
       document.getElementById('statusDot').style.background='var(--accent)';
-      document.getElementById('statusText').textContent='Camera ready';
+      document.getElementById('statusText').textContent='Camera ready — tap Detect';
     } else {
-      document.getElementById('captureBtn').disabled=false;
-      document.getElementById('regStatus').textContent='Camera ready — capture 10 samples';
+      const btn=document.getElementById('captureBtn');
+      if(btn) btn.disabled=false;
+      const st=document.getElementById('regStatus');
+      if(st) st.textContent='Ready — capture 10 samples';
     }
   }catch(e){
     const el=document.getElementById(isScan?'statusText':'regStatus');
@@ -1551,117 +1695,183 @@ async function startCamera(videoId,overlayId,isScan){
   }
 }
 
-async function captureSample(){
-  const v=document.getElementById('regVideo');
+// ── Detect face (no mark yet) ──
+let detectCooldown=false;
+async function doDetect(){
+  if(detectCooldown) return;
+  detectCooldown=true;
+  setTimeout(()=>detectCooldown=false,1500);
+
+  const v=document.getElementById('video');
   if(!v||!v.srcObject) return;
-  await faceapi.nets.ssdMobilenetv1.loadFromUri('/models');
-  await faceapi.nets.faceLandmark68Net.loadFromUri('/models');
-  await faceapi.nets.faceRecognitionNet.loadFromUri('/models');
+  await ensureModels();
+
+  const lbl=document.getElementById('detectedLabel');
+  lbl.textContent='🔍 Detecting...';lbl.style.display='block';lbl.className='detected-label';
+
   const det=await faceapi.detectSingleFace(v).withFaceLandmarks().withFaceDescriptor();
-  if(!det){document.getElementById('regStatus').textContent='No face detected — try again';return;}
-  regSamples.push(Array.from(det.descriptor));
-  const pct=regSamples.length/10*100;
-  document.getElementById('sampleCount').textContent=regSamples.length+' / 10 samples';
-  document.getElementById('sampleProgress').style.width=pct+'%';
-  document.getElementById('regStatus').textContent='Sample '+regSamples.length+' captured ✅';
-  if(regSamples.length>=10){
-    document.getElementById('saveBtn').disabled=false;
-    document.getElementById('regStatus').textContent='10 samples ready — fill details & save';
+  if(!det){
+    lbl.textContent='❌ No face detected';lbl.className='detected-label red';
+    setTimeout(()=>lbl.style.display='none',2000);
+    showResult({event:'no_face',message:'No face detected'},'⚠️');
+    return;
+  }
+
+  const r=await fetch('/api/admin/detect',{method:'POST',
+    headers:{'Content-Type':'application/json','x-token':adminToken},
+    body:JSON.stringify({descriptor:Array.from(det.descriptor)})}).then(x=>x.json());
+
+  if(r.event==='unknown'){
+    lbl.textContent='❓ Unknown face';lbl.className='detected-label red';
+    setTimeout(()=>lbl.style.display='none',3000);
+    showResult({event:'unknown',message:'Unknown face — not registered'},'❓');
+    document.getElementById('shiftSelectCard').style.display='none';
+    return;
+  }
+
+  if(r.event==='recognized'){
+    detectedFace=r;
+    lbl.textContent='✅ '+r.name;lbl.className='detected-label green';
+
+    const mode=document.getElementById('scanMode').value;
+    const card=document.getElementById('shiftSelectCard');
+
+    if(mode==='checkout'){
+      // For checkout — just show shifts that are checked-in today
+      const markedShifts=r.shifts.filter(s=>!r.pending_shifts.find(p=>p.id===s.id));
+      document.getElementById('detectedName').textContent=r.name;
+      document.getElementById('detectedMeta').textContent='Select shift to check out:';
+      let html='';
+      if(r.no_shift){
+        html='<div style="font-size:0.8rem;color:var(--muted);padding:6px">No-shift person — checking out directly.</div>';
+        document.getElementById('shiftActionBtns').innerHTML=
+          '<button class="btn btn-primary btn-sm" onclick="markAttendance(null)">Check Out</button>';
+      } else if(markedShifts.length===0){
+        html='<div style="font-size:0.8rem;color:var(--muted);padding:6px">Not checked in for any shift today.</div>';
+        document.getElementById('shiftActionBtns').innerHTML='';
+      } else {
+        markedShifts.forEach(s=>{
+          html+='<button class="btn btn-outline btn-sm" style="margin:3px" onclick="markAttendance('+s.id+')">'+
+            s.name+' ('+fmtT(s.start_time)+' – '+fmtT(s.end_time)+')</button>';
+        });
+        document.getElementById('shiftActionBtns').innerHTML='';
+      }
+      document.getElementById('pendingShiftsList').innerHTML=html;
+      card.style.display='block';
+    } else {
+      // Check-in mode
+      if(r.no_shift){
+        card.style.display='none';
+        markAttendance(null);
+        return;
+      }
+      if(r.pending_shifts.length===0){
+        document.getElementById('detectedName').textContent=r.name;
+        document.getElementById('detectedMeta').textContent='All shifts already marked today ✅';
+        document.getElementById('pendingShiftsList').innerHTML='<div class="chip chip-green" style="font-size:0.78rem">All '+r.shifts.length+' shift(s) marked</div>';
+        document.getElementById('shiftActionBtns').innerHTML='';
+        card.style.display='block';
+        showResult({event:'already_checked_in',name:r.name,time_in:'All shifts done'},'ℹ️');
+        return;
+      }
+      document.getElementById('detectedName').textContent=r.name;
+      const s=r.pending_shifts;
+      document.getElementById('detectedMeta').textContent=s.length+' pending shift'+(s.length>1?'s':'')+' — tap to mark:';
+      let html='';
+      s.forEach(sh=>{
+        html+='<button class="btn btn-success btn-sm" style="margin:3px;display:inline-flex;flex-direction:column;align-items:flex-start;height:auto;padding:8px 12px" onclick="markAttendance('+sh.id+')">'+
+          '<span style="font-weight:700">'+sh.name+'</span>'+
+          '<span style="font-size:0.65rem;opacity:0.8">'+fmtT(sh.start_time)+' – '+fmtT(sh.end_time)+'</span>'+
+          '</button>';
+      });
+      if(s.length>1){
+        html+='<button class="btn btn-primary btn-sm" style="margin:3px" onclick="markAllShifts()">✅ Mark All ('+s.length+')</button>';
+      }
+      document.getElementById('pendingShiftsList').innerHTML=html;
+      document.getElementById('shiftActionBtns').innerHTML='';
+      card.style.display='block';
+    }
+    showResult({event:'recognized',name:r.name,message:'Select shift below to mark attendance'},'👤');
   }
 }
 
-function clearSamples(){
-  regSamples=[];
-  document.getElementById('sampleCount').textContent='0 / 10 samples';
-  document.getElementById('sampleProgress').style.width='0%';
-  document.getElementById('saveBtn').disabled=true;
-  document.getElementById('regStatus').textContent='Samples cleared';
+async function markAttendance(shiftId){
+  if(!detectedFace) return;
+  const mode=document.getElementById('scanMode').value;
+  const r=await fetch('/api/admin/scan',{method:'POST',
+    headers:{'Content-Type':'application/json','x-token':adminToken},
+    body:JSON.stringify({face_id:detectedFace.face_id,shift_id:shiftId,mode})}).then(x=>x.json());
+  showResult(r);
+  loadScanTab();
+  // Re-detect to update pending
+  if(r.event==='checkin') showToast('✅ '+r.name+' marked '+(r.shift?'['+r.shift+']':''),'success');
+  if(r.event==='checkout') showToast('👋 '+r.name+' checked out'+(r.shift?' ['+r.shift+']':''),'info');
 }
 
-async function saveFace(){
-  const label=document.getElementById('fName').value.trim();
-  const email=document.getElementById('fUserEmail').value.trim();
-  const password=document.getElementById('fUserPassword').value;
-  if(!label){document.getElementById('regErr').textContent='Name required';document.getElementById('regErr').style.display='block';return;}
-  if(!email){document.getElementById('regErr').textContent='Email required';document.getElementById('regErr').style.display='block';return;}
-  if(!password||password.length<6){document.getElementById('regErr').textContent='Password must be at least 6 characters';document.getElementById('regErr').style.display='block';return;}
-  if(regSamples.length<5){document.getElementById('regErr').textContent='Need at least 5 face samples';document.getElementById('regErr').style.display='block';return;}
-  const r=await fetch('/api/admin/faces',{method:'POST',headers:{'Content-Type':'application/json','x-token':adminToken},
-    body:JSON.stringify({
-      label,employee_id:document.getElementById('fEmpId').value,
-      department:document.getElementById('fDept').value,
-      shift_id:document.getElementById('fShift').value||null,
-      user_email:email,user_password:password,
-      descriptors:regSamples,accuracy:Math.round(100-Math.random()*5)
-    })
-  }).then(x=>x.json());
-  if(r.error){document.getElementById('regErr').textContent=r.error;document.getElementById('regErr').style.display='block';return;}
-  document.getElementById('regOk2').textContent='Person registered & account created! ✅';
-  document.getElementById('regOk2').style.display='block';
-  document.getElementById('regErr').style.display='none';
-  document.getElementById('fName').value='';document.getElementById('fEmpId').value='';
-  document.getElementById('fDept').value='';document.getElementById('fUserEmail').value='';
-  document.getElementById('fUserPassword').value='';document.getElementById('fShift').value='';
-  clearSamples();loadFaceList();
+async function markAllShifts(){
+  if(!detectedFace||!detectedFace.pending_shifts) return;
+  for(const s of detectedFace.pending_shifts){
+    await fetch('/api/admin/scan',{method:'POST',
+      headers:{'Content-Type':'application/json','x-token':adminToken},
+      body:JSON.stringify({face_id:detectedFace.face_id,shift_id:s.id,mode:'checkin'})}).then(x=>x.json());
+  }
+  showToast('✅ All shifts marked for '+detectedFace.name,'success');
+  document.getElementById('shiftSelectCard').style.display='none';
+  loadScanTab();
+  showResult({event:'checkin',name:detectedFace.name,message:'All '+detectedFace.pending_shifts.length+' shifts marked'});
 }
 
-async function loadFaceList(){
-  const faces=await fetch('/api/admin/faces',{headers:{'x-token':adminToken}}).then(x=>x.json());
-  adminFaces=faces;
-  const countEl=document.getElementById('faceCount');
-  if(countEl) countEl.textContent=faces.length+' people';
-  const html=faces.length?faces.map(f=>\`
-    <div style="display:flex;align-items:flex-start;justify-content:space-between;padding:10px 0;border-bottom:1px solid var(--border)">
-      <div>
-        <span style="font-weight:600">\${f.label}</span>
-        \${f.employee_id?\`<span style="color:var(--muted);font-size:0.7rem;margin-left:6px">#\${f.employee_id}</span>\`:''}
-        <br>
-        <span style="color:var(--muted);font-size:0.7rem">\${f.department||''}\${f.shift_name?' · '+f.shift_name:''}</span>
-        \${f.user_email?\`<br><span style="font-size:0.68rem;color:var(--accent)">📧 \${f.user_email}</span>\`:''}
-        \${f.notifications_enabled?\`<span class="chip chip-green" style="margin-left:4px;font-size:0.6rem">🔔 notif on</span>\`:''}
-      </div>
-      <button class="btn btn-danger btn-sm" onclick="deleteFace(\${f.id})">✕</button>
-    </div>\`).join('')
-    :'<p style="color:var(--muted);font-size:0.82rem">No people registered yet.</p>';
-  document.getElementById('faceList').innerHTML=html;
+function fmtT(t){if(!t)return'';const p=t.split(':');const h=parseInt(p[0]),m=p[1]||'00';return(h%12||12)+':'+m+(h>=12?' PM':' AM');}
+
+function showResult(r,icon=''){
+  const icons={checkin:'✅',checkout:'👋',unknown:'❓',already_checked_in:'ℹ️',already_checked_out:'ℹ️',not_checked_in:'⚠️',recognized:'👤',no_face:'⚠️'};
+  const ic=icon||icons[r.event]||'📋';
+  const colors={checkin:'#059669',checkout:'var(--accent)',unknown:'var(--red)',already_checked_in:'#92400e',recognized:'var(--accent)'};
+  const color=colors[r.event]||'var(--muted)';
+  document.getElementById('resultBody').innerHTML=
+    '<div style="text-align:center;padding:10px">'+
+    '<div style="font-size:2rem">'+ic+'</div>'+
+    '<div style="font-size:1rem;font-weight:700;color:'+color+';margin:6px 0">'+(r.name||r.event)+'</div>'+
+    (r.time_in?'<div style="font-size:0.78rem;color:var(--muted)">In: '+r.time_in+'</div>':'')+
+    (r.time_out?'<div style="font-size:0.78rem;color:var(--muted)">Out: '+r.time_out+'</div>':'')+
+    (r.shift?'<div style="font-size:0.7rem;color:var(--accent);margin-top:2px">Shift: '+r.shift+'</div>':'')+
+    (r.message?'<div style="font-size:0.75rem;color:var(--muted);margin-top:4px">'+r.message+'</div>':'')+
+    '</div>';
 }
 
-async function deleteFace(id){
-  if(!confirm('Delete this person and their login account?')) return;
-  await fetch('/api/admin/faces/'+id,{method:'DELETE',headers:{'x-token':adminToken}});
-  loadFaceList();
+async function loadScanTab(){
+  const today=new Date().toISOString().split('T')[0];
+  const [rows,allFaces]=await Promise.all([
+    fetch('/api/admin/attendance?date='+today,{headers:{'x-token':adminToken}}).then(x=>x.json()),
+    fetch('/api/admin/faces',{headers:{'x-token':adminToken}}).then(x=>x.json())
+  ]);
+  const uniquePresent=new Set(rows.filter(r=>r.status==='present').map(r=>r.face_id)).size;
+  const total=allFaces.length;
+  document.getElementById('todayStats').innerHTML=
+    '<div class="stat"><div class="stat-val green">'+uniquePresent+'</div><div class="stat-label">Present</div></div>'+
+    '<div class="stat"><div class="stat-val red">'+(total-uniquePresent)+'</div><div class="stat-label">Absent</div></div>'+
+    '<div class="stat"><div class="stat-val">'+total+'</div><div class="stat-label">Total</div></div>'+
+    '<div class="stat"><div class="stat-val yellow">'+rows.filter(r=>r.time_out).length+'</div><div class="stat-label">Out</div></div>';
+  const todayCount=document.getElementById('todayCount');
+  if(todayCount) todayCount.textContent=rows.length+' records';
+  document.getElementById('todayList').innerHTML=rows.length?
+    rows.map(r=>'<div style="display:flex;justify-content:space-between;align-items:center;padding:7px 0;border-bottom:1px solid var(--surface)">'+
+      '<div><span style="font-weight:600;font-size:0.82rem">'+r.name+'</span>'+
+      (r.shift_name?'<span class="chip chip-blue" style="margin-left:4px">'+r.shift_name+'</span>':'')+
+      '</div>'+
+      '<div style="text-align:right;font-size:0.7rem;color:var(--muted)">'+r.time_in+(r.time_out?' → '+r.time_out:'')+'</div>'+
+    '</div>').join('')
+    :'<div class="empty-state"><div class="empty-icon">📋</div><p>No attendance today</p></div>';
 }
 
-async function loadShifts(){
-  adminShifts=await fetch('/api/admin/shifts',{headers:{'x-token':adminToken}}).then(x=>x.json());
-  const sel=document.getElementById('fShift');
-  if(sel) sel.innerHTML='<option value="">No Shift</option>'+adminShifts.map(s=>\`<option value="\${s.id}">\${s.name} (\${s.start_time.slice(0,5)}-\${s.end_time.slice(0,5)})</option>\`).join('');
-  const list=document.getElementById('shiftList');
-  if(list) list.innerHTML=adminShifts.length?adminShifts.map(s=>\`
-    <div style="display:flex;align-items:center;justify-content:space-between;padding:10px 0;border-bottom:1px solid var(--border)">
-      <div><span style="font-weight:600">\${s.name}</span>
-        <span style="color:var(--muted);font-size:0.75rem;margin-left:8px">\${s.start_time.slice(0,5)} – \${s.end_time.slice(0,5)}</span>
-      </div>
-      <button class="btn btn-danger btn-sm" onclick="deleteShift(\${s.id})">✕</button>
-    </div>\`).join('')
-    :'<p style="color:var(--muted);font-size:0.82rem">No shifts defined yet.</p>';
+function toggleAuto(){
+  autoMode=!autoMode;
+  const btn=document.getElementById('autoBtn');
+  if(autoMode){btn.textContent='⏹ Stop';btn.classList.add('active');btn.style.background='var(--accent)';btn.style.color='#fff';autoTimer=setInterval(()=>doDetect(),3500);}
+  else{btn.textContent='Auto';btn.classList.remove('active');btn.style.background='';btn.style.color='';clearInterval(autoTimer);}
 }
 
-async function addShift(){
-  const n=document.getElementById('shName').value.trim(),s=document.getElementById('shStart').value,e=document.getElementById('shEnd').value;
-  if(!n||!s||!e){document.getElementById('shErr').textContent='All fields required';document.getElementById('shErr').style.display='block';return;}
-  const r=await fetch('/api/admin/shifts',{method:'POST',headers:{'Content-Type':'application/json','x-token':adminToken},body:JSON.stringify({name:n,start_time:s,end_time:e})}).then(x=>x.json());
-  if(r.error){document.getElementById('shErr').textContent=r.error;document.getElementById('shErr').style.display='block';return;}
-  document.getElementById('shErr').style.display='none';document.getElementById('shName').value='';
-  loadShifts();
-}
-
-async function deleteShift(id){
-  if(!confirm('Delete this shift?')) return;
-  await fetch('/api/admin/shifts/'+id,{method:'DELETE',headers:{'x-token':adminToken}});
-  loadShifts();
-}
-
+// ── People / Face registration ──
 let modelsLoaded=false;
 async function ensureModels(){
   if(modelsLoaded) return;
@@ -1671,101 +1881,328 @@ async function ensureModels(){
   modelsLoaded=true;
 }
 
-async function doScan(){
-  const v=document.getElementById('video');
+async function captureSample(){
+  const v=document.getElementById('regVideo');
   if(!v||!v.srcObject) return;
   await ensureModels();
+  const st=document.getElementById('regStatus');
+  st.textContent='Processing...';
   const det=await faceapi.detectSingleFace(v).withFaceLandmarks().withFaceDescriptor();
-  if(!det){showResult({event:'no_face',message:'No face detected'},'⚠️');return;}
-  const mode=document.getElementById('scanMode').value;
-  const r=await fetch('/api/admin/scan',{method:'POST',headers:{'Content-Type':'application/json','x-token':adminToken},
-    body:JSON.stringify({descriptor:Array.from(det.descriptor),mode})}).then(x=>x.json());
-  showResult(r);
-  loadScanTab();
+  if(!det){st.textContent='❌ No face — try again';return;}
+  regSamples.push(Array.from(det.descriptor));
+  const pct=regSamples.length/10*100;
+  document.getElementById('sampleCount').textContent=regSamples.length+' / 10 samples';
+  document.getElementById('sampleProgress').style.width=pct+'%';
+  st.textContent='✅ Sample '+regSamples.length+' captured';
+  if(regSamples.length>=10){
+    document.getElementById('saveBtn').disabled=false;
+    st.textContent='🎉 10 samples ready — fill details & save!';
+  }
 }
 
-function showResult(r,icon=''){
-  const icons={checkin:'✅',checkout:'👋',unknown:'❓',already_checked_in:'ℹ️',already_checked_out:'ℹ️',not_checked_in:'⚠️'};
-  const ic=icon||icons[r.event]||'📋';
-  const color={checkin:'var(--green)',checkout:'var(--accent)',unknown:'var(--red)',already_checked_in:'var(--yellow)'}[r.event]||'var(--muted)';
-  document.getElementById('resultBody').innerHTML=\`
-    <div style="text-align:center;padding:10px">
-      <div style="font-size:2rem">\${ic}</div>
-      <div style="font-size:1rem;font-weight:700;color:\${color};margin:6px 0">\${r.name||r.event}</div>
-      \${r.time_in?\`<div style="font-size:0.8rem;color:var(--muted)">In: \${r.time_in}</div>\`:''}
-      \${r.time_out?\`<div style="font-size:0.8rem;color:var(--muted)">Out: \${r.time_out}</div>\`:''}
-      \${r.shift?\`<div style="font-size:0.72rem;color:var(--accent)">Shift: \${r.shift}</div>\`:''}
-      \${r.message?\`<div style="font-size:0.78rem;color:var(--muted);margin-top:4px">\${r.message}</div>\`:''}
-    </div>\`;
+function clearSamples(){
+  regSamples=[];
+  document.getElementById('sampleCount').textContent='0 / 10 samples';
+  document.getElementById('sampleProgress').style.width='0%';
+  document.getElementById('saveBtn').disabled=editingFaceId?false:true;
+  document.getElementById('regStatus').textContent='Samples cleared';
 }
 
-async function loadScanTab(){
-  const today=new Date().toISOString().split('T')[0];
-  const rows=await fetch(\`/api/admin/attendance?date=\${today}\`,{headers:{'x-token':adminToken}}).then(x=>x.json());
-  const allFaces=await fetch('/api/admin/faces',{headers:{'x-token':adminToken}}).then(x=>x.json());
-  const present=rows.filter(r=>r.status==='present').length,total=allFaces.length;
-  document.getElementById('todayStats').innerHTML=\`
-    <div class="stat card-sm"><div class="stat-val green">\${present}</div><div class="stat-label">Present</div></div>
-    <div class="stat card-sm"><div class="stat-val red">\${total-present}</div><div class="stat-label">Absent</div></div>
-    <div class="stat card-sm"><div class="stat-val">\${total}</div><div class="stat-label">Total</div></div>
-    <div class="stat card-sm"><div class="stat-val yellow">\${rows.filter(r=>r.time_out).length}</div><div class="stat-label">Checked Out</div></div>
-  \`;
-  document.getElementById('todayList').innerHTML=rows.map(r=>\`
-    <div style="display:flex;justify-content:space-between;padding:6px 0;border-bottom:1px solid var(--surface)">
-      <span>\${r.name}</span>
-      <span style="color:var(--muted);font-size:0.72rem">\${r.time_in} \${r.time_out?'→ '+r.time_out:''}</span>
-    </div>\`).join('')||'<p style="color:var(--muted);font-size:0.8rem">No attendance today</p>';
+function renderShiftCheckboxes(selectedIds=[]){
+  const container=document.getElementById('fShiftCheckboxes');
+  if(!adminShifts.length){
+    container.innerHTML='<div style="color:var(--muted);font-size:0.78rem;padding:8px">No shifts yet. Create shifts first.</div>';
+    return;
+  }
+  container.innerHTML=adminShifts.map(s=>{
+    const checked=selectedIds.includes(s.id);
+    const dur=shiftHoursJS(s.start_time,s.end_time);
+    return '<label class="shift-checkbox-item'+(checked?' checked':'')+'">'+
+      '<input type="checkbox" value="'+s.id+'"'+(checked?' checked':'')+' onchange="this.closest(\'.shift-checkbox-item\').classList.toggle(\'checked\',this.checked)">'+
+      '<div style="flex:1"><div class="shift-checkbox-label">'+s.name+'</div>'+
+      '<div class="shift-checkbox-meta">'+fmtT(s.start_time)+' – '+fmtT(s.end_time)+' · '+dur+'</div></div>'+
+      '</label>';
+  }).join('');
 }
 
-function toggleAuto(){
-  autoMode=!autoMode;
-  const btn=document.getElementById('autoBtn');
-  if(autoMode){btn.textContent='Stop Auto';btn.classList.add('active');autoTimer=setInterval(()=>doScan(),3000);}
-  else{btn.textContent='Auto';btn.classList.remove('active');clearInterval(autoTimer);}
+function shiftHoursJS(start,end){
+  const [sh,sm]=start.split(':').map(Number);
+  const [eh,em]=end.split(':').map(Number);
+  let mins=(eh*60+em)-(sh*60+sm);if(mins<0)mins+=24*60;
+  const h=Math.floor(mins/60),m=mins%60;
+  return m?h+'h '+m+'m':h+'h';
 }
 
+function getSelectedShiftIds(){
+  return Array.from(document.querySelectorAll('#fShiftCheckboxes input[type=checkbox]:checked')).map(c=>parseInt(c.value));
+}
+
+async function saveFace(){
+  const label=document.getElementById('fName').value.trim();
+  const email=document.getElementById('fUserEmail').value.trim();
+  const password=document.getElementById('fUserPassword').value;
+  if(!label){showMsg('regErr','error','Name required');return;}
+  if(!email){showMsg('regErr','error','Email required');return;}
+  if(!editingFaceId&&(!password||password.length<6)){showMsg('regErr','error','Password min 6 chars');return;}
+  if(!editingFaceId&&regSamples.length<5){showMsg('regErr','error','Need at least 5 face samples');return;}
+
+  const shift_ids=getSelectedShiftIds();
+
+  if(editingFaceId){
+    // Update only metadata & shifts (no re-scan needed)
+    const r=await fetch('/api/admin/faces/'+editingFaceId,{method:'PUT',
+      headers:{'Content-Type':'application/json','x-token':adminToken},
+      body:JSON.stringify({employee_id:document.getElementById('fEmpId').value,
+        department:document.getElementById('fDept').value,shift_ids})}).then(x=>x.json());
+    if(r.error){showMsg('regErr','error',r.error);return;}
+    showMsg('regOk2','success','Updated successfully!');
+    cancelEdit();
+  } else {
+    const r=await fetch('/api/admin/faces',{method:'POST',
+      headers:{'Content-Type':'application/json','x-token':adminToken},
+      body:JSON.stringify({label,employee_id:document.getElementById('fEmpId').value,
+        department:document.getElementById('fDept').value,shift_ids,
+        user_email:email,user_password:password,
+        descriptors:regSamples,accuracy:Math.round(100-Math.random()*5)})}).then(x=>x.json());
+    if(r.error){showMsg('regErr','error',r.error);return;}
+    showMsg('regOk2','success','Person registered & account created! ✅');
+    document.getElementById('fName').value='';document.getElementById('fEmpId').value='';
+    document.getElementById('fDept').value='';document.getElementById('fUserEmail').value='';
+    document.getElementById('fUserPassword').value='';
+    renderShiftCheckboxes([]);
+    clearSamples();
+  }
+  document.getElementById('regErr').style.display='none';
+  loadFaceList();
+}
+
+function editFace(id){
+  const face=allFacesCache.find(f=>f.id===id);
+  if(!face) return;
+  editingFaceId=id;
+  document.getElementById('fName').value=face.label;
+  document.getElementById('fName').disabled=true;
+  document.getElementById('fEmpId').value=face.employee_id||'';
+  document.getElementById('fDept').value=face.department||'';
+  document.getElementById('fUserEmail').value=face.user_email||'';
+  document.getElementById('fUserEmail').disabled=true;
+  document.getElementById('fUserPassword').placeholder='Leave blank (no change)';
+  document.getElementById('saveBtn').disabled=false;
+  document.getElementById('saveBtn').textContent='Update Person';
+  document.getElementById('cancelEditBtn').style.display='inline-flex';
+  document.getElementById('regModeLabel').textContent='Editing';
+  document.getElementById('regModeLabel').className='chip chip-yellow';
+  const selectedIds=(face.shifts||[]).map(s=>s.id);
+  renderShiftCheckboxes(selectedIds);
+  switchTab('people',null);
+  document.querySelectorAll('.mobile-nav-item').forEach((b,i)=>{b.classList.toggle('active',i===1)});
+  window.scrollTo({top:0,behavior:'smooth'});
+}
+
+function cancelEdit(){
+  editingFaceId=null;
+  document.getElementById('fName').disabled=false;
+  document.getElementById('fName').value='';
+  document.getElementById('fEmpId').value='';
+  document.getElementById('fDept').value='';
+  document.getElementById('fUserEmail').disabled=false;
+  document.getElementById('fUserEmail').value='';
+  document.getElementById('fUserPassword').placeholder='Min 6 chars';
+  document.getElementById('saveBtn').textContent='Save Person & Create Account';
+  document.getElementById('saveBtn').disabled=true;
+  document.getElementById('cancelEditBtn').style.display='none';
+  document.getElementById('regModeLabel').textContent='New';
+  document.getElementById('regModeLabel').className='chip chip-blue';
+  renderShiftCheckboxes([]);
+  clearSamples();
+  document.getElementById('regErr').style.display='none';
+  document.getElementById('regOk2').style.display='none';
+}
+
+async function loadFaceList(){
+  const faces=await fetch('/api/admin/faces',{headers:{'x-token':adminToken}}).then(x=>x.json());
+  allFacesCache=faces;
+  adminFaces=faces;
+  const countEl=document.getElementById('faceCount');
+  if(countEl) countEl.textContent=faces.length;
+  renderFaceList(faces);
+}
+
+function filterPeople(){
+  const q=document.getElementById('peopleSearch').value.toLowerCase();
+  const filtered=allFacesCache.filter(f=>
+    f.label.toLowerCase().includes(q)||
+    (f.user_email||'').toLowerCase().includes(q)||
+    (f.department||'').toLowerCase().includes(q)||
+    (f.employee_id||'').toLowerCase().includes(q)
+  );
+  renderFaceList(filtered);
+}
+
+function renderFaceList(faces){
+  const el=document.getElementById('faceList');
+  if(!faces.length){
+    el.innerHTML='<div class="empty-state"><div class="empty-icon">👥</div><p>No people registered yet.</p></div>';
+    return;
+  }
+  el.innerHTML='<div style="display:flex;flex-direction:column;gap:8px">'+faces.map(f=>{
+    const shiftTags=(f.shifts||[]).map(s=>'<span class="chip chip-blue" style="font-size:0.58rem">'+s.name+'</span>').join(' ');
+    return '<div class="person-card">'+
+      '<div class="person-avatar">'+f.label.charAt(0).toUpperCase()+'</div>'+
+      '<div class="person-info">'+
+        '<div class="person-name">'+f.label+'</div>'+
+        '<div class="person-meta">'+
+          (f.employee_id?'#'+f.employee_id+' · ':'')+
+          (f.department||'No Dept')+
+        '</div>'+
+        (f.user_email?'<div style="font-size:0.68rem;color:var(--accent);margin-top:2px">📧 '+f.user_email+'</div>':'')+
+        (shiftTags?'<div class="person-shifts" style="margin-top:4px">'+shiftTags+'</div>':
+          '<div style="font-size:0.65rem;color:var(--muted);margin-top:3px">No shift assigned</div>')+
+        (f.notifications_enabled?'<span class="chip chip-green" style="font-size:0.58rem;margin-top:3px">🔔 Notif on</span>':'')+
+      '</div>'+
+      '<div class="person-actions">'+
+        '<button class="btn btn-outline btn-icon" onclick="editFace('+f.id+')" title="Edit">✏️</button>'+
+        '<button class="btn btn-danger btn-icon" onclick="deleteFace('+f.id+')" title="Delete">✕</button>'+
+      '</div>'+
+    '</div>';
+  }).join('')+'</div>';
+}
+
+async function deleteFace(id){
+  if(!confirm('Delete this person and their login account?')) return;
+  await fetch('/api/admin/faces/'+id,{method:'DELETE',headers:{'x-token':adminToken}});
+  loadFaceList();
+  showToast('Person deleted','warn');
+}
+
+// ── Shifts ──
+async function loadShifts(){
+  adminShifts=await fetch('/api/admin/shifts',{headers:{'x-token':adminToken}}).then(x=>x.json());
+  renderShiftCheckboxes([]);
+  const list=document.getElementById('shiftList');
+  if(list) list.innerHTML=adminShifts.length?
+    '<div style="display:flex;flex-direction:column;gap:6px">'+adminShifts.map(s=>{
+      const dur=shiftHoursJS(s.start_time,s.end_time);
+      return '<div style="display:flex;align-items:center;justify-content:space-between;padding:10px 0;border-bottom:1px solid var(--border)">'+
+        '<div><span style="font-weight:600">'+s.name+'</span>'+
+        '<span style="color:var(--muted);font-size:0.72rem;margin-left:8px">'+
+        fmtT(s.start_time)+' – '+fmtT(s.end_time)+'</span>'+
+        '<span class="chip chip-blue" style="margin-left:6px">'+dur+'</span></div>'+
+        '<button class="btn btn-danger btn-xs" onclick="deleteShift('+s.id+')">✕</button>'+
+      '</div>';
+    }).join('')+'</div>'
+    :'<div class="empty-state"><div class="empty-icon">⏰</div><p>No shifts yet.</p></div>';
+}
+
+async function addShift(){
+  const n=document.getElementById('shName').value.trim(),s=document.getElementById('shStart').value,e=document.getElementById('shEnd').value;
+  if(!n||!s||!e){showMsg('shErr','error','All fields required');return;}
+  const r=await fetch('/api/admin/shifts',{method:'POST',headers:{'Content-Type':'application/json','x-token':adminToken},body:JSON.stringify({name:n,start_time:s,end_time:e})}).then(x=>x.json());
+  if(r.error){showMsg('shErr','error',r.error);return;}
+  document.getElementById('shErr').style.display='none';
+  document.getElementById('shName').value='';
+  document.getElementById('shStart').value='';
+  document.getElementById('shEnd').value='';
+  await loadShifts();
+  showToast('Shift added!','success');
+}
+
+async function deleteShift(id){
+  if(!confirm('Delete this shift? Employees assigned will lose this shift.')) return;
+  await fetch('/api/admin/shifts/'+id,{method:'DELETE',headers:{'x-token':adminToken}});
+  await loadShifts();loadFaceList();
+}
+
+// ── Attendance Records ──
+function populateExportMonthYear(){
+  const now=new Date();
+  const months=['January','February','March','April','May','June','July','August','September','October','November','December'];
+  const mSel=document.getElementById('expMonth');
+  const ySel=document.getElementById('expYear');
+  if(!mSel||!ySel)return;
+  mSel.innerHTML=months.map((m,i)=>'<option value="'+(i+1)+'"'+(i+1===now.getMonth()+1?' selected':'')+'>'+m+'</option>').join('');
+  const yr=now.getFullYear();
+  ySel.innerHTML=[yr-1,yr,yr+1].map(y=>'<option value="'+y+'"'+(y===yr?' selected':'')+'>'+y+'</option>').join('');
+}
+
+async function loadAttendanceRecords(){
+  const m=document.getElementById('expMonth').value;
+  const y=document.getElementById('expYear').value;
+  const rows=await fetch('/api/admin/attendance?month='+m+'&year='+y,{headers:{'x-token':adminToken}}).then(x=>x.json());
+  const present=rows.filter(r=>r.status==='present').length;
+  const absent=rows.filter(r=>r.status==='absent').length;
+  document.getElementById('attendanceSummary').innerHTML=
+    '<div class="grid4 stats-grid">'+
+    '<div class="stat card-sm"><div class="stat-val">'+rows.length+'</div><div class="stat-label">Total Records</div></div>'+
+    '<div class="stat card-sm"><div class="stat-val green">'+present+'</div><div class="stat-label">Present</div></div>'+
+    '<div class="stat card-sm"><div class="stat-val red">'+absent+'</div><div class="stat-label">Absent</div></div>'+
+    '<div class="stat card-sm"><div class="stat-val yellow">'+rows.filter(r=>r.time_out).length+'</div><div class="stat-label">Checked Out</div></div>'+
+    '</div>';
+  if(!rows.length){
+    document.getElementById('attendanceTable').innerHTML='<div class="empty-state"><div class="empty-icon">📋</div><p>No records for this period.</p></div>';
+    return;
+  }
+  const trs=rows.map(r=>'<tr>'+
+    '<td><strong>'+r.name+'</strong></td>'+
+    '<td>'+String(r.date).slice(0,10)+'</td>'+
+    '<td class="hide-mobile">'+(r.shift_name||'—')+'</td>'+
+    '<td>'+r.time_in+'</td>'+
+    '<td>'+(r.time_out||'—')+'</td>'+
+    '<td><span class="chip chip-'+(r.status==='present'?'green':'red')+'">'+r.status+'</span></td>'+
+  '</tr>').join('');
+  document.getElementById('attendanceTable').innerHTML=
+    '<table><thead><tr><th>Name</th><th>Date</th><th class="hide-mobile">Shift</th><th>Time In</th><th>Time Out</th><th>Status</th></tr></thead>'+
+    '<tbody>'+trs+'</tbody></table>';
+}
+
+function exportCSV(){
+  const m=document.getElementById('expMonth').value;
+  const y=document.getElementById('expYear').value;
+  window.location.href='/api/admin/attendance/export?month='+m+'&year='+y+'&_t='+adminToken;
+}
+
+// ── Calendar ──
 const MONTH_NAMES=['January','February','March','April','May','June','July','August','September','October','November','December'];
 function changeMonth(d){calMonth+=d;if(calMonth>12){calMonth=1;calYear++;}if(calMonth<1){calMonth=12;calYear--;}renderCalendar();}
 
 async function renderCalendar(){
-  calData=await fetch(\`/api/admin/calendar?month=\${calMonth}&year=\${calYear}\`,{headers:{'x-token':adminToken}}).then(x=>x.json());
+  calData=await fetch('/api/admin/calendar?month='+calMonth+'&year='+calYear,{headers:{'x-token':adminToken}}).then(x=>x.json());
   document.getElementById('calTitle').textContent=MONTH_NAMES[calMonth-1]+' '+calYear;
-  document.getElementById('calHead').innerHTML=['Sun','Mon','Tue','Wed','Thu','Fri','Sat'].map(d=>\`<div class="cal-head">\${d}</div>\`).join('');
+  document.getElementById('calHead').innerHTML=['S','M','T','W','T','F','S'].map(d=>'<div class="cal-head">'+d+'</div>').join('');
   const first=new Date(calYear,calMonth-1,1).getDay(),days=new Date(calYear,calMonth,0).getDate(),today=new Date();
   let cells='';
-  for(let i=0;i<first;i++) cells+=\`<div class="cal-day other-month"></div>\`;
+  for(let i=0;i<first;i++) cells+='<div class="cal-day other-month"></div>';
   for(let d=1;d<=days;d++){
-    const dateStr=calYear+'-'+String(calMonth).padStart(2,'0')+'-'+String(d).padStart(2,'0');
-    const att=calData.attendance.find(a=>a.date===dateStr||a.date?.startsWith(dateStr));
-    const hol=calData.holidays.find(h=>h.date===dateStr||h.date?.startsWith(dateStr));
-    const isToday=today.getDate()===d&&today.getMonth()===calMonth-1&&today.getFullYear()===calYear;
-    cells+=\`<div class="cal-day\${isToday?' today':''}\${hol?' holiday':''}" onclick="openCalDay('\${dateStr}',\${!!hol})">
-      <div class="cal-day-num">\${d}</div>
-      \${att?(\`<span class="cal-event cal-present">✅ \${att.present}</span>\`+(att.absent>0?\`<span class="cal-event cal-absent">❌ \${att.absent}</span>\`:'')):''} 
-      \${hol?\`<span class="cal-event cal-holiday-tag">\${hol.label}</span>\`:''}
-    </div>\`;
+    const ds=calYear+'-'+String(calMonth).padStart(2,'0')+'-'+String(d).padStart(2,'0');
+    const att=calData.attendance.find(a=>String(a.date).startsWith(ds));
+    const hol=calData.holidays.find(h=>String(h.date).startsWith(ds));
+    const isTd=today.getDate()===d&&today.getMonth()===calMonth-1&&today.getFullYear()===calYear;
+    cells+='<div class="cal-day'+(isTd?' today':'')+(hol?' holiday':'')+'" onclick="openCalDay(\''+ds+'\','+!!hol+')">'+
+      '<div class="cal-day-num">'+d+'</div>'+
+      (att?'<span class="cal-event cal-present">✅ '+att.present+'</span>'+(att.absent>0?'<span class="cal-event cal-absent">❌ '+att.absent+'</span>':''):'')+
+      (hol?'<span class="cal-event cal-holiday-tag">'+hol.label+'</span>':'')+
+    '</div>';
   }
   document.getElementById('calGrid').innerHTML=cells;
 }
 
 function openCalDay(date,isHoliday){
   selectedCalDate=date;
-  const hol=calData.holidays.find(h=>h.date===date||h.date?.startsWith(date));
-  const att=calData.attendance.find(a=>a.date===date||a.date?.startsWith(date));
+  const hol=calData.holidays.find(h=>String(h.date).startsWith(date));
+  const att=calData.attendance.find(a=>String(a.date).startsWith(date));
   document.getElementById('calModalDate').textContent=date;
   const btn=document.getElementById('holidayAddBtn');
   btn.textContent=isHoliday?'Remove Holiday':'Make Holiday';
   btn.className='btn '+(isHoliday?'btn-danger':'btn-success');
-  document.getElementById('calModalBody').innerHTML=\`
-    \${att?\`<p>✅ Present: <strong>\${att.present}</strong> · ❌ Absent: <strong>\${att.absent}</strong></p>\`:'<p style="color:var(--muted)">No attendance data</p>'}
-    \${hol?\`<p style="margin-top:8px">🎉 Holiday: <strong>\${hol.label}</strong></p>\`:''}
-  \`;
+  document.getElementById('calModalBody').innerHTML=
+    (att?'<p style="font-size:0.85rem">✅ Present: <strong>'+att.present+'</strong> · ❌ Absent: <strong>'+att.absent+'</strong></p>':'<p style="color:var(--muted);font-size:0.82rem">No attendance data</p>')+
+    (hol?'<p style="margin-top:8px;font-size:0.82rem">🎉 Holiday: <strong>'+hol.label+'</strong></p>':'');
   document.getElementById('calModal').classList.add('open');
 }
 function closeCalModal(){document.getElementById('calModal').classList.remove('open');}
 
 async function toggleHoliday(){
-  const hol=calData.holidays.find(h=>h.date===selectedCalDate||h.date?.startsWith(selectedCalDate));
+  const hol=calData.holidays.find(h=>String(h.date).startsWith(selectedCalDate));
   if(hol){
     await fetch('/api/admin/holidays/'+selectedCalDate,{method:'DELETE',headers:{'x-token':adminToken}});
   } else {
@@ -1776,6 +2213,7 @@ async function toggleHoliday(){
   closeCalModal();renderCalendar();
 }
 
+// ── Init ──
 (async function(){
   if(adminToken){
     const me=await fetch('/api/admin/me',{headers:{'x-token':adminToken}}).then(x=>x.json()).catch(()=>null);
@@ -1783,12 +2221,12 @@ async function toggleHoliday(){
     else localStorage.removeItem(TOKEN_KEY);
   }
 })();
-</script>`));
+</script>`, `<meta name="apple-mobile-web-app-capable" content="yes">`));
 });
 
-// ═══════════════════════════════════════════════════════════════════════════════
-//  USER PAGE — auto notification modal after 5 seconds
-// ═══════════════════════════════════════════════════════════════════════════════
+// ═══════════════════════════════════════════════════════════════════════
+//  USER PAGE
+// ═══════════════════════════════════════════════════════════════════════
 app.get('/user', (_, res) => {
   res.send(htmlBase('Employee Portal', `
 <nav>
@@ -1797,30 +2235,47 @@ app.get('/user', (_, res) => {
 </nav>
 <main id="app">
   <!-- Login -->
-  <div id="loginSection" style="max-width:400px;margin:60px auto">
-    <div class="page-title">👤 Employee Login</div>
+  <div id="loginSection" style="max-width:380px;margin:48px auto">
+    <div class="page-title">👤 Employee Portal</div>
     <div class="card">
+      <div style="font-size:1.1rem;font-weight:700;margin-bottom:14px">Sign In</div>
       <div id="loginErr" class="alert alert-error" style="display:none"></div>
-      <div class="form-group"><label>Email</label><input class="form-control" id="uEmail" type="email"></div>
-      <div class="form-group"><label>Password</label><input class="form-control" id="uPass" type="password"></div>
-      <button class="btn btn-primary" style="width:100%" onclick="doUserLogin()">Login</button>
+      <div class="form-group"><label>Email</label><input class="form-control" id="uEmail" type="email" autocomplete="email"></div>
+      <div class="form-group"><label>Password</label><input class="form-control" id="uPass" type="password" autocomplete="current-password" onkeydown="if(event.key==='Enter')doUserLogin()"></div>
+      <button class="btn btn-primary btn-full" onclick="doUserLogin()">Login</button>
     </div>
   </div>
 
   <!-- Dashboard -->
   <div id="userDash" style="display:none">
-    <div class="grid4" id="statsRow" style="margin-bottom:18px"></div>
+    <!-- Notif toggle bar -->
+    <div class="card" style="margin-bottom:14px" id="notifBar">
+      <div style="display:flex;align-items:center;justify-content:space-between;gap:10px;flex-wrap:wrap">
+        <div>
+          <div style="font-weight:600;font-size:0.88rem">🔔 Attendance Notifications</div>
+          <div style="font-size:0.72rem;color:var(--muted);margin-top:2px" id="notifStatusText">Loading...</div>
+        </div>
+        <div style="display:flex;gap:8px;align-items:center">
+          <span id="notifStatusBadge"></span>
+          <button class="btn btn-primary btn-sm" id="notifToggleBtn" onclick="toggleNotifications()" style="display:none"></button>
+        </div>
+      </div>
+    </div>
+
+    <div class="grid4 stats-grid" id="statsRow" style="margin-bottom:14px"></div>
+
     <div class="card">
-      <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:16px">
-        <button class="btn btn-outline btn-sm" onclick="changeMonth(-1)">&#8249; Prev</button>
+      <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:14px;gap:10px">
+        <button class="btn btn-outline btn-sm" onclick="changeMonth(-1)">&#8249;</button>
         <span id="calTitle" style="font-weight:700"></span>
-        <button class="btn btn-outline btn-sm" onclick="changeMonth(1)">Next &#8250;</button>
+        <button class="btn btn-outline btn-sm" onclick="changeMonth(1)">&#8250;</button>
       </div>
       <div class="cal-grid" id="calHead"></div>
-      <div class="cal-grid" style="margin-top:4px" id="calGrid"></div>
+      <div class="cal-grid" style="margin-top:3px" id="calGrid"></div>
     </div>
+
     <div class="card" style="margin-top:14px">
-      <div style="font-weight:700;margin-bottom:12px">Recent Records</div>
+      <div class="card-title" style="margin-bottom:12px">Recent Records</div>
       <div id="recentList"></div>
     </div>
   </div>
@@ -1828,19 +2283,17 @@ app.get('/user', (_, res) => {
 
 <!-- Notification Permission Modal -->
 <div id="notifModal" class="modal-backdrop">
-  <div class="modal" style="text-align:center;max-width:380px">
-    <div class="notif-modal-icon">🔔</div>
-    <div style="font-weight:700;font-size:1.05rem;margin-bottom:8px">Enable Attendance Alerts</div>
-    <div style="font-size:0.82rem;color:var(--muted);margin-bottom:20px;line-height:1.6">
-      Get instant push notifications when your attendance is marked — check-in &amp; check-out alerts sent right to your device.
+  <div class="modal" style="text-align:center">
+    <div class="modal-handle"></div>
+    <div style="width:60px;height:60px;border-radius:50%;background:rgba(0,173,238,0.1);display:flex;align-items:center;justify-content:center;font-size:2rem;margin:0 auto 14px">🔔</div>
+    <div style="font-weight:700;font-size:1rem;margin-bottom:8px">Enable Attendance Alerts</div>
+    <div style="font-size:0.8rem;color:var(--muted);margin-bottom:20px;line-height:1.6">
+      Get instant push notifications every time your attendance is marked — check-in &amp; check-out alerts sent right to your device.
     </div>
-    <div style="display:flex;flex-direction:column;gap:10px">
-      <button class="btn btn-primary" style="width:100%;justify-content:center" onclick="enableNotif()">
-        🔔 Enable Notifications
-      </button>
-      <button class="btn btn-outline btn-sm" style="width:100%;justify-content:center" onclick="dismissNotifModal()">
-        Maybe later
-      </button>
+    <div id="notifModalPushStatus" class="alert alert-warn" style="display:none;text-align:left;margin-bottom:12px"></div>
+    <div style="display:flex;flex-direction:column;gap:8px">
+      <button class="btn btn-primary btn-full" id="notifModalEnableBtn" onclick="enableNotif()">🔔 Enable Notifications</button>
+      <button class="btn btn-outline btn-sm btn-full" onclick="dismissNotifModal()">Maybe later</button>
     </div>
   </div>
 </div>
@@ -1850,14 +2303,24 @@ const TOKEN_KEY='user_token';
 let userToken=localStorage.getItem(TOKEN_KEY);
 let calYear=new Date().getFullYear(),calMonth=new Date().getMonth()+1;
 let calData={attendance:[],holidays:[]};
+let currentUser=null;
 const MONTH_NAMES=['January','February','March','April','May','June','July','August','September','October','November','December'];
+
+function showToast(msg,type='info'){
+  const t=document.createElement('div');
+  t.className='toast';
+  const colors={info:'#1a2332',success:'#059669',error:'#dc2626',warn:'#92400e'};
+  t.style.background=colors[type]||colors.info;
+  t.textContent=msg;document.body.appendChild(t);
+  setTimeout(()=>{t.style.opacity='0';setTimeout(()=>t.remove(),400)},4000);
+}
 
 async function doUserLogin(){
   const e=document.getElementById('uEmail').value,p=document.getElementById('uPass').value;
   const r=await fetch('/api/user/login',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({email:e,password:p})}).then(x=>x.json());
-  if(r.error){document.getElementById('loginErr').textContent=r.error;document.getElementById('loginErr').style.display='block';return;}
+  if(r.error){const el=document.getElementById('loginErr');el.textContent=r.error;el.style.display='block';return;}
   userToken=r.token;localStorage.setItem(TOKEN_KEY,userToken);
-  showUserDash(r);
+  currentUser=r;showUserDash(r);
 }
 
 function userLogout(){localStorage.removeItem(TOKEN_KEY);location.reload();}
@@ -1866,61 +2329,120 @@ async function showUserDash(r){
   document.getElementById('loginSection').style.display='none';
   document.getElementById('userDash').style.display='block';
   let logoHtml='';
-  if(r.logo_base64) logoHtml=\`<img src="\${r.logo_base64}" style="height:32px;border-radius:6px;margin-right:6px">\`;
+  if(r.logo_base64) logoHtml='<img src="'+r.logo_base64+'" style="height:26px;border-radius:5px;margin-right:6px">';
   document.getElementById('navLogo').innerHTML=logoHtml+'Face<span style="color:var(--accent)">Attend</span>';
-  document.getElementById('navRight').innerHTML=\`
-    <span style="font-size:0.75rem;color:var(--muted)">\${r.name||''}</span>
-    <span class="badge badge-user">Employee</span>
-    <button class="btn btn-sm btn-outline" onclick="userLogout()">Logout</button>\`;
+  document.getElementById('navRight').innerHTML=
+    '<span style="font-size:0.72rem;color:var(--muted)">'+r.name+'</span>'+
+    '<span class="badge badge-user">Employee</span>'+
+    '<button class="btn btn-sm btn-outline" onclick="userLogout()">Logout</button>';
 
   renderCalendar();
 
-  // Auto-show notification modal after 5 seconds — only if not already enabled
-  // and browser supports push + permission not yet decided
-  if('serviceWorker' in navigator && 'PushManager' in navigator){
+  // Setup service worker & check push status
+  await setupPushNotifications(r.notifications_enabled);
+}
+
+async function setupPushNotifications(alreadyEnabled){
+  const statusText=document.getElementById('notifStatusText');
+  const statusBadge=document.getElementById('notifStatusBadge');
+  const toggleBtn=document.getElementById('notifToggleBtn');
+
+  if(!('serviceWorker' in navigator)||!('PushManager' in window)){
+    statusText.textContent='Push notifications not supported on this browser.';
+    document.getElementById('notifBar').style.display='none';
+    return;
+  }
+
+  // Check VAPID availability
+  const vapidResp=await fetch('/api/vapid-public').then(x=>x.json()).catch(()=>({enabled:false}));
+  if(!vapidResp.enabled||!vapidResp.key){
+    statusText.textContent='Push service not configured on this server.';
+    toggleBtn.style.display='none';
+    return;
+  }
+
+  try{
     await navigator.serviceWorker.register('/sw.js');
-    const notifPerm=Notification.permission;
-    const alreadyEnabled=r.notifications_enabled;
-    if(!alreadyEnabled && notifPerm!=='denied'){
-      setTimeout(()=>{
-        document.getElementById('notifModal').classList.add('open');
-      }, 5000);
+    await navigator.serviceWorker.ready;
+  }catch(e){
+    statusText.textContent='Service worker error: '+e.message;
+    return;
+  }
+
+  const perm=Notification.permission;
+
+  if(alreadyEnabled&&perm==='granted'){
+    statusText.textContent='You will receive alerts when attendance is marked.';
+    statusBadge.innerHTML='<span class="chip chip-green">✅ Active</span>';
+    toggleBtn.textContent='Disable';toggleBtn.className='btn btn-danger btn-sm';toggleBtn.style.display='inline-flex';
+  } else if(perm==='denied'){
+    statusText.textContent='Blocked by browser. Enable in browser settings to receive alerts.';
+    statusBadge.innerHTML='<span class="chip chip-red">🚫 Blocked</span>';
+    toggleBtn.style.display='none';
+  } else {
+    statusText.textContent='Enable to get instant check-in/out alerts.';
+    statusBadge.innerHTML='<span class="chip chip-gray">○ Off</span>';
+    toggleBtn.textContent='Enable';toggleBtn.className='btn btn-primary btn-sm';toggleBtn.style.display='inline-flex';
+    // Auto-show modal after 5s if not denied
+    if(!alreadyEnabled&&perm!=='denied'){
+      setTimeout(()=>document.getElementById('notifModal').classList.add('open'),5000);
     }
+  }
+}
+
+async function toggleNotifications(){
+  const btn=document.getElementById('notifToggleBtn');
+  const isEnabled=btn.textContent.includes('Disable');
+  if(isEnabled){
+    await fetch('/api/user/push-unsubscribe',{method:'POST',headers:{'x-token':userToken}});
+    showToast('Notifications disabled','warn');
+    await setupPushNotifications(false);
+  } else {
+    await enableNotif();
   }
 }
 
 async function enableNotif(){
   dismissNotifModal();
+  const statusEl=document.getElementById('notifModalPushStatus');
+
+  if(Notification.permission==='denied'){
+    showToast('Notifications blocked — enable in browser settings','error');
+    return;
+  }
+
   const perm=await Notification.requestPermission();
-  if(perm!=='granted'){alert('Notifications were blocked. You can enable them from browser settings.');return;}
+  if(perm!=='granted'){
+    showToast('Notification permission denied','error');
+    return;
+  }
+
   try{
     const reg=await navigator.serviceWorker.ready;
     const vapid=await fetch('/api/vapid-public').then(x=>x.json());
-    if(!vapid.key){alert('Push notifications not configured on this server yet.');return;}
+    if(!vapid.key||!vapid.enabled){
+      showToast('Push service not available on this server','error');
+      return;
+    }
+    const existing=await reg.pushManager.getSubscription();
+    if(existing) await existing.unsubscribe();
     const sub=await reg.pushManager.subscribe({
       userVisibleOnly:true,
       applicationServerKey:urlBase64ToUint8Array(vapid.key)
     });
-    await fetch('/api/user/push-subscribe',{method:'POST',
+    const r=await fetch('/api/user/push-subscribe',{method:'POST',
       headers:{'Content-Type':'application/json','x-token':userToken},
-      body:JSON.stringify({subscription:sub.toJSON()})});
-    // Show success toast
-    showToast('✅ Notifications enabled! You will be notified on every attendance mark.');
-  } catch(e){
-    alert('Could not subscribe: '+e.message);
+      body:JSON.stringify({subscription:sub.toJSON()})}).then(x=>x.json());
+    if(r.error) throw new Error(r.error);
+    showToast('✅ Notifications enabled!','success');
+    await setupPushNotifications(true);
+  }catch(e){
+    showToast('Could not enable notifications: '+e.message,'error');
   }
 }
 
 function dismissNotifModal(){
   document.getElementById('notifModal').classList.remove('open');
-}
-
-function showToast(msg){
-  const t=document.createElement('div');
-  t.style.cssText='position:fixed;bottom:20px;left:50%;transform:translateX(-50%);background:#1f2937;color:white;padding:12px 20px;border-radius:12px;font-size:0.82rem;z-index:9999;box-shadow:0 8px 24px rgba(0,0,0,0.2);transition:opacity 0.4s';
-  t.textContent=msg;
-  document.body.appendChild(t);
-  setTimeout(()=>{t.style.opacity='0';setTimeout(()=>t.remove(),400);},4000);
 }
 
 function urlBase64ToUint8Array(base64String){
@@ -1933,66 +2455,68 @@ function urlBase64ToUint8Array(base64String){
 function changeMonth(d){calMonth+=d;if(calMonth>12){calMonth=1;calYear++;}if(calMonth<1){calMonth=12;calYear--;}renderCalendar();}
 
 async function renderCalendar(){
-  calData=await fetch(\`/api/user/attendance?month=\${calMonth}&year=\${calYear}\`,{headers:{'x-token':userToken}}).then(x=>x.json());
+  calData=await fetch('/api/user/attendance?month='+calMonth+'&year='+calYear,{headers:{'x-token':userToken}}).then(x=>x.json());
   document.getElementById('calTitle').textContent=MONTH_NAMES[calMonth-1]+' '+calYear;
   const present=calData.attendance.filter(a=>a.status==='present').length;
   const absent=calData.attendance.filter(a=>a.status==='absent').length;
   const total=calData.attendance.length;
   const pct=total>0?Math.round(present/total*100):0;
-  document.getElementById('statsRow').innerHTML=\`
-    <div class="stat"><div class="stat-val green">\${present}</div><div class="stat-label">Present</div></div>
-    <div class="stat"><div class="stat-val red">\${absent}</div><div class="stat-label">Absent</div></div>
-    <div class="stat"><div class="stat-val">\${total}</div><div class="stat-label">Days Marked</div></div>
-    <div class="stat"><div class="stat-val \${pct>=80?'green':pct>=60?'yellow':'red'}">\${pct}%</div><div class="stat-label">Attendance %</div></div>
-  \`;
-  document.getElementById('calHead').innerHTML=['Sun','Mon','Tue','Wed','Thu','Fri','Sat'].map(d=>\`<div class="cal-head">\${d}</div>\`).join('');
+  document.getElementById('statsRow').innerHTML=
+    '<div class="stat"><div class="stat-val green">'+present+'</div><div class="stat-label">Present</div></div>'+
+    '<div class="stat"><div class="stat-val red">'+absent+'</div><div class="stat-label">Absent</div></div>'+
+    '<div class="stat"><div class="stat-val">'+total+'</div><div class="stat-label">Marked</div></div>'+
+    '<div class="stat"><div class="stat-val '+(pct>=80?'green':pct>=60?'yellow':'red')+'">'+pct+'%</div><div class="stat-label">Rate</div></div>';
+  document.getElementById('calHead').innerHTML=['S','M','T','W','T','F','S'].map(d=>'<div class="cal-head">'+d+'</div>').join('');
   const first=new Date(calYear,calMonth-1,1).getDay(),days=new Date(calYear,calMonth,0).getDate(),today=new Date();
   let cells='';
-  for(let i=0;i<first;i++) cells+=\`<div class="cal-day other-month"></div>\`;
+  for(let i=0;i<first;i++) cells+='<div class="cal-day other-month"></div>';
   for(let d=1;d<=days;d++){
-    const dateStr=calYear+'-'+String(calMonth).padStart(2,'0')+'-'+String(d).padStart(2,'0');
-    const att=calData.attendance.find(a=>(a.date+'').startsWith(dateStr));
-    const hol=calData.holidays.find(h=>(h.date+'').startsWith(dateStr));
-    const isToday=today.getDate()===d&&today.getMonth()===calMonth-1&&today.getFullYear()===calYear;
-    cells+=\`<div class="cal-day\${isToday?' today':''}\${hol?' holiday':''}">
-      <div class="cal-day-num">\${d}</div>
-      \${att?\`<span class="cal-event \${att.status==='present'?'cal-present':'cal-absent'}">\${att.status==='present'?'✅':'❌'}\${att.shift_name?' '+att.shift_name:''}</span>\`:''}
-      \${hol?\`<span class="cal-event cal-holiday-tag">\${hol.label}</span>\`:''}
-    </div>\`;
+    const ds=calYear+'-'+String(calMonth).padStart(2,'0')+'-'+String(d).padStart(2,'0');
+    const dayAtts=calData.attendance.filter(a=>String(a.date).startsWith(ds));
+    const hol=calData.holidays.find(h=>String(h.date).startsWith(ds));
+    const isTd=today.getDate()===d&&today.getMonth()===calMonth-1&&today.getFullYear()===calYear;
+    const hasPresent=dayAtts.some(a=>a.status==='present');
+    const hasAbsent=dayAtts.some(a=>a.status==='absent');
+    cells+='<div class="cal-day'+(isTd?' today':'')+(hol?' holiday':'')+'">'+
+      '<div class="cal-day-num">'+d+'</div>'+
+      (hasPresent?'<span class="cal-event cal-present">✅'+(dayAtts.length>1?' '+dayAtts.filter(a=>a.status==='present').length:'')+'</span>':'')+
+      (hasAbsent?'<span class="cal-event cal-absent">❌</span>':'')+
+      (hol?'<span class="cal-event cal-holiday-tag">'+hol.label+'</span>':'')+
+    '</div>';
   }
   document.getElementById('calGrid').innerHTML=cells;
 
-  const recent=calData.attendance.slice(0,10);
-  document.getElementById('recentList').innerHTML=recent.length?recent.map(a=>\`
-    <div style="display:flex;justify-content:space-between;padding:8px 0;border-bottom:1px solid var(--surface)">
-      <div>
-        <span class="chip \${a.status==='present'?'chip-green':'chip-red'}">\${a.status==='present'?'✅ Present':'❌ Absent'}</span>
-        \${a.shift_name?\`<span class="chip chip-blue" style="margin-left:4px">\${a.shift_name}</span>\`:''}
-      </div>
-      <div style="text-align:right;font-size:0.75rem;color:var(--muted)">
-        <div>\${(a.date+'').slice(0,10)}</div>
-        \${a.time_in?\`<div>In: \${a.time_in}\${a.time_out?' | Out: '+a.time_out:''}</div>\`:''}
-      </div>
-    </div>\`).join(''):'<p style="color:var(--muted);font-size:0.82rem">No attendance records for this month</p>';
+  const recent=calData.attendance.slice(0,15);
+  document.getElementById('recentList').innerHTML=recent.length?
+    recent.map(a=>'<div style="display:flex;justify-content:space-between;align-items:center;padding:8px 0;border-bottom:1px solid var(--surface)">'+
+      '<div style="display:flex;gap:6px;align-items:center;flex-wrap:wrap">'+
+      '<span class="chip '+(a.status==='present'?'chip-green':'chip-red')+'">'+(a.status==='present'?'✅ Present':'❌ Absent')+'</span>'+
+      (a.shift_name?'<span class="chip chip-blue">'+a.shift_name+'</span>':'')+
+      '</div>'+
+      '<div style="text-align:right;font-size:0.72rem;color:var(--muted)">'+
+      '<div>'+String(a.date).slice(0,10)+'</div>'+
+      (a.time_in?'<div>'+a.time_in+(a.time_out?' → '+a.time_out:'')+'</div>':'')+
+      '</div></div>').join('')
+    :'<div class="empty-state"><div class="empty-icon">📋</div><p>No records this month.</p></div>';
 }
 
 (async function(){
   if(userToken){
-    const r=await fetch('/api/user/notif-status',{headers:{'x-token':userToken}}).then(x=>x.json()).catch(()=>null);
-    if(r!==null&&!r.error){
-      const tok=userToken;
-      const parts=tok.split('.');
-      const pay=JSON.parse(atob(parts[1]));
-      showUserDash({name:pay.name,logo_base64:null,notifications_enabled:r.enabled});
-    } else {
-      localStorage.removeItem(TOKEN_KEY);
-    }
+    try{
+      const r=await fetch('/api/user/notif-status',{headers:{'x-token':userToken}}).then(x=>x.json());
+      if(r&&!r.error){
+        const parts=userToken.split('.');
+        const pay=JSON.parse(atob(parts[1]));
+        currentUser={name:pay.name,logo_base64:null,notifications_enabled:r.enabled};
+        await showUserDash(currentUser);
+      } else {localStorage.removeItem(TOKEN_KEY);}
+    }catch(e){localStorage.removeItem(TOKEN_KEY);}
   }
 })();
 </script>`));
 });
 
-// ── Start ─────────────────────────────────────────────────────────────────────
+// ── Start ──────────────────────────────────────────────────────────────
 app.listen(PORT, () => {
   console.log('✅ Server listening on port', PORT);
 });
