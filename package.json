@@ -1,14 +1,17 @@
 {
-  "name": "face-recognition-app",
-  "version": "1.0.0",
-  "description": "Face Recognition App - Express + MySQL",
+  "name": "faceattend-saas",
+  "version": "2.0.0",
+  "description": "FaceAttend SaaS — Multi-tenant Face Recognition Attendance System",
   "main": "index.js",
   "scripts": {
     "start": "node index.js"
   },
   "dependencies": {
+    "bcryptjs": "^2.4.3",
     "express": "^4.18.2",
-    "mysql2": "^3.9.7"
+    "jsonwebtoken": "^9.0.2",
+    "mysql2": "^3.9.7",
+    "web-push": "^3.6.7"
   },
   "engines": {
     "node": ">=16.0.0"
