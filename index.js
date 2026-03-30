@@ -631,7 +631,7 @@ td{padding:10px 14px;font-size:0.82rem;vertical-align:middle}
         <input class="s-inp" id="s_grace" type="number" min="0" max="60" placeholder="10"/>
       </div>
       <div class="s-field">
-        <div class="s-label">Office End / Checkout From (HH:MM)</div>
+        <div class="s-label">Checkout From (HH:MM)</div>
         <input class="s-inp" id="s_end" placeholder="18:10" maxlength="5"/>
       </div>
       <div class="s-field">
