@@ -7,13 +7,11 @@ const path    = require('path');
 const app  = express();
 const PORT = process.env.PORT || 3000;
 
-app.use(express.json({ limit: '20mb' }));  // increased for base64 image uploads
+app.use(express.json({ limit: '20mb' }));
 app.use(express.urlencoded({ extended: true }));
 
 app.use('/models',    express.static(path.join(__dirname, 'public', 'models')));
 app.use('/faceapi.js',(req, res) => res.sendFile(path.join(__dirname, 'public', 'faceapi.js')));
-
-// Serve unknown face images
 app.use('/unknown-images', express.static(path.join(__dirname, 'public', 'unknown-images')));
 
 const DB_CONFIG = {
@@ -24,6 +22,41 @@ const DB_CONFIG = {
 };
 
 const db = mysql.createConnection(DB_CONFIG);
+
+// ── In-memory office settings cache (refreshed from DB) ──────────────────────
+let OFFICE = {
+  start_h: 9, start_m: 30,
+  grace_minutes: 10,
+  end_h: 18, end_m: 10,
+  absent_after_h: 11, absent_after_m: 0
+};
+
+function calcDerivedTimes() {
+  return {
+    LATE_AFTER:       OFFICE.start_h * 60 + OFFICE.start_m + OFFICE.grace_minutes,
+    CHECKOUT_FROM:    OFFICE.end_h   * 60 + OFFICE.end_m,
+    ABSENT_AFTER_MIN: OFFICE.absent_after_h * 60 + OFFICE.absent_after_m
+  };
+}
+
+async function loadOfficeSettings() {
+  try {
+    const rows = await dbQuery('SELECT key_name, val FROM office_settings');
+    if (!rows.length) return;
+    const map = {};
+    rows.forEach(r => { map[r.key_name] = r.val; });
+    if (map.start_h          !== undefined) OFFICE.start_h          = parseInt(map.start_h);
+    if (map.start_m          !== undefined) OFFICE.start_m          = parseInt(map.start_m);
+    if (map.grace_minutes    !== undefined) OFFICE.grace_minutes    = parseInt(map.grace_minutes);
+    if (map.end_h            !== undefined) OFFICE.end_h            = parseInt(map.end_h);
+    if (map.end_m            !== undefined) OFFICE.end_m            = parseInt(map.end_m);
+    if (map.absent_after_h   !== undefined) OFFICE.absent_after_h   = parseInt(map.absent_after_h);
+    if (map.absent_after_m   !== undefined) OFFICE.absent_after_m   = parseInt(map.absent_after_m);
+    console.log('✅ Office settings loaded from DB');
+  } catch(e) {
+    console.warn('⚠️ Could not load office_settings (using defaults):', e.message);
+  }
+}
 
 db.connect(err => {
   if (err) {
@@ -60,7 +93,6 @@ db.connect(err => {
     )
   `, err => { if (!err) console.log('✅ attendance table ready'); });
 
-  // NEW: unknown_faces table for tracking unknown detections + images
   db.query(`
     CREATE TABLE IF NOT EXISTS unknown_faces (
       id             INT AUTO_INCREMENT PRIMARY KEY,
@@ -71,6 +103,36 @@ db.connect(err => {
       source         VARCHAR(50) DEFAULT 'checkin'
     )
   `, err => { if (!err) console.log('✅ unknown_faces table ready'); });
+
+  // ── NEW: office_settings table ──────────────────────────────────────────────
+  db.query(`
+    CREATE TABLE IF NOT EXISTS office_settings (
+      id        INT AUTO_INCREMENT PRIMARY KEY,
+      key_name  VARCHAR(50) NOT NULL UNIQUE,
+      val       VARCHAR(20) NOT NULL,
+      updated_at DATETIME DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP
+    )
+  `, err => {
+    if (!err) {
+      console.log('✅ office_settings table ready');
+      // Seed defaults if empty
+      db.query('SELECT COUNT(*) AS c FROM office_settings', (e, rows) => {
+        if (!e && rows[0].c === 0) {
+          const defaults = [
+            ['start_h','9'],['start_m','30'],['grace_minutes','10'],
+            ['end_h','18'],['end_m','10'],
+            ['absent_after_h','11'],['absent_after_m','0']
+          ];
+          defaults.forEach(([k,v]) => {
+            db.query('INSERT IGNORE INTO office_settings (key_name, val) VALUES (?,?)', [k,v]);
+          });
+          console.log('✅ Default office settings seeded');
+        }
+        // Load into memory after seeding
+        loadOfficeSettings();
+      });
+    }
+  });
 });
 
 // ─── AUTO DOWNLOAD face-api.js + MODELS ──────────────────────────────────────
@@ -116,7 +178,6 @@ async function setup() {
     catch(e) { console.log('❌ ' + e.message); }
   } else { console.log('✅ face-api.js cached'); }
 
-  // Validate + fix corrupt model files
   for (const f of MODEL_FILES) {
     const fp = path.join(MODELS_DIR, f);
     if (fs.existsSync(fp)) {
@@ -189,19 +250,19 @@ function fmtTime(t) {
   return (h % 12 || 12) + ':' + m + ' ' + (h >= 12 ? 'PM' : 'AM');
 }
 
-// ─── OFFICE TIMING CONFIG ─────────────────────────────────────────────────────
-const OFFICE_START   = { h: 9,  m: 30 };
-const GRACE_MINUTES  = 10;
-const OFFICE_END     = { h: 18, m: 10 };
-const ABSENT_AFTER   = { h: 11, m: 0 };
+function pad2(n) { return String(n).padStart(2, '0'); }
+
+function fmtHM(h, m) {
+  const ampm = h >= 12 ? 'PM' : 'AM';
+  const h12  = h % 12 || 12;
+  return h12 + ':' + pad2(m) + ' ' + ampm;
+}
+
 const THRESHOLD      = 0.5;
 const REGISTER_SAMPLES = 10;
 
-const LATE_AFTER       = OFFICE_START.h * 60 + OFFICE_START.m + GRACE_MINUTES;
-const CHECKOUT_FROM    = OFFICE_END.h   * 60 + OFFICE_END.m;
-const ABSENT_AFTER_MIN = ABSENT_AFTER.h * 60 + ABSENT_AFTER.m;
-
 function calcExpectedCheckout(timeInStr) {
+  const { CHECKOUT_FROM } = calcDerivedTimes();
   const parts = timeInStr.split(':');
   const inMin = parseInt(parts[0]) * 60 + parseInt(parts[1]);
   const byWorkHours = inMin + 8 * 60;
@@ -231,7 +292,6 @@ function calcWorkingMinutes(timeIn, timeOut) {
   return diff > 0 ? diff : 0;
 }
 
-// ─── STATUS LABEL HELPER ──────────────────────────────────────────────────────
 function statusLabel(s) {
   const map = {
     present:           '✅ Present',
@@ -284,12 +344,35 @@ nav{position:sticky;top:0;z-index:100;background:rgba(255,255,255,0.96);backdrop
 
 main{position:relative;z-index:1;max-width:1400px;margin:0 auto;padding:16px}
 
-.timing-bar{display:flex;align-items:center;gap:8px;background:var(--card);border:1px solid var(--border);border-radius:12px;padding:10px 14px;margin-bottom:14px;flex-wrap:wrap;gap:6px}
+/* ── Timing bar ── */
+.timing-bar{display:flex;align-items:center;gap:8px;background:var(--card);border:1px solid var(--border);border-radius:12px;padding:10px 14px;margin-bottom:14px;flex-wrap:wrap;gap:6px;justify-content:space-between}
+.timing-left{display:flex;align-items:center;gap:8px;flex-wrap:wrap}
 .timing-item{display:flex;align-items:center;gap:6px;font-size:0.72rem;color:var(--muted)}
 .timing-item strong{color:var(--text);font-family:'JetBrains Mono',monospace;font-size:0.72rem}
 .timing-sep{color:var(--muted2);font-size:0.9rem}
 .timing-dot{width:6px;height:6px;border-radius:50%;flex-shrink:0}
 .td-green{background:var(--accent2)}.td-yellow{background:var(--yellow)}.td-orange{background:var(--orange)}.td-purple{background:var(--purple)}
+/* Settings button */
+.timing-edit-btn{display:flex;align-items:center;gap:5px;padding:5px 10px;background:rgba(0,173,238,0.08);border:1px solid rgba(0,173,238,0.2);color:var(--accent);font-family:'Space Grotesk',sans-serif;font-size:0.7rem;font-weight:600;border-radius:8px;cursor:pointer;transition:all 0.2s;white-space:nowrap;flex-shrink:0}
+.timing-edit-btn:hover{background:rgba(0,173,238,0.18)}
+
+/* ── Settings Modal ── */
+.modal-backdrop{position:fixed;inset:0;background:rgba(0,0,0,0.45);z-index:800;display:none;align-items:center;justify-content:center;padding:16px}
+.modal-backdrop.open{display:flex}
+.modal{background:var(--card);border:1px solid var(--border);border-radius:18px;padding:24px;width:100%;max-width:440px;box-shadow:0 20px 60px rgba(0,0,0,0.15)}
+.modal-title{font-family:'JetBrains Mono',monospace;font-size:0.7rem;letter-spacing:2px;color:var(--muted);text-transform:uppercase;margin-bottom:18px;display:flex;align-items:center;justify-content:space-between}
+.modal-close{background:none;border:none;cursor:pointer;color:var(--muted);font-size:1.1rem;line-height:1;padding:2px}
+.modal-close:hover{color:var(--red)}
+.settings-grid{display:grid;grid-template-columns:1fr 1fr;gap:12px;margin-bottom:18px}
+.s-field{display:flex;flex-direction:column;gap:4px}
+.s-label{font-size:0.65rem;color:var(--muted);text-transform:uppercase;letter-spacing:0.8px}
+.s-inp{background:var(--surface);border:1px solid var(--border);border-radius:8px;padding:8px 10px;color:var(--text);font-family:'JetBrains Mono',monospace;font-size:0.82rem;outline:none;transition:border-color 0.2s;width:100%}
+.s-inp:focus{border-color:var(--accent)}
+.modal-actions{display:flex;gap:8px;justify-content:flex-end}
+.btn-save{padding:9px 20px;background:var(--accent);color:#fff;border:none;border-radius:9px;font-family:'Space Grotesk',sans-serif;font-size:0.82rem;font-weight:700;cursor:pointer;transition:all 0.2s}
+.btn-save:hover{background:#009ed8;transform:translateY(-1px)}
+.btn-cancel{padding:9px 14px;background:transparent;border:1px solid var(--border);color:var(--muted);border-radius:9px;font-family:'Space Grotesk',sans-serif;font-size:0.82rem;cursor:pointer}
+.btn-cancel:hover{border-color:var(--red);color:var(--red)}
 
 .stats-bar{display:grid;grid-template-columns:repeat(5,1fr);gap:10px;margin-bottom:16px}
 @media(max-width:600px){.stats-bar{grid-template-columns:repeat(3,1fr)}}
@@ -387,8 +470,6 @@ td{padding:10px 14px;font-size:0.82rem;vertical-align:middle}
 @media(min-width:500px){.toast{left:auto;max-width:340px}}
 .toast.show{opacity:1;transform:translateY(0)}
 .toast.s{background:rgba(52,211,153,0.93);color:#000}.toast.e{background:rgba(248,113,113,0.93);color:#fff}.toast.i{background:rgba(0,173,238,0.93);color:#fff}.toast.w{background:rgba(251,191,36,0.93);color:#000}.toast.p{background:rgba(0,173,238,0.93);color:#fff}
-
-/* Unknown counter badge */
 .unk-badge{background:rgba(248,113,113,0.12);border:1px solid rgba(248,113,113,0.3);color:var(--red);padding:3px 8px;border-radius:10px;font-family:'JetBrains Mono',monospace;font-size:0.68rem;font-weight:700}
 </style>
 </head>
@@ -423,14 +504,18 @@ td{padding:10px 14px;font-size:0.82rem;vertical-align:middle}
 </nav>
 
 <main>
+  <!-- ── Timing Bar (populated dynamically via JS) ── -->
   <div class="timing-bar">
-    <div class="timing-item"><div class="timing-dot td-green"></div>On Time: before <strong>9:40 AM</strong></div>
-    <div class="timing-sep">·</div>
-    <div class="timing-item"><div class="timing-dot td-yellow"></div>Late: after <strong>9:40 AM</strong></div>
-    <div class="timing-sep">·</div>
-    <div class="timing-item"><div class="timing-dot td-purple"></div>Checkout from: <strong>6:10 PM</strong></div>
-    <div class="timing-sep">·</div>
-    <div class="timing-item"><div class="timing-dot" style="background:var(--red)"></div>Absent after <strong>11:00 AM</strong></div>
+    <div class="timing-left">
+      <div class="timing-item"><div class="timing-dot td-green"></div>On Time: before <strong id="tLateAfter">—</strong></div>
+      <div class="timing-sep">·</div>
+      <div class="timing-item"><div class="timing-dot td-yellow"></div>Late: after <strong id="tLateAfter2">—</strong></div>
+      <div class="timing-sep">·</div>
+      <div class="timing-item"><div class="timing-dot td-purple"></div>Checkout from: <strong id="tCheckoutFrom">—</strong></div>
+      <div class="timing-sep">·</div>
+      <div class="timing-item"><div class="timing-dot" style="background:var(--red)"></div>Absent after <strong id="tAbsentAfter">—</strong></div>
+    </div>
+    <button class="timing-edit-btn" onclick="openSettings()">⚙️ Edit Timings</button>
   </div>
 
   <div class="stats-bar">
@@ -529,14 +614,50 @@ td{padding:10px 14px;font-size:0.82rem;vertical-align:middle}
   </div>
 </main>
 
+<!-- ── Office Timings Settings Modal ── -->
+<div class="modal-backdrop" id="settingsModal">
+  <div class="modal">
+    <div class="modal-title">
+      ⚙️ Office Timing Settings
+      <button class="modal-close" onclick="closeSettings()">✕</button>
+    </div>
+    <div class="settings-grid">
+      <div class="s-field">
+        <div class="s-label">Check-In Start (HH:MM)</div>
+        <input class="s-inp" id="s_start" placeholder="09:30" maxlength="5"/>
+      </div>
+      <div class="s-field">
+        <div class="s-label">Grace Period (minutes)</div>
+        <input class="s-inp" id="s_grace" type="number" min="0" max="60" placeholder="10"/>
+      </div>
+      <div class="s-field">
+        <div class="s-label">Office End / Checkout From (HH:MM)</div>
+        <input class="s-inp" id="s_end" placeholder="18:10" maxlength="5"/>
+      </div>
+      <div class="s-field">
+        <div class="s-label">Mark Absent After (HH:MM)</div>
+        <input class="s-inp" id="s_absent" placeholder="11:00" maxlength="5"/>
+      </div>
+    </div>
+    <div style="font-size:0.68rem;color:var(--muted);margin-bottom:14px;line-height:1.6">
+      ⚠️ On-time = check-in before <em>Start + Grace</em>. Late = after that. Absent = no check-in by Absent After time.
+    </div>
+    <div class="modal-actions">
+      <button class="btn-cancel" onclick="closeSettings()">Cancel</button>
+      <button class="btn-save" onclick="saveSettings()">💾 Save Timings</button>
+    </div>
+  </div>
+</div>
+
 <div class="toast" id="toast"></div>
 
 <script>
-// ── Mobile tensor fix: try CDN fallback if local model fails ──
 const MODEL_URL = '/models';
 const CDN_MODEL_URL = 'https://justadudewhohacks.github.io/face-api.js/models';
 const THRESHOLD = ${THRESHOLD};
 let isReady = false, autoOn = false, modelsLoaded = false;
+let officeSettings = null; // loaded from API
+
 const video   = document.getElementById('video');
 const overlay = document.getElementById('overlay');
 const ctx     = overlay.getContext('2d');
@@ -544,6 +665,93 @@ const ctx     = overlay.getContext('2d');
 const now = new Date();
 document.getElementById('navDate').textContent =
   now.toLocaleDateString('en-US',{weekday:'short',year:'numeric',month:'short',day:'numeric'});
+
+// ── Load & display office settings ───────────────────────────────────────────
+async function loadTimingBar() {
+  try {
+    const data = await (await fetch('/api/office-settings')).json();
+    officeSettings = data;
+    const { start_h, start_m, grace_minutes, end_h, end_m, absent_after_h, absent_after_m } = data;
+    const lateAfterMin = start_h * 60 + start_m + parseInt(grace_minutes);
+    const lateAfterH = Math.floor(lateAfterMin / 60);
+    const lateAfterM = lateAfterMin % 60;
+    const fmt = (h, m) => {
+      const ampm = h >= 12 ? 'PM' : 'AM';
+      return (h % 12 || 12) + ':' + String(m).padStart(2,'0') + ' ' + ampm;
+    };
+    const lateStr = fmt(lateAfterH, lateAfterM);
+    document.getElementById('tLateAfter').textContent  = lateStr;
+    document.getElementById('tLateAfter2').textContent = lateStr;
+    document.getElementById('tCheckoutFrom').textContent = fmt(end_h, end_m);
+    document.getElementById('tAbsentAfter').textContent  = fmt(absent_after_h, absent_after_m);
+  } catch(e) {
+    console.warn('Could not load office settings:', e.message);
+  }
+}
+
+// ── Settings Modal ────────────────────────────────────────────────────────────
+function openSettings() {
+  if (officeSettings) {
+    const { start_h, start_m, grace_minutes, end_h, end_m, absent_after_h, absent_after_m } = officeSettings;
+    document.getElementById('s_start').value  = String(start_h).padStart(2,'0') + ':' + String(start_m).padStart(2,'0');
+    document.getElementById('s_grace').value  = grace_minutes;
+    document.getElementById('s_end').value    = String(end_h).padStart(2,'0') + ':' + String(end_m).padStart(2,'0');
+    document.getElementById('s_absent').value = String(absent_after_h).padStart(2,'0') + ':' + String(absent_after_m).padStart(2,'0');
+  }
+  document.getElementById('settingsModal').classList.add('open');
+}
+
+function closeSettings() {
+  document.getElementById('settingsModal').classList.remove('open');
+}
+
+function parseHM(val) {
+  const parts = val.split(':');
+  if (parts.length !== 2) return null;
+  const h = parseInt(parts[0]), m = parseInt(parts[1]);
+  if (isNaN(h) || isNaN(m) || h < 0 || h > 23 || m < 0 || m > 59) return null;
+  return { h, m };
+}
+
+async function saveSettings() {
+  const startVal  = document.getElementById('s_start').value.trim();
+  const graceVal  = parseInt(document.getElementById('s_grace').value);
+  const endVal    = document.getElementById('s_end').value.trim();
+  const absentVal = document.getElementById('s_absent').value.trim();
+
+  const start  = parseHM(startVal);
+  const end    = parseHM(endVal);
+  const absent = parseHM(absentVal);
+
+  if (!start)           { toast('Invalid Check-In Start time (use HH:MM)', 'e'); return; }
+  if (isNaN(graceVal))  { toast('Invalid grace period', 'e'); return; }
+  if (!end)             { toast('Invalid Office End time (use HH:MM)', 'e'); return; }
+  if (!absent)          { toast('Invalid Absent After time (use HH:MM)', 'e'); return; }
+
+  try {
+    const res = await fetch('/api/office-settings', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        start_h: start.h, start_m: start.m,
+        grace_minutes: graceVal,
+        end_h: end.h, end_m: end.m,
+        absent_after_h: absent.h, absent_after_m: absent.m
+      })
+    });
+    if (!res.ok) throw new Error((await res.json()).error || 'Save failed');
+    toast('✅ Timings saved!', 's');
+    closeSettings();
+    loadTimingBar();
+  } catch(e) {
+    toast('Error: ' + e.message, 'e');
+  }
+}
+
+// Close modal on backdrop click
+document.getElementById('settingsModal').addEventListener('click', function(e) {
+  if (e.target === this) closeSettings();
+});
 
 function showErr(msg){
   document.getElementById('loadTitle').textContent='❌ Error';
@@ -572,7 +780,6 @@ async function init(){
     try {
       const probe = await fetch('/models/ssd_mobilenetv1_model-weights_manifest.json');
       if(!probe.ok) throw new Error('manifest not found');
-      // Check size to detect corrupt files
       const mdata = await probe.json();
       if (!mdata || !mdata.weightsManifest) throw new Error('invalid manifest');
     } catch(e) {
@@ -589,7 +796,6 @@ async function init(){
       if (useUrl !== CDN_MODEL_URL) {
         console.warn('Local model load failed, trying CDN:', modelErr.message);
         setLoad('Retrying via CDN','Local model corrupted, downloading fresh...');
-        // Tell server to re-download
         try { await fetch('/api/models/refresh', {method:'POST'}); } catch(_){}
         await loadModels(CDN_MODEL_URL);
         modelsLoaded = true;
@@ -620,7 +826,7 @@ async function init(){
     document.getElementById('btnCO').disabled=false;
     document.getElementById('btnA').disabled=false;
     setSt('Ready — use Check In or Check Out','ok');
-    loadStats();loadTable();loadUnkCount();
+    loadStats();loadTable();loadUnkCount();loadTimingBar();
   }catch(e){
     console.error('Init error:', e);
     showErr('Load failed: '+e.message+'. Try refreshing or check if face-api models are downloaded.');
@@ -633,11 +839,9 @@ async function detectFaces(){
     .withFaceLandmarks().withFaceDescriptors();
 }
 
-// Capture a snapshot of the video as base64 JPEG
 function captureSnapshot(box){
   const snap = document.createElement('canvas');
   const sw = video.videoWidth, sh = video.videoHeight;
-  // Crop around face with padding
   const pad = 60;
   const x = Math.max(0, (box ? box.x - pad : 0));
   const y = Math.max(0, (box ? box.y - pad : 0));
@@ -646,7 +850,7 @@ function captureSnapshot(box){
   snap.width = w; snap.height = h;
   const sc2 = snap.getContext('2d');
   sc2.drawImage(video, x, y, w, h, 0, 0, w, h);
-  return snap.toDataURL('image/jpeg', 0.75); // compress for storage
+  return snap.toDataURL('image/jpeg', 0.75);
 }
 
 function drawFaceCircle(box, color, label, sx, sy){
@@ -655,17 +859,13 @@ function drawFaceCircle(box, color, label, sx, sy){
   const w = box.width  * sx;
   const h = box.height * sy;
   const pad = 10;
-  // Outer glow border
   ctx.strokeStyle = color+'33'; ctx.lineWidth = 8;
   ctx.beginPath(); ctx.roundRect(x-pad-4, y-pad-4, w+pad*2+8, h+pad*2+8, 8); ctx.stroke();
-  // Main border
   ctx.strokeStyle = color; ctx.lineWidth = 2.5;
   ctx.beginPath(); ctx.roundRect(x-pad, y-pad, w+pad*2, h+pad*2, 6); ctx.stroke();
-  // Fill tint
   ctx.save(); ctx.globalAlpha = 0.06; ctx.fillStyle = color;
   ctx.beginPath(); ctx.roundRect(x-pad, y-pad, w+pad*2, h+pad*2, 6); ctx.fill();
   ctx.restore();
-  // Corner accents
   const cs = 14; ctx.strokeStyle = color; ctx.lineWidth = 3;
   [[x-pad, y-pad],[x-pad+w+pad*2, y-pad],[x-pad, y-pad+h+pad*2],[x-pad+w+pad*2, y-pad+h+pad*2]].forEach(([cx2,cy2],i)=>{
     const dx = i%2===0?1:-1, dy = i<2?1:-1;
@@ -682,10 +882,8 @@ function drawFaceCircle(box, color, label, sx, sy){
     ctx.fillStyle = color; ctx.textAlign='center';
     ctx.fillText(label, cx, txtY); ctx.textAlign='left';
   }
-  return {cx: x+w/2, cy: y+h/2, r: Math.max(w,h)/2};
 }
 
-// ── CHECK IN ──────────────────────────────────────────────────
 async function capture(){
   if(!isReady)return;
   setSt('Scanning for check-in...','pulse');clearC();
@@ -695,7 +893,6 @@ async function capture(){
   const sx=overlay.width/video.videoWidth, sy=overlay.height/video.videoHeight;
   let lastResult=null, unknownCount=0, successCount=0;
 
-  // Process all detected faces in parallel
   await Promise.all(dets.map(async det => {
     const{x,y,width,height}=det.detection.box;
     const res=await fetch('/api/attendance/mark',{
@@ -735,7 +932,6 @@ async function capture(){
   else setSt(dets.length+' face'+(dets.length>1?'s':'')+' processed','ok');
 }
 
-// ── CHECK OUT ─────────────────────────────────────────────────
 async function captureCheckout(){
   if(!isReady)return;
   setSt('Scanning for check-out...','pulse');clearC();
@@ -789,7 +985,6 @@ async function captureCheckout(){
   else setSt(dets.length+' face'+(dets.length>1?'s':'')+' processed','ok');
 }
 
-// ── RESULT DISPLAY ────────────────────────────────────────────
 function showIdle(){
   document.getElementById('resultIdle').style.display='flex';
   document.getElementById('recognizedBox').style.display='none';
@@ -871,7 +1066,6 @@ function showResult(d){
   }
 }
 
-// ── AUTO MODE ─────────────────────────────────────────────────
 function toggleAuto(){
   autoOn=!autoOn;
   const b=document.getElementById('btnA');
@@ -889,7 +1083,6 @@ function toggleAuto(){
 }
 async function runAuto(){while(autoOn){await capture();await new Promise(r=>setTimeout(r,3000));}}
 
-// ── DATA ──────────────────────────────────────────────────────
 async function loadStats(){
   try{
     const{stats}=await(await fetch('/api/attendance/stats')).json();
@@ -938,7 +1131,7 @@ function setSt(t,type){document.getElementById('st').textContent=t;const d=docum
 function toast(msg,type='i'){const t=document.getElementById('toast');t.textContent=msg;t.className='toast '+type+' show';clearTimeout(t._to);t._to=setTimeout(()=>t.classList.remove('show'),4000);}
 function esc(s){return String(s).replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));}
 
-loadStats();loadTable();loadUnkCount();
+loadStats();loadTable();loadUnkCount();loadTimingBar();
 setInterval(()=>{loadStats();loadTable();loadUnkCount();},30000);
 </script>
 </body>
@@ -1393,8 +1586,6 @@ main{position:relative;z-index:1;max-width:1400px;margin:0 auto;padding:20px 16p
 .filter-row{display:flex;gap:8px;align-items:center;flex-wrap:wrap}
 .filter-inp{background:var(--surface);border:1px solid var(--border);border-radius:8px;padding:8px 12px;color:var(--text);font-family:'Space Grotesk',sans-serif;font-size:0.8rem;outline:none;transition:border-color 0.2s}
 .filter-inp:focus{border-color:var(--accent)}.filter-inp::placeholder{color:var(--muted)}
-
-/* Stats row */
 .stats-row{display:grid;grid-template-columns:repeat(3,1fr);gap:12px;margin-bottom:20px}
 @media(max-width:500px){.stats-row{grid-template-columns:1fr 1fr}}
 .stat-card{background:var(--card);border:1px solid var(--border);border-radius:12px;padding:14px}
@@ -1402,11 +1593,8 @@ main{position:relative;z-index:1;max-width:1400px;margin:0 auto;padding:20px 16p
 .stat-val.today{color:var(--orange)}
 .stat-val.week{color:var(--yellow)}
 .stat-lbl{font-size:0.62rem;color:var(--muted);text-transform:uppercase;letter-spacing:1px;margin-top:5px}
-
-/* Grid of face cards */
 .faces-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(200px,1fr));gap:14px}
 @media(max-width:500px){.faces-grid{grid-template-columns:repeat(auto-fill,minmax(160px,1fr))}}
-
 .face-card{background:var(--card);border:1px solid var(--border);border-radius:14px;overflow:hidden;transition:all 0.2s;position:relative}
 .face-card:hover{border-color:rgba(248,113,113,0.4);box-shadow:0 4px 20px rgba(248,113,113,0.1)}
 .face-img-wrap{aspect-ratio:1;overflow:hidden;background:var(--surface);position:relative}
@@ -1418,20 +1606,15 @@ main{position:relative;z-index:1;max-width:1400px;margin:0 auto;padding:20px 16p
 .face-del{position:absolute;top:6px;right:6px;width:26px;height:26px;border-radius:50%;background:rgba(248,113,113,0.85);border:none;color:#fff;font-size:0.8rem;cursor:pointer;display:flex;align-items:center;justify-content:center;opacity:0;transition:opacity 0.2s;line-height:1}
 .face-card:hover .face-del{opacity:1}
 .face-badge{position:absolute;top:6px;left:6px;background:rgba(248,113,113,0.85);color:#fff;font-size:0.62rem;font-weight:700;padding:2px 7px;border-radius:10px;font-family:'JetBrains Mono',monospace}
-
 .empty-state{text-align:center;padding:80px 20px;color:var(--muted)}
 .empty-state svg{opacity:0.12;margin-bottom:16px}
 .empty-state p{font-size:0.9rem;line-height:1.7}
-
 .load-more{margin:20px auto;display:block;padding:10px 28px;background:var(--surface);border:1px solid var(--border);color:var(--text);font-family:'Space Grotesk',sans-serif;font-size:0.82rem;font-weight:600;border-radius:10px;cursor:pointer;transition:all 0.2s}
 .load-more:hover{border-color:var(--accent);color:var(--accent)}
-
 .toast{position:fixed;bottom:20px;right:16px;left:16px;padding:11px 16px;border-radius:12px;font-size:0.8rem;font-weight:600;opacity:0;transform:translateY(10px);transition:all 0.3s;z-index:500;pointer-events:none}
 @media(min-width:500px){.toast{left:auto;max-width:320px}}
 .toast.show{opacity:1;transform:translateY(0)}
 .toast.s{background:rgba(52,211,153,0.93);color:#000}.toast.e{background:rgba(248,113,113,0.93);color:#fff}.toast.i{background:rgba(0,173,238,0.93);color:#fff}
-
-/* Lightbox */
 .lb{position:fixed;inset:0;background:rgba(0,0,0,0.85);z-index:900;display:none;align-items:center;justify-content:center;padding:20px}
 .lb.open{display:flex}
 .lb-img{max-width:90vw;max-height:90vh;border-radius:12px;box-shadow:0 20px 60px rgba(0,0,0,0.5)}
@@ -1473,7 +1656,6 @@ main{position:relative;z-index:1;max-width:1400px;margin:0 auto;padding:20px 16p
   <button class="load-more" id="loadMoreBtn" onclick="loadMore()" style="display:none">Load More</button>
 </main>
 
-<!-- Lightbox -->
 <div class="lb" id="lb" onclick="closeLb()">
   <button class="lb-close" onclick="closeLb()">✕</button>
   <img class="lb-img" id="lbImg" src="" alt="Unknown Face"/>
@@ -1541,10 +1723,7 @@ async function loadFaces(reset = true) {
   }
 }
 
-function loadMore() {
-  page++;
-  loadFaces(false);
-}
+function loadMore() { page++; loadFaces(false); }
 
 async function delFace(id, btn) {
   const card = btn.closest('.face-card');
@@ -1585,7 +1764,7 @@ setInterval(()=>loadFaces(), 20000);
 </html>`;
 }
 
-// ─── RECORDS PAGE HTML ────────────────────────────────────────────────────────
+// ─── RECORDS PAGE HTML ── (with Excel export) ─────────────────────────────────
 function getRecordsHTML() {
   return `<!DOCTYPE html>
 <html lang="en">
@@ -1599,6 +1778,7 @@ function getRecordsHTML() {
   --bg:#ffffff;--surface:#f8f9fa;--card:#ffffff;--border:#dbe3ea;
   --accent:#00adee;--accent2:#00adee;--red:#f87171;--yellow:#fbbf24;
   --purple:#00adee;--orange:#fb923c;--text:#1f2937;--muted:#6b7280;--muted2:#cfd8e3;
+  --green:#34d399;
 }
 *{box-sizing:border-box;margin:0;padding:0}
 body{font-family:'Space Grotesk',sans-serif;background:var(--bg);color:var(--text);min-height:100vh;overflow-x:hidden}
@@ -1628,6 +1808,10 @@ main{position:relative;z-index:1;max-width:1500px;margin:0 auto;padding:20px 16p
 .btn-filter:hover{background:#009ed8;transform:translateY(-1px)}
 .btn-clear{padding:8px 12px;border:1px solid var(--border);border-radius:9px;background:transparent;color:var(--muted);font-family:'Space Grotesk',sans-serif;font-size:0.8rem;cursor:pointer;transition:all 0.18s}
 .btn-clear:hover{border-color:var(--red);color:var(--red)}
+/* Excel Export Button */
+.btn-excel{display:flex;align-items:center;gap:6px;padding:8px 14px;border:1px solid rgba(52,211,153,0.35);border-radius:9px;background:rgba(52,211,153,0.08);color:#059669;font-family:'Space Grotesk',sans-serif;font-size:0.8rem;font-weight:600;cursor:pointer;transition:all 0.18s}
+.btn-excel:hover{background:rgba(52,211,153,0.18);border-color:rgba(52,211,153,0.55);transform:translateY(-1px)}
+.btn-excel:disabled{opacity:0.4;cursor:not-allowed}
 
 .summary-bar{display:grid;grid-template-columns:repeat(6,1fr);gap:10px;margin-bottom:18px}
 @media(max-width:700px){.summary-bar{grid-template-columns:repeat(3,1fr)}}
@@ -1640,6 +1824,7 @@ main{position:relative;z-index:1;max-width:1500px;margin:0 auto;padding:20px 16p
 .table-card{background:var(--card);border:1px solid var(--border);border-radius:16px;overflow:hidden}
 .table-head{display:flex;align-items:center;justify-content:space-between;padding:12px 16px;border-bottom:1px solid var(--border);flex-wrap:wrap;gap:8px}
 .table-head h3{font-family:'JetBrains Mono',monospace;font-size:0.65rem;letter-spacing:1.5px;color:var(--muted);text-transform:uppercase}
+.table-head-right{display:flex;align-items:center;gap:8px;flex-wrap:wrap}
 .cnt-pill{background:rgba(0,173,238,0.1);color:var(--accent);font-size:0.7rem;font-weight:600;padding:3px 10px;border-radius:12px;font-family:'JetBrains Mono',monospace}
 .tbl-wrap{overflow-x:auto;max-height:560px;overflow-y:auto}
 .tbl-wrap::-webkit-scrollbar{width:3px;height:3px}.tbl-wrap::-webkit-scrollbar-thumb{background:var(--muted2);border-radius:2px}
@@ -1736,7 +1921,19 @@ td{padding:9px 12px;font-size:0.8rem;vertical-align:middle;white-space:nowrap}
   <div class="table-card">
     <div class="table-head">
       <h3>📋 Attendance Records</h3>
-      <span class="cnt-pill" id="recCnt">loading...</span>
+      <div class="table-head-right">
+        <span class="cnt-pill" id="recCnt">loading...</span>
+        <!-- ── Excel Export Button ── -->
+        <button class="btn-excel" id="exportBtn" onclick="exportExcel()" disabled>
+          <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2">
+            <path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/>
+            <polyline points="14 2 14 8 20 8"/>
+            <line x1="9" y1="15" x2="15" y2="15"/>
+            <line x1="9" y1="11" x2="15" y2="11"/>
+          </svg>
+          Export Excel
+        </button>
+      </div>
     </div>
     <div class="tbl-wrap">
       <table>
@@ -1760,11 +1957,20 @@ td{padding:9px 12px;font-size:0.8rem;vertical-align:middle;white-space:nowrap}
 </main>
 
 <script>
+/* ── SheetJS from CDN for Excel export ── */
+const sheetScript = document.createElement('script');
+sheetScript.src = 'https://cdnjs.cloudflare.com/ajax/libs/xlsx/0.18.5/xlsx.full.min.js';
+document.head.appendChild(sheetScript);
+
 const statusLabels = {
   present:'✅ Present', late:'⏰ Late', early_leave:'⚠️ Early Leave',
   late_early_leave:'🔴 Late + Early', absent:'❌ Absent'
 };
 function esc(s){return String(s).replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));}
+
+// Store last fetched records for export
+let _lastRecords = [];
+let _lastTotalWork = '';
 
 (function setDefaults(){
   const now=new Date();
@@ -1789,11 +1995,14 @@ async function applyFilters(){
   const name=document.getElementById('fName').value.trim();
   const body=document.getElementById('recBody');
   body.innerHTML='<tr class="loading-row"><td colspan="9">Loading...</td></tr>';
+  document.getElementById('exportBtn').disabled = true;
   const params=new URLSearchParams();
   if(from)params.set('from',from);if(to)params.set('to',to);
   if(status)params.set('status',status);if(dept)params.set('department',dept);if(name)params.set('name',name);
   try{
     const{records=[],total_working='0h 0m',total_working_minutes=0}=await(await fetch('/api/attendance/records?'+params)).json();
+    _lastRecords = records;
+    _lastTotalWork = total_working;
     document.getElementById('recCnt').textContent=records.length+' records';
     const counts={present:0,late:0,early_leave:0,late_early_leave:0,absent:0};
     records.forEach(r=>{if(counts[r.status]!==undefined)counts[r.status]++;});
@@ -1808,6 +2017,7 @@ async function applyFilters(){
       document.getElementById('totalWorkVal').textContent=total_working;
       document.getElementById('totalWorkNote').textContent=from&&to?'Range: '+from+' → '+to:'';
       document.getElementById('totalWorkBar').style.display='flex';
+      document.getElementById('exportBtn').disabled = false;
     }else{document.getElementById('totalWorkBar').style.display='none';}
     if(!records.length){body.innerHTML='<tr><td colspan="9" class="tbl-empty">No records found</td></tr>';return;}
     body.innerHTML=records.map(r=>{
@@ -1834,6 +2044,71 @@ function clearFilters(){
   applyFilters();
 }
 document.getElementById('fName').addEventListener('keydown',e=>{if(e.key==='Enter')applyFilters();});
+
+// ── Excel Export ──────────────────────────────────────────────────────────────
+function exportExcel() {
+  if (!_lastRecords.length) { alert('No records to export.'); return; }
+  if (typeof XLSX === 'undefined') { alert('Excel library not loaded yet. Try again in a moment.'); return; }
+
+  const statusMap = {
+    present:'Present', late:'Late', early_leave:'Early Leave',
+    late_early_leave:'Late + Early Leave', absent:'Absent'
+  };
+
+  // Build worksheet data
+  const wsData = [
+    ['Name','Employee ID','Department','Date','Check In','Check Out','Expected Checkout','Working Hours','Status']
+  ];
+
+  _lastRecords.forEach(r => {
+    wsData.push([
+      r.name,
+      r.employee_id || '',
+      r.department  || '',
+      r.date,
+      r.time_in     || '',
+      r.time_out    || '—',
+      r.expected_checkout || '—',
+      r.working_hours     || '—',
+      statusMap[r.status] || r.status
+    ]);
+  });
+
+  // Summary row at bottom
+  wsData.push([]);
+  wsData.push(['Total Working Hours', _lastTotalWork]);
+
+  const ws = XLSX.utils.aoa_to_sheet(wsData);
+
+  // Column widths
+  ws['!cols'] = [
+    {wch:22},{wch:14},{wch:18},{wch:12},
+    {wch:11},{wch:11},{wch:18},{wch:14},{wch:18}
+  ];
+
+  // Style header row (bold background)
+  const headerRange = XLSX.utils.decode_range(ws['!ref']);
+  for (let C = headerRange.s.c; C <= headerRange.e.c; C++) {
+    const cellAddr = XLSX.utils.encode_cell({r:0, c:C});
+    if (!ws[cellAddr]) continue;
+    ws[cellAddr].s = {
+      font: { bold: true, color: { rgb: 'FFFFFF' } },
+      fill: { patternType: 'solid', fgColor: { rgb: '00ADEE' } },
+      alignment: { horizontal: 'center' }
+    };
+  }
+
+  const wb = XLSX.utils.book_new();
+  XLSX.utils.book_append_sheet(wb, ws, 'Attendance');
+
+  // Filename with date range
+  const from = document.getElementById('fFrom').value || 'all';
+  const to   = document.getElementById('fTo').value   || 'all';
+  const filename = 'attendance_' + from + '_to_' + to + '.xlsx';
+
+  XLSX.writeFile(wb, filename);
+}
+
 applyFilters();
 </script>
 </body>
@@ -1841,6 +2116,35 @@ applyFilters();
 }
 
 // ─── API ROUTES ───────────────────────────────────────────────────────────────
+
+// ── Office Settings API ───────────────────────────────────────────────────────
+app.get('/api/office-settings', (req, res) => {
+  res.json({ ...OFFICE });
+});
+
+app.post('/api/office-settings', async (req, res) => {
+  try {
+    const { start_h, start_m, grace_minutes, end_h, end_m, absent_after_h, absent_after_m } = req.body;
+    const fields = { start_h, start_m, grace_minutes, end_h, end_m, absent_after_h, absent_after_m };
+    for (const [k, v] of Object.entries(fields)) {
+      if (v === undefined || v === null) return res.status(400).json({ error: `Missing field: ${k}` });
+      await dbQuery(
+        'INSERT INTO office_settings (key_name, val) VALUES (?,?) ON DUPLICATE KEY UPDATE val=?, updated_at=NOW()',
+        [k, String(v), String(v)]
+      );
+    }
+    // Update in-memory cache
+    OFFICE.start_h        = parseInt(start_h);
+    OFFICE.start_m        = parseInt(start_m);
+    OFFICE.grace_minutes  = parseInt(grace_minutes);
+    OFFICE.end_h          = parseInt(end_h);
+    OFFICE.end_m          = parseInt(end_m);
+    OFFICE.absent_after_h = parseInt(absent_after_h);
+    OFFICE.absent_after_m = parseInt(absent_after_m);
+    console.log('✅ Office settings updated:', OFFICE);
+    res.json({ success: true, settings: OFFICE });
+  } catch(e) { res.status(500).json({ error: e.message }); }
+});
 
 app.get('/api/faces', async (req, res) => {
   try {
@@ -1878,37 +2182,28 @@ app.delete('/api/faces/:id', async (req, res) => {
   } catch(e) { res.status(500).json({ error: e.message }); }
 });
 
-// ── Force model re-download (called when tensor mismatch detected on client) ──
 app.post('/api/models/refresh', async (req, res) => {
   try {
-    // Delete potentially corrupt model files so they'll be re-downloaded on next setup
     for (const f of MODEL_FILES) {
       const fp = path.join(MODELS_DIR, f);
-      if (fs.existsSync(fp)) {
-        try { fs.unlinkSync(fp); } catch(_) {}
-      }
+      if (fs.existsSync(fp)) { try { fs.unlinkSync(fp); } catch(_) {} }
     }
     console.log('🔄 Model files cleared for re-download');
-    // Re-run setup in background
     setup().catch(e => console.error('Re-setup error:', e));
     res.json({ success: true, message: 'Models queued for re-download. Reload in 60 seconds.' });
   } catch(e) { res.status(500).json({ error: e.message }); }
 });
 
 // ── UNKNOWN FACES API ─────────────────────────────────────────────────────────
-
-// Save unknown face with auto-captured image
 app.post('/api/unknown-faces/save', async (req, res) => {
   try {
-    const { image } = req.body; // base64 JPEG data URL
+    const { image } = req.body;
     const nowIST = new Date(new Date().toLocaleString('en-US', { timeZone: 'Asia/Kolkata' }));
-    const today  = nowIST.toISOString().slice(0, 10).replace('T', ' ').slice(0, 10);
     const dateStr = nowIST.getFullYear() + '-' + String(nowIST.getMonth()+1).padStart(2,'0') + '-' + String(nowIST.getDate()).padStart(2,'0');
     const timeStr = String(nowIST.getHours()).padStart(2,'0') + ':' + String(nowIST.getMinutes()).padStart(2,'0') + ':' + String(nowIST.getSeconds()).padStart(2,'0');
 
     let imageFile = null;
     if (image && image.startsWith('data:image')) {
-      // Save base64 image to disk
       const base64Data = image.replace(/^data:image\/\w+;base64,/, '');
       const filename = `unk_${Date.now()}_${Math.random().toString(36).slice(2,6)}.jpg`;
       const filepath = path.join(UNKNOWN_IMAGES_DIR, filename);
@@ -1928,7 +2223,6 @@ app.post('/api/unknown-faces/save', async (req, res) => {
   }
 });
 
-// Debug: check DB directly
 app.get('/api/unknown-faces/debug', async (req, res) => {
   try {
     const rows = await dbQuery('SELECT id, image_file, date, time_detected, captured_at FROM unknown_faces ORDER BY id DESC LIMIT 20');
@@ -1937,7 +2231,6 @@ app.get('/api/unknown-faces/debug', async (req, res) => {
   } catch(e) { res.status(500).json({ error: e.message }); }
 });
 
-// Get unknown faces list with pagination
 app.get('/api/unknown-faces', async (req, res) => {
   try {
     const { date, limit = 24, offset = 0 } = req.query;
@@ -1947,36 +2240,24 @@ app.get('/api/unknown-faces', async (req, res) => {
     weekStart.setDate(today.getDate() - today.getDay());
     const weekStr = weekStart.getFullYear() + '-' + String(weekStart.getMonth()+1).padStart(2,'0') + '-' + String(weekStart.getDate()).padStart(2,'0');
 
-    // Use DATE(detected_at) as fallback — handles timezone mismatches in date column
     let sql = 'SELECT * FROM unknown_faces';
     const params = [];
-    if (date) {
-      sql += ' WHERE (date = ? OR DATE(captured_at) = ?)';
-      params.push(date, date);
-    }
+    if (date) { sql += ' WHERE (date = ? OR DATE(captured_at) = ?)'; params.push(date, date); }
     sql += ' ORDER BY captured_at DESC LIMIT ? OFFSET ?';
     params.push(parseInt(limit), parseInt(offset));
 
     const faces = await dbQuery(sql, params);
-
     const totalRows = await dbQuery(
       date ? 'SELECT COUNT(*) AS c FROM unknown_faces WHERE (date=? OR DATE(captured_at)=?)' : 'SELECT COUNT(*) AS c FROM unknown_faces',
       date ? [date, date] : []
     );
-    const todayRows = await dbQuery(
-      'SELECT COUNT(*) AS c FROM unknown_faces WHERE (date=? OR DATE(captured_at)=?)',
-      [todayStr, todayStr]
-    );
-    const weekRows = await dbQuery(
-      'SELECT COUNT(*) AS c FROM unknown_faces WHERE (date >= ? OR DATE(captured_at) >= ?)',
-      [weekStr, weekStr]
-    );
+    const todayRows = await dbQuery('SELECT COUNT(*) AS c FROM unknown_faces WHERE (date=? OR DATE(captured_at)=?)', [todayStr, todayStr]);
+    const weekRows  = await dbQuery('SELECT COUNT(*) AS c FROM unknown_faces WHERE (date >= ? OR DATE(captured_at) >= ?)', [weekStr, weekStr]);
 
     res.json({ faces, total: totalRows[0].c, today: todayRows[0].c, week: weekRows[0].c });
   } catch(e) { res.status(500).json({ error: e.message }); }
 });
 
-// Count for nav badge
 app.get('/api/unknown-faces/count', async (req, res) => {
   try {
     const todayIST = new Date(new Date().toLocaleString('en-US', { timeZone: 'Asia/Kolkata' }));
@@ -1986,7 +2267,6 @@ app.get('/api/unknown-faces/count', async (req, res) => {
   } catch(e) { res.status(500).json({ count: 0 }); }
 });
 
-// Delete all unknown faces — MUST be before /:id route so "all" isn't treated as an ID
 app.delete('/api/unknown-faces/all', async (req, res) => {
   try {
     const { date } = req.query;
@@ -1994,19 +2274,13 @@ app.delete('/api/unknown-faces/all', async (req, res) => {
     if (date) {
       rows = await dbQuery('SELECT image_file FROM unknown_faces WHERE date=?', [date]);
       for (const r of rows) {
-        if (r.image_file) {
-          const fp = path.join(UNKNOWN_IMAGES_DIR, r.image_file);
-          try { if (fs.existsSync(fp)) fs.unlinkSync(fp); } catch(_) {}
-        }
+        if (r.image_file) { const fp = path.join(UNKNOWN_IMAGES_DIR, r.image_file); try { if (fs.existsSync(fp)) fs.unlinkSync(fp); } catch(_) {} }
       }
       await dbQuery('DELETE FROM unknown_faces WHERE date=?', [date]);
     } else {
       rows = await dbQuery('SELECT image_file FROM unknown_faces');
       for (const r of rows) {
-        if (r.image_file) {
-          const fp = path.join(UNKNOWN_IMAGES_DIR, r.image_file);
-          try { if (fs.existsSync(fp)) fs.unlinkSync(fp); } catch(_) {}
-        }
+        if (r.image_file) { const fp = path.join(UNKNOWN_IMAGES_DIR, r.image_file); try { if (fs.existsSync(fp)) fs.unlinkSync(fp); } catch(_) {} }
       }
       await dbQuery('DELETE FROM unknown_faces');
     }
@@ -2014,7 +2288,6 @@ app.delete('/api/unknown-faces/all', async (req, res) => {
   } catch(e) { res.status(500).json({ error: e.message }); }
 });
 
-// Delete single unknown face — MUST be after /all route
 app.delete('/api/unknown-faces/:id', async (req, res) => {
   try {
     const rows = await dbQuery('SELECT image_file FROM unknown_faces WHERE id=?', [parseInt(req.params.id)]);
@@ -2053,6 +2326,8 @@ app.post('/api/attendance/mark', async (req, res) => {
     const today    = nowIST.getFullYear() + '-' + String(nowIST.getMonth()+1).padStart(2,'0') + '-' + String(nowIST.getDate()).padStart(2,'0');
     const timeStr  = String(nowIST.getHours()).padStart(2,'0') + ':' + String(nowIST.getMinutes()).padStart(2,'0') + ':' + String(nowIST.getSeconds()).padStart(2,'0');
     const totalMin = nowIST.getHours() * 60 + nowIST.getMinutes();
+
+    const { LATE_AFTER, ABSENT_AFTER_MIN } = calcDerivedTimes();
 
     let status = 'present';
     if (totalMin >= ABSENT_AFTER_MIN) {
@@ -2111,6 +2386,8 @@ app.post('/api/attendance/checkout', async (req, res) => {
     const today    = nowIST.getFullYear() + '-' + String(nowIST.getMonth()+1).padStart(2,'0') + '-' + String(nowIST.getDate()).padStart(2,'0');
     const timeStr  = String(nowIST.getHours()).padStart(2,'0') + ':' + String(nowIST.getMinutes()).padStart(2,'0') + ':' + String(nowIST.getSeconds()).padStart(2,'0');
     const totalMin = nowIST.getHours() * 60 + nowIST.getMinutes();
+
+    const { CHECKOUT_FROM } = calcDerivedTimes();
     const isEarly  = totalMin < CHECKOUT_FROM;
 
     const existing = await dbQuery(
@@ -2287,9 +2564,7 @@ setup().then(() => {
     console.log('📊  Records       → http://localhost:' + PORT + '/records');
     console.log('👤  Register      → http://localhost:' + PORT + '/register');
     console.log('❓  Unknown Faces → http://localhost:' + PORT + '/unknown-faces');
-    console.log('⏰  Office: ' + OFFICE_START.h + ':' + String(OFFICE_START.m).padStart(2,'0') +
-      ' AM  |  Grace: +' + GRACE_MINUTES + ' min  |  End: ' + OFFICE_END.h + ':' + String(OFFICE_END.m).padStart(2,'0') +
-      '  |  Absent after: ' + ABSENT_AFTER.h + ':00 AM');
+    console.log('⚙️   Office settings stored in DB (office_settings table)');
     console.log('==========================================\n');
   });
 });
