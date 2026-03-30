@@ -7,8 +7,6 @@
  *  - No separate Users tab (removed)
  *  - After user login, auto-show notification permission modal after 5 seconds
  *  - Portal page redesigned (same #00adee accent)
- *
- * Install:  npm install express mysql2 bcryptjs jsonwebtoken web-push
  */
 
 'use strict';
