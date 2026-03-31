@@ -1,3 +1,18 @@
+/**
+ * FaceAttend SaaS — Multi-tenant Face Recognition Attendance
+ * Roles: super_admin | admin (tenant) | user (employee)
+ *
+ * Changes v3 → v4:
+ *  - Multi-shift attendance: select one / multiple / all pending shifts per scan
+ *  - Duplicate scan prevention per shift per day
+ *  - Admin: export attendance (CSV/Excel)
+ *  - Admin: user management tab (view/delete users)
+ *  - Notification subscription fix (service worker registration order)
+ *  - Scan result label always shown
+ *  - Improved UI mobile responsiveness across all pages
+ *  - Attendance table updated: UNIQUE KEY now per face+date+shift combo
+ */
+
 'use strict';
 
 const express   = require('express');
@@ -209,7 +224,6 @@ async function initTables() {
       status ENUM('present','absent') DEFAULT 'present',
       notification_sent TINYINT(1) DEFAULT 0,
       created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-      UNIQUE KEY uq_face_date (face_id, date),
       FOREIGN KEY (admin_id) REFERENCES admins(id) ON DELETE CASCADE,
       FOREIGN KEY (face_id) REFERENCES faces(id) ON DELETE CASCADE,
       FOREIGN KEY (shift_id) REFERENCES shifts(id) ON DELETE SET NULL
@@ -251,6 +265,15 @@ async function initTables() {
   try {
     await dbQuery(sql);
     console.log('✅ All tables ready');
+    // Run ALTER commands to support multi-shift per day (drop old unique, add new)
+    try {
+      await dbQuery('ALTER TABLE attendance DROP INDEX uq_face_date');
+      console.log('✅ Dropped old uq_face_date index');
+    } catch(e) { /* already dropped or never existed */ }
+    try {
+      await dbQuery('ALTER TABLE attendance ADD UNIQUE KEY uq_face_date_shift (face_id, date, shift_id)');
+      console.log('✅ Added uq_face_date_shift index');
+    } catch(e) { /* already exists */ }
   } catch(e) {
     if (!e.message.includes('already exists')) console.warn('DB init warning:', e.message);
   }
@@ -327,12 +350,12 @@ const SHARED_CSS = `
 *{box-sizing:border-box;margin:0;padding:0}
 body{font-family:'Space Grotesk',sans-serif;background:var(--bg);color:var(--text);min-height:100vh;overflow-x:hidden}
 body::before{content:'';position:fixed;inset:0;background:radial-gradient(ellipse 80% 50% at 50% -10%,rgba(0,173,238,0.08),transparent);pointer-events:none;z-index:0}
-nav{position:sticky;top:0;z-index:100;background:rgba(255,255,255,0.96);backdrop-filter:blur(20px);border-bottom:1px solid var(--border);display:flex;align-items:center;justify-content:space-between;padding:0 20px;height:62px}
-.nav-logo{display:flex;align-items:center;gap:10px;font-family:'JetBrains Mono',monospace;font-size:0.9rem;font-weight:600;color:var(--text);text-decoration:none}
+nav{position:sticky;top:0;z-index:100;background:rgba(255,255,255,0.96);backdrop-filter:blur(20px);border-bottom:1px solid var(--border);display:flex;align-items:center;justify-content:space-between;padding:0 16px;height:58px;gap:10px}
+.nav-logo{display:flex;align-items:center;gap:8px;font-family:'JetBrains Mono',monospace;font-size:0.88rem;font-weight:600;color:var(--text);text-decoration:none;flex-shrink:0}
 .nav-logo span{color:var(--accent)}
-.nav-logo img{height:36px;border-radius:6px;object-fit:contain}
-.nav-right{display:flex;align-items:center;gap:10px}
-.badge{padding:3px 10px;border-radius:20px;font-size:0.65rem;font-weight:700;letter-spacing:0.5px;text-transform:uppercase}
+.nav-logo img{height:32px;border-radius:6px;object-fit:contain}
+.nav-right{display:flex;align-items:center;gap:8px;flex-wrap:wrap}
+.badge{padding:3px 10px;border-radius:20px;font-size:0.62rem;font-weight:700;letter-spacing:0.5px;text-transform:uppercase;white-space:nowrap}
 .badge-sa{background:rgba(167,139,250,0.15);color:#7c3aed}
 .badge-admin{background:rgba(0,173,238,0.12);color:var(--accent)}
 .badge-user{background:rgba(52,211,153,0.15);color:#059669}
@@ -346,83 +369,115 @@ nav{position:sticky;top:0;z-index:100;background:rgba(255,255,255,0.96);backdrop
 .btn-success{background:rgba(52,211,153,0.1);border:1px solid rgba(52,211,153,0.3);color:#059669}
 .btn-success:hover{background:rgba(52,211,153,0.2)}
 .btn-sm{padding:5px 10px;font-size:0.72rem}
-main{max-width:1100px;margin:0 auto;padding:24px 16px;position:relative;z-index:1}
-.page-title{font-family:'JetBrains Mono',monospace;font-size:0.65rem;color:var(--muted);letter-spacing:2px;text-transform:uppercase;margin-bottom:18px}
-.card{background:var(--card);border:1px solid var(--border);border-radius:16px;padding:20px}
-.card-sm{padding:14px}
+main{max-width:1100px;margin:0 auto;padding:20px 14px;position:relative;z-index:1}
+.page-title{font-family:'JetBrains Mono',monospace;font-size:0.62rem;color:var(--muted);letter-spacing:2px;text-transform:uppercase;margin-bottom:16px}
+.card{background:var(--card);border:1px solid var(--border);border-radius:16px;padding:18px}
+.card-sm{padding:12px}
 .grid2{display:grid;grid-template-columns:1fr 1fr;gap:14px}
 .grid3{display:grid;grid-template-columns:repeat(3,1fr);gap:14px}
 .grid4{display:grid;grid-template-columns:repeat(4,1fr);gap:14px}
-.stat{background:var(--card);border:1px solid var(--border);border-radius:14px;padding:14px}
-.stat-val{font-family:'JetBrains Mono',monospace;font-size:1.6rem;font-weight:600;color:var(--accent);line-height:1}
+.stat{background:var(--card);border:1px solid var(--border);border-radius:14px;padding:14px 10px}
+.stat-val{font-family:'JetBrains Mono',monospace;font-size:1.5rem;font-weight:600;color:var(--accent);line-height:1}
 .stat-val.green{color:var(--green)}.stat-val.red{color:var(--red)}.stat-val.yellow{color:var(--yellow)}
-.stat-label{font-size:0.62rem;color:var(--muted);text-transform:uppercase;letter-spacing:1px;margin-top:5px}
+.stat-label{font-size:0.6rem;color:var(--muted);text-transform:uppercase;letter-spacing:1px;margin-top:4px}
 .form-group{margin-bottom:14px}
-.form-group label{display:block;font-size:0.7rem;color:var(--muted);text-transform:uppercase;letter-spacing:0.8px;margin-bottom:6px}
-.form-control{width:100%;background:var(--surface);border:1px solid var(--border);border-radius:9px;padding:9px 12px;color:var(--text);font-family:'Space Grotesk',sans-serif;font-size:0.85rem;outline:none;transition:border-color 0.2s}
+.form-group label{display:block;font-size:0.68rem;color:var(--muted);text-transform:uppercase;letter-spacing:0.8px;margin-bottom:5px}
+.form-control{width:100%;background:var(--surface);border:1px solid var(--border);border-radius:9px;padding:9px 12px;color:var(--text);font-family:'Space Grotesk',sans-serif;font-size:0.84rem;outline:none;transition:border-color 0.2s}
 .form-control:focus{border-color:var(--accent)}
 select.form-control{cursor:pointer}
-.alert{padding:10px 14px;border-radius:10px;font-size:0.82rem;margin-bottom:14px}
+.alert{padding:10px 14px;border-radius:10px;font-size:0.8rem;margin-bottom:12px}
 .alert-error{background:rgba(248,113,113,0.1);border:1px solid rgba(248,113,113,0.25);color:#dc2626}
 .alert-success{background:rgba(52,211,153,0.1);border:1px solid rgba(52,211,153,0.25);color:#059669}
 .alert-warn{background:rgba(251,191,36,0.1);border:1px solid rgba(251,191,36,0.25);color:#92400e}
 .alert-info{background:rgba(0,173,238,0.08);border:1px solid rgba(0,173,238,0.2);color:var(--accent)}
-table{width:100%;border-collapse:collapse;font-size:0.82rem}
-th{font-size:0.65rem;color:var(--muted);text-transform:uppercase;letter-spacing:0.8px;padding:8px 12px;text-align:left;border-bottom:1px solid var(--border)}
-td{padding:10px 12px;border-bottom:1px solid var(--surface);color:var(--text)}
+table{width:100%;border-collapse:collapse;font-size:0.8rem}
+th{font-size:0.62rem;color:var(--muted);text-transform:uppercase;letter-spacing:0.8px;padding:8px 10px;text-align:left;border-bottom:1px solid var(--border)}
+td{padding:9px 10px;border-bottom:1px solid var(--surface);color:var(--text);vertical-align:top}
 tr:last-child td{border-bottom:none}
 tr:hover td{background:var(--surface)}
-.chip{display:inline-block;padding:2px 8px;border-radius:20px;font-size:0.65rem;font-weight:600}
+.chip{display:inline-block;padding:2px 8px;border-radius:20px;font-size:0.62rem;font-weight:600}
 .chip-green{background:rgba(52,211,153,0.12);color:#059669}
 .chip-red{background:rgba(248,113,113,0.12);color:#dc2626}
 .chip-yellow{background:rgba(251,191,36,0.12);color:#92400e}
 .chip-blue{background:rgba(0,173,238,0.1);color:var(--accent)}
 .chip-gray{background:rgba(107,114,128,0.1);color:var(--muted)}
 .chip-purple{background:rgba(167,139,250,0.12);color:#7c3aed}
-.modal-backdrop{position:fixed;inset:0;background:rgba(0,0,0,0.45);z-index:800;display:none;align-items:center;justify-content:center;padding:16px}
+.modal-backdrop{position:fixed;inset:0;background:rgba(0,0,0,0.45);z-index:800;display:none;align-items:center;justify-content:center;padding:14px}
 .modal-backdrop.open{display:flex}
-.modal{background:var(--card);border:1px solid var(--border);border-radius:18px;padding:24px;width:100%;max-width:480px;box-shadow:0 20px 60px rgba(0,0,0,0.12)}
-.modal-title{font-family:'JetBrains Mono',monospace;font-size:0.65rem;letter-spacing:2px;color:var(--muted);text-transform:uppercase;margin-bottom:18px;display:flex;align-items:center;justify-content:space-between}
+.modal{background:var(--card);border:1px solid var(--border);border-radius:18px;padding:22px;width:100%;max-width:480px;box-shadow:0 20px 60px rgba(0,0,0,0.12);max-height:90vh;overflow-y:auto}
+.modal-title{font-family:'JetBrains Mono',monospace;font-size:0.62rem;letter-spacing:2px;color:var(--muted);text-transform:uppercase;margin-bottom:16px;display:flex;align-items:center;justify-content:space-between}
 .modal-close{background:none;border:none;cursor:pointer;color:var(--muted);font-size:1.2rem;line-height:1}
 .modal-close:hover{color:var(--red)}
-.tabs{display:flex;gap:4px;background:var(--surface);border-radius:10px;padding:4px;margin-bottom:18px}
-.tab{flex:1;text-align:center;padding:7px 10px;border-radius:8px;font-size:0.78rem;font-weight:600;cursor:pointer;border:none;background:transparent;color:var(--muted);transition:all 0.2s}
+.tabs{display:flex;gap:3px;background:var(--surface);border-radius:10px;padding:4px;margin-bottom:16px;overflow-x:auto}
+.tab{flex:1;text-align:center;padding:7px 8px;border-radius:8px;font-size:0.75rem;font-weight:600;cursor:pointer;border:none;background:transparent;color:var(--muted);transition:all 0.2s;white-space:nowrap;min-width:70px}
 .tab.active{background:var(--card);color:var(--accent);box-shadow:0 1px 4px rgba(0,0,0,0.08)}
 .cal-grid{display:grid;grid-template-columns:repeat(7,1fr);gap:3px}
-.cal-head{font-size:0.65rem;color:var(--muted);text-align:center;padding:4px;font-weight:600}
-.cal-day{min-height:56px;border:1px solid var(--border);border-radius:8px;padding:4px;font-size:0.7rem;cursor:pointer;transition:border-color 0.2s;position:relative;display:flex;flex-direction:column}
+.cal-head{font-size:0.6rem;color:var(--muted);text-align:center;padding:4px;font-weight:600}
+.cal-day{min-height:52px;border:1px solid var(--border);border-radius:8px;padding:4px;font-size:0.68rem;cursor:pointer;transition:border-color 0.2s;position:relative;display:flex;flex-direction:column}
 .cal-day:hover{border-color:var(--accent)}
 .cal-day.today{border-color:var(--accent);background:rgba(0,173,238,0.04)}
 .cal-day.holiday{background:rgba(251,191,36,0.08);border-color:var(--yellow)}
 .cal-day.other-month{opacity:0.35}
-.cal-day-num{font-family:'JetBrains Mono',monospace;font-size:0.72rem;font-weight:600;color:var(--text)}
+.cal-day-num{font-family:'JetBrains Mono',monospace;font-size:0.7rem;font-weight:600;color:var(--text)}
 .cal-day.holiday .cal-day-num{color:#92400e}
 .cal-day.today .cal-day-num{color:var(--accent)}
-.cal-event{font-size:0.58rem;border-radius:4px;padding:1px 4px;margin-top:2px;font-weight:600;display:block}
+.cal-event{font-size:0.56rem;border-radius:4px;padding:1px 4px;margin-top:2px;font-weight:600;display:block}
 .cal-present{background:rgba(52,211,153,0.2);color:#059669}
 .cal-absent{background:rgba(248,113,113,0.2);color:#dc2626}
 .cal-holiday-tag{background:rgba(251,191,36,0.25);color:#92400e}
 .cam-card{background:var(--card);border:1px solid var(--border);border-radius:16px;overflow:hidden}
-.cam-wrap{position:relative;background:#f8f9fa;aspect-ratio:4/3}
+.cam-wrap{position:relative;background:#f0f4f8;aspect-ratio:4/3}
 .cam-wrap video,.cam-wrap canvas{position:absolute;inset:0;width:100%;height:100%;object-fit:cover}
 .scan-line{position:absolute;left:0;right:0;height:2px;background:linear-gradient(90deg,transparent,var(--accent),transparent);animation:scan 3s ease-in-out infinite;opacity:0.4;pointer-events:none}
 @keyframes scan{0%{top:0}50%{top:calc(100% - 2px)}100%{top:0}}
 .cam-controls{padding:10px 12px;background:var(--surface);display:flex;gap:6px;align-items:center;flex-wrap:wrap}
 .btn-checkin{background:var(--accent);color:#fff}.btn-checkin:hover:not(:disabled){background:#009ed8;transform:translateY(-1px)}
-.btn-checkin:disabled,.btn-checkout:disabled{opacity:0.5;cursor:not-allowed}
+.btn-checkin:disabled{opacity:0.5;cursor:not-allowed}
 @keyframes livepulse{0%,100%{opacity:1}50%{opacity:0.4}}
 .live-dot{width:8px;height:8px;border-radius:50%;background:var(--accent);animation:livepulse 2s infinite;flex-shrink:0}
-.result-card{background:var(--card);border:1px solid var(--border);border-radius:16px;padding:18px}
-.result-title{font-family:'JetBrains Mono',monospace;font-size:0.62rem;letter-spacing:2px;color:var(--muted);text-transform:uppercase;margin-bottom:12px}
+.result-card{background:var(--card);border:1px solid var(--border);border-radius:16px;padding:16px}
+.result-title{font-family:'JetBrains Mono',monospace;font-size:0.6rem;letter-spacing:2px;color:var(--muted);text-transform:uppercase;margin-bottom:10px}
 .logo-preview{max-height:60px;max-width:150px;border-radius:8px;object-fit:contain;border:1px solid var(--border)}
-.notif-modal-icon{width:64px;height:64px;border-radius:50%;background:rgba(0,173,238,0.1);display:flex;align-items:center;justify-content:center;font-size:2rem;margin:0 auto 16px}
+.notif-modal-icon{width:60px;height:60px;border-radius:50%;background:rgba(0,173,238,0.1);display:flex;align-items:center;justify-content:center;font-size:1.8rem;margin:0 auto 14px}
 .switch{position:relative;display:inline-block;width:42px;height:24px}
 .switch input{opacity:0;width:0;height:0}
 .slider{position:absolute;cursor:pointer;inset:0;background:#ccc;border-radius:24px;transition:0.3s}
 .slider:before{content:'';position:absolute;width:18px;height:18px;left:3px;bottom:3px;background:white;border-radius:50%;transition:0.3s}
 input:checked+.slider{background:var(--accent)}
 input:checked+.slider:before{transform:translateX(18px)}
-@media(max-width:640px){.grid2,.grid3,.grid4{grid-template-columns:1fr}.cal-grid{gap:2px}.cal-day{min-height:44px}}
+/* Shift multiselect */
+.shift-select-box{border:1px solid var(--border);border-radius:10px;max-height:160px;overflow-y:auto;background:var(--surface)}
+.shift-select-item{display:flex;align-items:center;gap:10px;padding:8px 12px;cursor:pointer;transition:background 0.15s;border-bottom:1px solid var(--border);font-size:0.82rem}
+.shift-select-item:last-child{border-bottom:none}
+.shift-select-item:hover{background:rgba(0,173,238,0.06)}
+.shift-select-item input[type=checkbox]{accent-color:var(--accent);width:15px;height:15px;flex-shrink:0}
+.shift-select-item.already-done{opacity:0.45;pointer-events:none}
+.shift-select-item .shift-badge{font-size:0.62rem;padding:2px 7px;border-radius:20px;background:rgba(0,173,238,0.1);color:var(--accent);font-weight:600;white-space:nowrap}
+.shift-select-item .done-badge{font-size:0.62rem;padding:2px 7px;border-radius:20px;background:rgba(52,211,153,0.12);color:#059669;font-weight:600}
+/* Table responsive */
+.table-wrap{overflow-x:auto;-webkit-overflow-scrolling:touch}
+/* Mobile improvements */
+@media(max-width:768px){
+  .grid2,.grid3,.grid4{grid-template-columns:1fr}
+  .cal-grid{gap:2px}
+  .cal-day{min-height:40px}
+  .cal-event{font-size:0.5rem;padding:1px 2px}
+  main{padding:14px 10px}
+  nav{padding:0 12px;height:54px}
+  .tabs{gap:2px}
+  .tab{font-size:0.7rem;padding:6px 6px;min-width:58px}
+  .stat-val{font-size:1.3rem}
+  th,td{padding:7px 8px;font-size:0.75rem}
+  .modal{padding:16px}
+  .btn{padding:7px 12px;font-size:0.76rem}
+}
+@media(max-width:480px){
+  .cal-head{font-size:0.52rem}
+  .cal-day{min-height:34px}
+  .cam-controls{flex-wrap:wrap;gap:5px}
+  .grid2{gap:10px}
+  .nav-right .badge{display:none}
+}
 </style>`;
 
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -525,7 +580,7 @@ app.delete('/api/admin/shifts/:id', authMiddleware('admin'), async (req, res) =>
   res.json({ ok: true });
 });
 
-// ── Faces (now creates user account too) ──────────────────────────────────────
+// ── Faces ─────────────────────────────────────────────────────────────────────
 app.get('/api/admin/faces', authMiddleware('admin'), async (req, res) => {
   const rows = await dbQuery(
     `SELECT f.*,s.name as shift_name,
@@ -540,7 +595,6 @@ app.get('/api/admin/faces', authMiddleware('admin'), async (req, res) => {
   res.json(rows.map(r => ({ ...r, descriptor: JSON.parse(r.descriptor) })));
 });
 
-// POST /api/admin/faces — register face AND create/update user account
 app.post('/api/admin/faces', authMiddleware('admin'), async (req, res) => {
   const { label, employee_id, department, shift_id, user_email, user_password, descriptors, accuracy } = req.body;
   if (!label||!descriptors?.length) return res.json({ error: 'Label and descriptors required' });
@@ -548,10 +602,7 @@ app.post('/api/admin/faces', authMiddleware('admin'), async (req, res) => {
   if (!user_password || user_password.length < 6) return res.json({ error: 'Password must be at least 6 characters' });
 
   try {
-    // Average descriptor across samples
     const avg = descriptors[0].map((_, i) => descriptors.reduce((s, d) => s + d[i], 0) / descriptors.length);
-
-    // Upsert face
     const r = await dbQuery(
       `INSERT INTO faces (admin_id,label,employee_id,department,shift_id,user_email,descriptor,registration_accuracy)
        VALUES (?,?,?,?,?,?,?,?)
@@ -567,13 +618,11 @@ app.post('/api/admin/faces', authMiddleware('admin'), async (req, res) => {
       'SELECT id FROM faces WHERE admin_id=? AND label=?', [req.user.id, label]
     ))[0]?.id;
 
-    // Create or update user account
     const hash = await bcrypt.hash(user_password, 12);
     const existingUser = await dbQuery(
       'SELECT id FROM users WHERE email=? AND admin_id=?', [user_email, req.user.id]
     );
     if (existingUser.length) {
-      // Update existing user — link face, update password
       await dbQuery(
         'UPDATE users SET face_id=?, name=?, password=? WHERE email=? AND admin_id=?',
         [faceId, label, hash, user_email, req.user.id]
@@ -585,9 +634,7 @@ app.post('/api/admin/faces', authMiddleware('admin'), async (req, res) => {
       );
     }
 
-    // Also back-link face → user
     await dbQuery('UPDATE faces SET user_email=? WHERE id=?', [user_email, faceId]);
-
     res.json({ ok: true });
   } catch(e) {
     if (e.code === 'ER_DUP_ENTRY') return res.json({ error: 'A person with this name or email already exists' });
@@ -596,12 +643,40 @@ app.post('/api/admin/faces', authMiddleware('admin'), async (req, res) => {
 });
 
 app.delete('/api/admin/faces/:id', authMiddleware('admin'), async (req, res) => {
-  // Also delete linked user
   const face = await dbQuery('SELECT user_email FROM faces WHERE id=? AND admin_id=?', [req.params.id, req.user.id]);
   if (face.length && face[0].user_email) {
     await dbQuery('DELETE FROM users WHERE email=? AND admin_id=?', [face[0].user_email, req.user.id]);
   }
   await dbQuery('DELETE FROM faces WHERE id=? AND admin_id=?', [req.params.id, req.user.id]);
+  res.json({ ok: true });
+});
+
+// ── Users management (admin) ──────────────────────────────────────────────────
+app.get('/api/admin/users', authMiddleware('admin'), async (req, res) => {
+  const rows = await dbQuery(
+    `SELECT u.id, u.name, u.email, u.notifications_enabled, u.created_at,
+       f.label as face_label, f.employee_id, f.department, s.name as shift_name
+     FROM users u
+     LEFT JOIN faces f ON f.id=u.face_id
+     LEFT JOIN shifts s ON s.id=f.shift_id
+     WHERE u.admin_id=? ORDER BY u.name`,
+    [req.user.id]
+  );
+  res.json(rows);
+});
+
+app.delete('/api/admin/users/:id', authMiddleware('admin'), async (req, res) => {
+  // Unlink face first, then delete user
+  await dbQuery('UPDATE faces SET user_email=NULL WHERE user_email=(SELECT email FROM users WHERE id=? AND admin_id=?)', [req.params.id, req.user.id]);
+  await dbQuery('DELETE FROM users WHERE id=? AND admin_id=?', [req.params.id, req.user.id]);
+  res.json({ ok: true });
+});
+
+app.put('/api/admin/users/:id/reset-password', authMiddleware('admin'), async (req, res) => {
+  const { password } = req.body;
+  if (!password || password.length < 6) return res.json({ error: 'Password min 6 chars' });
+  const hash = await bcrypt.hash(password, 12);
+  await dbQuery('UPDATE users SET password=? WHERE id=? AND admin_id=?', [hash, req.params.id, req.user.id]);
   res.json({ ok: true });
 });
 
@@ -621,6 +696,34 @@ app.get('/api/admin/attendance', authMiddleware('admin'), async (req, res) => {
     params
   );
   res.json(rows);
+});
+
+// ── Export attendance CSV ─────────────────────────────────────────────────────
+app.get('/api/admin/attendance/export', authMiddleware('admin'), async (req, res) => {
+  const { month, year, format } = req.query;
+  let where = 'a.admin_id=?', params = [req.user.id];
+  if (month && year) {
+    where += ' AND MONTH(a.date)=? AND YEAR(a.date)=?';
+    params.push(parseInt(month), parseInt(year));
+  }
+  const rows = await dbQuery(
+    `SELECT a.name, a.date, a.time_in, a.time_out, a.status, s.name as shift_name, a.face_id
+     FROM attendance a
+     LEFT JOIN shifts s ON s.id=a.shift_id
+     WHERE ${where} ORDER BY a.date DESC, a.name`,
+    params
+  );
+
+  const headers = ['Name','Date','Shift','Time In','Time Out','Status'];
+  const csvRows = rows.map(r => [
+    r.name, r.date, r.shift_name||'', r.time_in||'', r.time_out||'', r.status
+  ].map(v => `"${String(v).replace(/"/g,'""')}"`).join(','));
+
+  const csv = [headers.join(','), ...csvRows].join('\n');
+  const filename = `attendance_${month||'all'}_${year||new Date().getFullYear()}.csv`;
+  res.setHeader('Content-Type', 'text/csv');
+  res.setHeader('Content-Disposition', `attachment; filename="${filename}"`);
+  res.send(csv);
 });
 
 app.get('/api/admin/calendar', authMiddleware('admin'), async (req, res) => {
@@ -655,7 +758,7 @@ app.delete('/api/admin/holidays/:date', authMiddleware('admin'), async (req, res
   res.json({ ok: true });
 });
 
-// ── Scan ──────────────────────────────────────────────────────────────────────
+// ── Scan — returns matched face + pending shifts ──────────────────────────────
 app.post('/api/admin/scan', authMiddleware('admin'), async (req, res) => {
   const { descriptor: inDesc, mode } = req.body;
   if (!inDesc?.length) return res.json({ event: 'error', message: 'No descriptor' });
@@ -679,39 +782,97 @@ app.post('/api/admin/scan', authMiddleware('admin'), async (req, res) => {
   const now = new Date();
   const dateStr = now.toISOString().split('T')[0];
   const timeStr = pad2(now.getHours())+':'+pad2(now.getMinutes())+':'+pad2(now.getSeconds());
-  const shiftRow = best.shift_id ? (await dbQuery('SELECT * FROM shifts WHERE id=?', [best.shift_id]))[0] : null;
-  const existing = await dbQuery('SELECT * FROM attendance WHERE face_id=? AND date=?', [best.id, dateStr]);
+
+  // Get all shifts for this admin
+  const allShifts = await dbQuery('SELECT * FROM shifts WHERE admin_id=? ORDER BY start_time', [adminId]);
+
+  // Get today's attendance for this face (all shifts)
+  const todayAtt = await dbQuery(
+    'SELECT * FROM attendance WHERE face_id=? AND date=?', [best.id, dateStr]
+  );
+  const markedShiftIds = todayAtt.map(a => a.shift_id);
+
+  // Pending shifts = shifts not yet marked today
+  const pendingShifts = allShifts.filter(s => !markedShiftIds.includes(s.id));
+
+  // Also check if there's a "no-shift" attendance (shift_id IS NULL)
+  const hasNoShiftAttendance = todayAtt.some(a => a.shift_id === null);
 
   if (mode === 'checkout') {
-    if (!existing.length) return res.json({ event: 'not_checked_in', name: best.label });
-    if (existing[0].time_out) return res.json({ event: 'already_checked_out', name: best.label, time_out: existing[0].time_out });
-    await dbQuery('UPDATE attendance SET time_out=? WHERE id=?', [timeStr, existing[0].id]);
+    // Checkout: update time_out for latest check-in without time_out
+    const openAtt = todayAtt.filter(a => !a.time_out);
+    if (!openAtt.length) return res.json({ event: 'not_checked_in', name: best.label });
+    // Update all open attendances (or just the first one)
+    await dbQuery('UPDATE attendance SET time_out=? WHERE id=?', [timeStr, openAtt[0].id]);
     if (best.user_email) {
       const user = await dbQuery('SELECT id FROM users WHERE email=? AND admin_id=?', [best.user_email, adminId]);
       if (user.length) await sendPushToUser(user[0].id, '👋 Checked Out', `${best.label}, you checked out at ${fmtTime(timeStr)}`, adminId);
     }
-    return res.json({ event: 'checkout', name: best.label, time_out: timeStr, shift: shiftRow?.name });
+    return res.json({ event: 'checkout', name: best.label, time_out: timeStr });
   }
 
-  if (existing.length) {
-    return res.json({ event: 'already_checked_in', name: best.label, time_in: existing[0].time_in });
-  }
+  // Return face info + pending shifts for the frontend to display multiselect
+  return res.json({
+    event: 'face_identified',
+    name: best.label,
+    face_id: best.id,
+    user_email: best.user_email,
+    distance: bestDist,
+    pending_shifts: pendingShifts,
+    all_shifts: allShifts,
+    marked_shift_ids: markedShiftIds,
+    has_no_shift_attendance: hasNoShiftAttendance,
+    today_attendance: todayAtt
+  });
+});
 
-  const r = await dbQuery(
-    'INSERT INTO attendance (admin_id,face_id,shift_id,name,date,time_in,status) VALUES (?,?,?,?,?,?,?)',
-    [adminId, best.id, best.shift_id||null, best.label, dateStr, timeStr, 'present']
-  );
+// ── Mark attendance for selected shifts (after face scan) ─────────────────────
+app.post('/api/admin/mark-attendance', authMiddleware('admin'), async (req, res) => {
+  const { face_id, shift_ids } = req.body; // shift_ids: array, empty = no-shift mark
+  if (!face_id) return res.json({ error: 'face_id required' });
 
-  if (best.user_email) {
-    const user = await dbQuery('SELECT id FROM users WHERE email=? AND admin_id=?', [best.user_email, adminId]);
-    if (user.length) {
-      const shiftInfo = shiftRow ? ` (${shiftRow.name} shift)` : '';
-      await sendPushToUser(user[0].id, '✅ Attendance Marked', `${best.label}, your attendance was recorded at ${fmtTime(timeStr)}${shiftInfo}`, adminId);
-      await dbQuery('UPDATE attendance SET notification_sent=1 WHERE id=?', [r.insertId]);
+  const adminId = req.user.id;
+  const now = new Date();
+  const dateStr = now.toISOString().split('T')[0];
+  const timeStr = pad2(now.getHours())+':'+pad2(now.getMinutes())+':'+pad2(now.getSeconds());
+
+  const face = await dbQuery('SELECT * FROM faces WHERE id=? AND admin_id=?', [face_id, adminId]);
+  if (!face.length) return res.json({ error: 'Face not found' });
+  const f = face[0];
+
+  const results = [];
+  const shiftsToMark = (shift_ids && shift_ids.length > 0) ? shift_ids : [null];
+
+  for (const shiftId of shiftsToMark) {
+    // Check duplicate
+    const existing = await dbQuery(
+      'SELECT id FROM attendance WHERE face_id=? AND date=? AND (shift_id=? OR (shift_id IS NULL AND ? IS NULL))',
+      [face_id, dateStr, shiftId, shiftId]
+    );
+    if (existing.length) {
+      results.push({ shift_id: shiftId, skipped: true, reason: 'Already marked' });
+      continue;
     }
+
+    const shiftRow = shiftId ? (await dbQuery('SELECT * FROM shifts WHERE id=?', [shiftId]))[0] : null;
+
+    const r = await dbQuery(
+      'INSERT INTO attendance (admin_id,face_id,shift_id,name,date,time_in,status) VALUES (?,?,?,?,?,?,?)',
+      [adminId, face_id, shiftId||null, f.label, dateStr, timeStr, 'present']
+    );
+
+    if (f.user_email) {
+      const user = await dbQuery('SELECT id FROM users WHERE email=? AND admin_id=?', [f.user_email, adminId]);
+      if (user.length) {
+        const shiftInfo = shiftRow ? ` (${shiftRow.name} shift)` : '';
+        await sendPushToUser(user[0].id, '✅ Attendance Marked', `${f.label}, your attendance was recorded at ${fmtTime(timeStr)}${shiftInfo}`, adminId);
+        await dbQuery('UPDATE attendance SET notification_sent=1 WHERE id=?', [r.insertId]);
+      }
+    }
+    results.push({ shift_id: shiftId, shift_name: shiftRow?.name||null, time_in: timeStr, ok: true });
   }
 
-  res.json({ event: 'checkin', name: best.label, time_in: timeStr, status: 'present', shift: shiftRow?.name, distance: bestDist });
+  res.json({ event: 'marked', name: f.label, results, time_in: timeStr });
 });
 
 app.post('/api/admin/unknown-face', authMiddleware('admin'), async (req, res) => {
@@ -755,6 +916,7 @@ app.post('/api/user/login', async (req, res) => {
 
 app.post('/api/user/push-subscribe', authMiddleware('user'), async (req, res) => {
   const { subscription } = req.body;
+  if (!subscription) return res.json({ error: 'No subscription data' });
   await dbQuery(
     'UPDATE users SET push_subscription=?, notifications_enabled=1 WHERE id=? AND admin_id=?',
     [JSON.stringify(subscription), req.user.id, req.user.admin_id]
@@ -783,7 +945,7 @@ app.get('/api/user/attendance', authMiddleware('user'), async (req, res) => {
        FROM attendance a
        JOIN faces f ON f.id=a.face_id
        LEFT JOIN shifts s ON s.id=a.shift_id
-       WHERE ${where} ORDER BY a.date DESC`,
+       WHERE ${where} ORDER BY a.date DESC, a.time_in`,
       params
     ),
     dbQuery(
@@ -845,7 +1007,7 @@ ${SHARED_CSS}${extraHead}
 app.get('/', (_, res) => res.redirect('/portal'));
 
 // ═══════════════════════════════════════════════════════════════════════════════
-//  PORTAL PAGE — Redesigned
+//  PORTAL PAGE
 // ═══════════════════════════════════════════════════════════════════════════════
 app.get('/portal', (_, res) => {
   res.send(`<!DOCTYPE html><html lang="en"><head>
@@ -865,222 +1027,59 @@ app.get('/portal', (_, res) => {
     --border:rgba(0,173,238,0.15);
     --card:#ffffff;
   }
-
-  body{
-    font-family:'DM Sans',sans-serif;
-    background:#f8fcff;
-    color:var(--text);
-    min-height:100vh;
-    overflow-x:hidden;
-  }
-
-  /* Animated background mesh */
-  .bg-mesh{
-    position:fixed;inset:0;z-index:0;
-    background:
-      radial-gradient(ellipse 60% 40% at 20% 10%, rgba(0,173,238,0.12) 0%, transparent 60%),
-      radial-gradient(ellipse 50% 60% at 80% 80%, rgba(0,173,238,0.08) 0%, transparent 60%),
-      radial-gradient(ellipse 40% 30% at 50% 50%, rgba(0,173,238,0.04) 0%, transparent 70%);
-    pointer-events:none;
-  }
-
-  /* Grid overlay */
-  .bg-grid{
-    position:fixed;inset:0;z-index:0;
-    background-image:
-      linear-gradient(rgba(0,173,238,0.04) 1px, transparent 1px),
-      linear-gradient(90deg, rgba(0,173,238,0.04) 1px, transparent 1px);
-    background-size:40px 40px;
-    pointer-events:none;
-    mask-image:radial-gradient(ellipse 80% 80% at 50% 50%, black 30%, transparent 100%);
-  }
-
-  .portal-wrap{
-    position:relative;z-index:1;
-    min-height:100vh;
-    display:flex;
-    flex-direction:column;
-    align-items:center;
-    justify-content:center;
-    padding:40px 20px;
-  }
-
-  /* Top bar */
-  .top-bar{
-    position:fixed;top:0;left:0;right:0;z-index:10;
-    display:flex;align-items:center;justify-content:space-between;
-    padding:0 32px;height:60px;
-    background:rgba(248,252,255,0.85);
-    backdrop-filter:blur(16px);
-    border-bottom:1px solid rgba(0,173,238,0.1);
-  }
-  .top-brand{
-    display:flex;align-items:center;gap:10px;
-    font-family:'Syne',sans-serif;font-weight:800;font-size:1.1rem;color:var(--text);
-    text-decoration:none;letter-spacing:-0.5px;
-  }
-  .brand-icon{
-    width:32px;height:32px;border-radius:8px;
-    background:var(--accent);
-    display:flex;align-items:center;justify-content:center;
-    font-size:1rem;color:white;
-    box-shadow:0 4px 12px var(--accent-glow);
-  }
-  .top-version{
-    font-family:'JetBrains Mono',monospace;font-size:0.65rem;
-    color:var(--accent);background:rgba(0,173,238,0.1);
-    padding:3px 10px;border-radius:20px;letter-spacing:1px;
-  }
-
-  /* Hero section */
-  .hero{
-    text-align:center;
-    margin-bottom:52px;
-    animation:fadeUp 0.7s ease both;
-  }
-  .hero-eyebrow{
-    font-family:'JetBrains Mono',monospace;font-size:0.65rem;
-    color:var(--accent);letter-spacing:3px;text-transform:uppercase;
-    margin-bottom:16px;
-    display:inline-flex;align-items:center;gap:8px;
-  }
-  .hero-eyebrow::before,.hero-eyebrow::after{
-    content:'';display:block;width:24px;height:1px;background:var(--accent);opacity:0.5;
-  }
-  .hero-title{
-    font-family:'Syne',sans-serif;font-weight:800;
-    font-size:clamp(2.4rem,5vw,3.6rem);
-    line-height:1.05;
-    letter-spacing:-2px;
-    color:var(--text);
-    margin-bottom:16px;
-  }
-  .hero-title .hl{color:var(--accent);}
-  .hero-sub{
-    font-size:1rem;color:var(--muted);font-weight:400;
-    max-width:440px;margin:0 auto;line-height:1.6;
-  }
-
-  /* Portal cards */
-  .cards-row{
-    display:flex;gap:20px;flex-wrap:wrap;justify-content:center;
-    animation:fadeUp 0.7s 0.15s ease both;
-  }
-
-  .portal-card{
-    background:var(--card);
-    border:1px solid rgba(0,173,238,0.12);
-    border-radius:20px;
-    padding:28px 24px;
-    width:220px;
-    text-align:center;
-    text-decoration:none;
-    cursor:pointer;
-    position:relative;
-    overflow:hidden;
-    transition:transform 0.25s, box-shadow 0.25s, border-color 0.25s;
-    box-shadow:0 2px 12px rgba(0,0,0,0.04);
-  }
-  .portal-card::before{
-    content:'';position:absolute;inset:0;
-    background:radial-gradient(circle at 50% 0%, rgba(0,173,238,0.07), transparent 70%);
-    opacity:0;transition:opacity 0.3s;
-  }
-  .portal-card:hover{
-    transform:translateY(-6px);
-    box-shadow:0 16px 40px rgba(0,173,238,0.15),0 4px 12px rgba(0,0,0,0.06);
-    border-color:rgba(0,173,238,0.4);
-  }
-  .portal-card:hover::before{opacity:1;}
-
-  .card-icon-wrap{
-    width:60px;height:60px;border-radius:16px;
-    margin:0 auto 16px;
-    display:flex;align-items:center;justify-content:center;
-    font-size:1.6rem;
-    position:relative;
-    transition:transform 0.25s;
-  }
-  .portal-card:hover .card-icon-wrap{transform:scale(1.1);}
-
-  .icon-sa{background:linear-gradient(135deg,rgba(167,139,250,0.2),rgba(139,92,246,0.12));border:1px solid rgba(139,92,246,0.2);}
-  .icon-admin{background:linear-gradient(135deg,rgba(0,173,238,0.2),rgba(0,173,238,0.08));border:1px solid rgba(0,173,238,0.2);}
-  .icon-user{background:linear-gradient(135deg,rgba(52,211,153,0.2),rgba(52,211,153,0.08));border:1px solid rgba(52,211,153,0.2);}
-
-  .card-title{
-    font-family:'Syne',sans-serif;font-weight:700;font-size:1rem;
-    color:var(--text);margin-bottom:6px;letter-spacing:-0.3px;
-  }
-  .card-desc{
-    font-size:0.75rem;color:var(--muted);line-height:1.5;
-  }
-  .card-cta{
-    display:inline-flex;align-items:center;gap:5px;
-    margin-top:16px;padding:7px 16px;border-radius:8px;
-    font-size:0.75rem;font-weight:600;
-    transition:all 0.2s;color:white;
-  }
-  .cta-sa{background:linear-gradient(135deg,#7c3aed,#a78bfa);}
-  .cta-admin{background:linear-gradient(135deg,#009ed8,var(--accent));}
-  .cta-user{background:linear-gradient(135deg,#059669,#34d399);}
-  .portal-card:hover .card-cta{filter:brightness(1.1);}
-
-  /* Feature pills */
-  .features{
-    display:flex;gap:10px;flex-wrap:wrap;justify-content:center;
-    margin-top:48px;
-    animation:fadeUp 0.7s 0.3s ease both;
-  }
-  .feat{
-    display:flex;align-items:center;gap:6px;
-    padding:6px 14px;border-radius:20px;
-    background:white;border:1px solid rgba(0,173,238,0.12);
-    font-size:0.72rem;color:var(--muted);font-weight:500;
-    box-shadow:0 1px 4px rgba(0,0,0,0.04);
-  }
-  .feat-dot{width:6px;height:6px;border-radius:50%;background:var(--accent);}
-
-  /* Footer */
-  .portal-footer{
-    margin-top:48px;font-size:0.7rem;color:var(--muted);
-    display:flex;align-items:center;gap:6px;
-    animation:fadeUp 0.7s 0.4s ease both;
-  }
-  .portal-footer a{color:var(--accent);text-decoration:none;}
-
-  @keyframes fadeUp{
-    from{opacity:0;transform:translateY(20px);}
-    to{opacity:1;transform:translateY(0);}
-  }
-
-  @media(max-width:640px){
-    .cards-row{gap:14px;}
-    .portal-card{width:100%;max-width:320px;padding:22px 20px;}
-  }
+  body{font-family:'DM Sans',sans-serif;background:#f8fcff;color:var(--text);min-height:100vh;overflow-x:hidden}
+  .bg-mesh{position:fixed;inset:0;z-index:0;background:radial-gradient(ellipse 60% 40% at 20% 10%,rgba(0,173,238,0.12) 0%,transparent 60%),radial-gradient(ellipse 50% 60% at 80% 80%,rgba(0,173,238,0.08) 0%,transparent 60%);pointer-events:none}
+  .bg-grid{position:fixed;inset:0;z-index:0;background-image:linear-gradient(rgba(0,173,238,0.04) 1px,transparent 1px),linear-gradient(90deg,rgba(0,173,238,0.04) 1px,transparent 1px);background-size:40px 40px;pointer-events:none;mask-image:radial-gradient(ellipse 80% 80% at 50% 50%,black 30%,transparent 100%)}
+  .portal-wrap{position:relative;z-index:1;min-height:100vh;display:flex;flex-direction:column;align-items:center;justify-content:center;padding:80px 20px 40px}
+  .top-bar{position:fixed;top:0;left:0;right:0;z-index:10;display:flex;align-items:center;justify-content:space-between;padding:0 24px;height:58px;background:rgba(248,252,255,0.9);backdrop-filter:blur(16px);border-bottom:1px solid rgba(0,173,238,0.1)}
+  .top-brand{display:flex;align-items:center;gap:10px;font-family:'Syne',sans-serif;font-weight:800;font-size:1.05rem;color:var(--text);text-decoration:none}
+  .brand-icon{width:32px;height:32px;border-radius:8px;background:var(--accent);display:flex;align-items:center;justify-content:center;font-size:1rem;color:white;box-shadow:0 4px 12px var(--accent-glow)}
+  .top-version{font-family:'JetBrains Mono',monospace;font-size:0.62rem;color:var(--accent);background:rgba(0,173,238,0.1);padding:3px 10px;border-radius:20px;letter-spacing:1px}
+  .hero{text-align:center;margin-bottom:48px;animation:fadeUp 0.7s ease both}
+  .hero-eyebrow{font-family:'JetBrains Mono',monospace;font-size:0.62rem;color:var(--accent);letter-spacing:3px;text-transform:uppercase;margin-bottom:14px;display:inline-flex;align-items:center;gap:8px}
+  .hero-eyebrow::before,.hero-eyebrow::after{content:'';display:block;width:20px;height:1px;background:var(--accent);opacity:0.5}
+  .hero-title{font-family:'Syne',sans-serif;font-weight:800;font-size:clamp(2rem,5vw,3.4rem);line-height:1.05;letter-spacing:-2px;color:var(--text);margin-bottom:14px}
+  .hero-title .hl{color:var(--accent)}
+  .hero-sub{font-size:0.96rem;color:var(--muted);font-weight:400;max-width:420px;margin:0 auto;line-height:1.6}
+  .cards-row{display:flex;gap:18px;flex-wrap:wrap;justify-content:center;animation:fadeUp 0.7s 0.15s ease both}
+  .portal-card{background:var(--card);border:1px solid rgba(0,173,238,0.12);border-radius:20px;padding:26px 22px;width:210px;text-align:center;text-decoration:none;cursor:pointer;position:relative;overflow:hidden;transition:transform 0.25s,box-shadow 0.25s,border-color 0.25s;box-shadow:0 2px 12px rgba(0,0,0,0.04)}
+  .portal-card::before{content:'';position:absolute;inset:0;background:radial-gradient(circle at 50% 0%,rgba(0,173,238,0.07),transparent 70%);opacity:0;transition:opacity 0.3s}
+  .portal-card:hover{transform:translateY(-6px);box-shadow:0 16px 40px rgba(0,173,238,0.15),0 4px 12px rgba(0,0,0,0.06);border-color:rgba(0,173,238,0.4)}
+  .portal-card:hover::before{opacity:1}
+  .card-icon-wrap{width:58px;height:58px;border-radius:16px;margin:0 auto 14px;display:flex;align-items:center;justify-content:center;font-size:1.5rem;transition:transform 0.25s}
+  .portal-card:hover .card-icon-wrap{transform:scale(1.1)}
+  .icon-sa{background:linear-gradient(135deg,rgba(167,139,250,0.2),rgba(139,92,246,0.12));border:1px solid rgba(139,92,246,0.2)}
+  .icon-admin{background:linear-gradient(135deg,rgba(0,173,238,0.2),rgba(0,173,238,0.08));border:1px solid rgba(0,173,238,0.2)}
+  .icon-user{background:linear-gradient(135deg,rgba(52,211,153,0.2),rgba(52,211,153,0.08));border:1px solid rgba(52,211,153,0.2)}
+  .card-title{font-family:'Syne',sans-serif;font-weight:700;font-size:0.98rem;color:var(--text);margin-bottom:6px}
+  .card-desc{font-size:0.73rem;color:var(--muted);line-height:1.5}
+  .card-cta{display:inline-flex;align-items:center;gap:5px;margin-top:14px;padding:7px 16px;border-radius:8px;font-size:0.73rem;font-weight:600;transition:all 0.2s;color:white}
+  .cta-sa{background:linear-gradient(135deg,#7c3aed,#a78bfa)}
+  .cta-admin{background:linear-gradient(135deg,#009ed8,var(--accent))}
+  .cta-user{background:linear-gradient(135deg,#059669,#34d399)}
+  .portal-card:hover .card-cta{filter:brightness(1.1)}
+  .features{display:flex;gap:8px;flex-wrap:wrap;justify-content:center;margin-top:44px;animation:fadeUp 0.7s 0.3s ease both}
+  .feat{display:flex;align-items:center;gap:6px;padding:5px 12px;border-radius:20px;background:white;border:1px solid rgba(0,173,238,0.12);font-size:0.7rem;color:var(--muted);font-weight:500;box-shadow:0 1px 4px rgba(0,0,0,0.04)}
+  .feat-dot{width:5px;height:5px;border-radius:50%;background:var(--accent)}
+  .portal-footer{margin-top:44px;font-size:0.68rem;color:var(--muted);display:flex;align-items:center;gap:6px;animation:fadeUp 0.7s 0.4s ease both}
+  .portal-footer a{color:var(--accent);text-decoration:none}
+  @keyframes fadeUp{from{opacity:0;transform:translateY(20px)}to{opacity:1;transform:translateY(0)}}
+  @media(max-width:640px){.cards-row{gap:12px}.portal-card{width:100%;max-width:300px;padding:20px 18px}.hero-title{font-size:1.9rem}}
 </style>
 </head>
 <body>
   <div class="bg-mesh"></div>
   <div class="bg-grid"></div>
-
   <div class="top-bar">
-    <a class="top-brand" href="/portal">
-      <div class="brand-icon">👁</div>
-      FaceAttend
-    </a>
-    <span class="top-version">SaaS v2.0</span>
+    <a class="top-brand" href="/portal"><div class="brand-icon">👁</div>FaceAttend</a>
+    <span class="top-version">SaaS v4.0</span>
   </div>
-
   <div class="portal-wrap">
     <div class="hero">
       <div class="hero-eyebrow">Multi-tenant Platform</div>
-      <h1 class="hero-title">
-        Face Recognition<br>
-        <span class="hl">Attendance</span> System
-      </h1>
+      <h1 class="hero-title">Face Recognition<br><span class="hl">Attendance</span> System</h1>
       <p class="hero-sub">Automated attendance tracking powered by real-time face recognition. Choose your portal to get started.</p>
     </div>
-
     <div class="cards-row">
       <a href="/super-admin" class="portal-card">
         <div class="card-icon-wrap icon-sa">🛡️</div>
@@ -1088,14 +1087,12 @@ app.get('/portal', (_, res) => {
         <div class="card-desc">Platform control, admin approvals &amp; system-wide oversight.</div>
         <div class="card-cta cta-sa">Enter Portal →</div>
       </a>
-
       <a href="/admin" class="portal-card">
         <div class="card-icon-wrap icon-admin">🏢</div>
         <div class="card-title">Admin</div>
-        <div class="card-desc">Manage faces, shifts, attendance scanning &amp; calendar.</div>
+        <div class="card-desc">Manage people, shifts, scan attendance &amp; export reports.</div>
         <div class="card-cta cta-admin">Enter Portal →</div>
       </a>
-
       <a href="/user" class="portal-card">
         <div class="card-icon-wrap icon-user">👤</div>
         <div class="card-title">Employee</div>
@@ -1103,22 +1100,16 @@ app.get('/portal', (_, res) => {
         <div class="card-cta cta-user">Enter Portal →</div>
       </a>
     </div>
-
     <div class="features">
       <div class="feat"><div class="feat-dot"></div>Real-time Face Recognition</div>
+      <div class="feat"><div class="feat-dot"></div>Multi-shift Attendance</div>
       <div class="feat"><div class="feat-dot"></div>Web Push Notifications</div>
-      <div class="feat"><div class="feat-dot"></div>Multi-tenant SaaS</div>
-      <div class="feat"><div class="feat-dot"></div>Shift Management</div>
+      <div class="feat"><div class="feat-dot"></div>Export CSV/Excel</div>
       <div class="feat"><div class="feat-dot"></div>Holiday Calendar</div>
+      <div class="feat"><div class="feat-dot"></div>Multi-tenant SaaS</div>
     </div>
-
     <div class="portal-footer">
-      <span>Powered by</span>
-      <a href="#">face-api.js</a>
-      <span>·</span>
-      <a href="#">Node.js</a>
-      <span>·</span>
-      <a href="#">MySQL</a>
+      <span>Powered by</span><a href="#">face-api.js</a><span>·</span><a href="#">Node.js</a><span>·</span><a href="#">MySQL</a>
     </div>
   </div>
 </body></html>`);
@@ -1158,9 +1149,9 @@ app.get('/super-admin', (_, res) => {
     <div id="statsRow" class="grid4" style="margin-bottom:18px"></div>
     <div class="card">
       <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:14px">
-        <span style="font-weight:700">Registered Admins</span>
+        <span style="font-weight:700">Registered Organisations</span>
       </div>
-      <div id="adminTable"></div>
+      <div class="table-wrap" id="adminTable"></div>
     </div>
   </div>
 </main>
@@ -1203,29 +1194,29 @@ async function loadDashboard(){
         pending=admins.filter(a=>a.status==='pending').length,
         totalUsers=admins.reduce((s,a)=>s+(a.user_count||0),0);
   document.getElementById('statsRow').innerHTML=\`
-    <div class="stat"><div class="stat-val">\${total}</div><div class="stat-label">Total Admins</div></div>
+    <div class="stat"><div class="stat-val">\${total}</div><div class="stat-label">Total Orgs</div></div>
     <div class="stat"><div class="stat-val green">\${approved}</div><div class="stat-label">Approved</div></div>
     <div class="stat"><div class="stat-val yellow">\${pending}</div><div class="stat-label">Pending</div></div>
-    <div class="stat"><div class="stat-val">\${totalUsers}</div><div class="stat-label">Total Employees</div></div>
+    <div class="stat"><div class="stat-val">\${totalUsers}</div><div class="stat-label">Employees</div></div>
   \`;
   const rows=admins.map(a=>\`
     <tr>
-      <td><strong>\${a.org_name}</strong><br><span style="color:var(--muted);font-size:0.72rem">\${a.email}</span></td>
-      <td>\${a.org_type}</td>
+      <td><strong>\${a.org_name}</strong><br><span style="color:var(--muted);font-size:0.7rem">\${a.email}</span></td>
+      <td><span class="chip chip-gray">\${a.org_type}</span></td>
       <td><span class="chip chip-\${a.status==='approved'?'green':a.status==='pending'?'yellow':a.status==='rejected'?'red':'gray'}">\${a.status}</span></td>
-      <td style="font-family:'JetBrains Mono',monospace">\${a.face_count||0} faces / \${a.user_count||0} users</td>
-      <td><span class="chip chip-blue">\${a.notif_count||0} notif</span></td>
-      <td>\${a.today_attendance||0} today</td>
-      <td>
-        \${a.status!=='approved'?'<button class="btn btn-sm btn-success" onclick="setStatus('+a.id+',\\'approved\\')">Approve</button>':
-          '<button class="btn btn-sm btn-danger" onclick="setStatus('+a.id+',\\'suspended\\')">Suspend</button>'}
-        \${a.status==='pending'||a.status==='suspended'?'<button class="btn btn-sm btn-danger" onclick="setStatus('+a.id+',\\'rejected\\')">Reject</button>':''}
+      <td style="font-family:'JetBrains Mono',monospace;font-size:0.75rem">\${a.face_count||0}👥 / \${a.user_count||0}🔑</td>
+      <td><span class="chip chip-blue">\${a.notif_count||0} 🔔</span></td>
+      <td style="font-weight:600">\${a.today_attendance||0}</td>
+      <td style="white-space:nowrap">
+        \${a.status!=='approved'?'<button class="btn btn-sm btn-success" onclick="setStatus('+a.id+',\\'approved\\')">✅ Approve</button>':
+          '<button class="btn btn-sm btn-danger" onclick="setStatus('+a.id+',\\'suspended\\')">⏸ Suspend</button>'}
+        \${a.status==='pending'||a.status==='suspended'?'<button class="btn btn-sm btn-danger" style="margin-top:3px" onclick="setStatus('+a.id+',\\'rejected\\')">✕ Reject</button>':''}
       </td>
     </tr>
   \`).join('');
   document.getElementById('adminTable').innerHTML=\`
     <table>
-      <thead><tr><th>Organisation</th><th>Type</th><th>Status</th><th>Faces/Users</th><th>Notifications</th><th>Today</th><th>Action</th></tr></thead>
+      <thead><tr><th>Organisation</th><th>Type</th><th>Status</th><th>Faces/Users</th><th>Notif</th><th>Today</th><th>Action</th></tr></thead>
       <tbody>\${rows||'<tr><td colspan="7" style="text-align:center;color:var(--muted);padding:30px">No admins yet</td></tr>'}</tbody>
     </table>\`;
 }
@@ -1240,7 +1231,7 @@ init();
 });
 
 // ═══════════════════════════════════════════════════════════════════════════════
-//  ADMIN PAGE — faces tab now collects email+password, no Users tab
+//  ADMIN PAGE
 // ═══════════════════════════════════════════════════════════════════════════════
 app.get('/admin', (_, res) => {
   res.send(htmlBase('Admin Portal', `
@@ -1253,7 +1244,7 @@ app.get('/admin', (_, res) => {
   <div id="authSection" style="max-width:460px;margin:30px auto">
     <div class="tabs">
       <button class="tab active" onclick="switchAuthTab('login',this)">Login</button>
-      <button class="tab" onclick="switchAuthTab('register',this)">Register Organisation</button>
+      <button class="tab" onclick="switchAuthTab('register',this)">Register Org</button>
     </div>
     <div id="loginPanel" class="card">
       <div id="loginErr" class="alert alert-error" style="display:none"></div>
@@ -1298,6 +1289,8 @@ app.get('/admin', (_, res) => {
       <button class="tab active" onclick="switchTab('scan',this)">📷 Scan</button>
       <button class="tab" onclick="switchTab('faces',this)">👥 People</button>
       <button class="tab" onclick="switchTab('shifts',this)">⏰ Shifts</button>
+      <button class="tab" onclick="switchTab('users',this)">🔑 Users</button>
+      <button class="tab" onclick="switchTab('reports',this)">📊 Reports</button>
       <button class="tab" onclick="switchTab('calendar',this)">📅 Calendar</button>
     </div>
 
@@ -1312,9 +1305,9 @@ app.get('/admin', (_, res) => {
               <div class="scan-line"></div>
             </div>
             <div class="cam-controls">
-              <div style="flex:1;display:flex;align-items:center;gap:8px;font-size:0.74rem;color:var(--muted)">
+              <div style="flex:1;display:flex;align-items:center;gap:8px;font-size:0.72rem;color:var(--muted);min-width:0">
                 <div class="live-dot" id="statusDot" style="background:var(--muted)"></div>
-                <span id="statusText">Starting camera...</span>
+                <span id="statusText" style="white-space:nowrap;overflow:hidden;text-overflow:ellipsis">Starting camera...</span>
               </div>
               <select class="form-control" id="scanMode" style="width:auto;padding:6px 10px;font-size:0.75rem">
                 <option value="checkin">Check In</option>
@@ -1328,60 +1321,60 @@ app.get('/admin', (_, res) => {
         </div>
         <div>
           <div class="result-card" id="resultCard">
-            <div class="result-title">Last Result</div>
-            <div id="resultBody" style="color:var(--muted);font-size:0.82rem">Scan a face to see results here.</div>
+            <div class="result-title">Scan Result</div>
+            <div id="resultBody" style="color:var(--muted);font-size:0.82rem;text-align:center;padding:20px 0">Scan a face to see results here.</div>
           </div>
           <div class="card" style="margin-top:12px">
-            <div style="font-size:0.72rem;font-weight:700;margin-bottom:10px">Today's Attendance</div>
-            <div id="todayList" style="max-height:300px;overflow-y:auto;font-size:0.8rem"></div>
+            <div style="font-size:0.7rem;font-weight:700;margin-bottom:10px;color:var(--muted);text-transform:uppercase;letter-spacing:1px">Today's Attendance</div>
+            <div id="todayList" style="max-height:280px;overflow-y:auto;font-size:0.78rem"></div>
           </div>
         </div>
       </div>
     </div>
 
-    <!-- PEOPLE TAB — face registration WITH email+password -->
+    <!-- PEOPLE TAB -->
     <div id="tab-faces" style="display:none">
       <div class="grid2" style="gap:14px;align-items:start">
         <div class="card">
-          <div style="font-weight:700;margin-bottom:14px">Register New Person</div>
-          <div class="alert alert-info" style="font-size:0.75rem;margin-bottom:14px">
-            📌 Fill in all details below — this creates both the <strong>face profile</strong> and the <strong>employee login account</strong> in one step.
+          <div style="font-weight:700;margin-bottom:12px;font-size:0.95rem">Register New Person</div>
+          <div class="alert alert-info" style="font-size:0.73rem;margin-bottom:12px">
+            📌 This creates both the <strong>face profile</strong> and the <strong>employee login account</strong> in one step.
           </div>
           <div class="cam-card" style="margin-bottom:12px">
             <div class="cam-wrap"><video id="regVideo" autoplay muted playsinline></video><canvas id="regOverlay"></canvas></div>
             <div class="cam-controls" style="justify-content:space-between">
-              <span id="regStatus" style="font-size:0.72rem;color:var(--muted)">Camera ready</span>
+              <span id="regStatus" style="font-size:0.7rem;color:var(--muted)">Camera ready</span>
               <button class="btn btn-primary btn-sm" id="captureBtn" onclick="captureSample()" disabled>Capture Sample</button>
             </div>
           </div>
           <div class="grid2">
-            <div class="form-group"><label>Full Name</label><input class="form-control" id="fName" placeholder="Employee / Student Name"></div>
+            <div class="form-group"><label>Full Name</label><input class="form-control" id="fName" placeholder="Employee Name"></div>
             <div class="form-group"><label>Employee ID</label><input class="form-control" id="fEmpId" placeholder="EMP001"></div>
           </div>
           <div class="grid2">
             <div class="form-group"><label>Department</label><input class="form-control" id="fDept" placeholder="Engineering"></div>
             <div class="form-group">
-              <label>Shift</label>
-              <select class="form-control" id="fShift"><option value="">No Shift</option></select>
+              <label>Default Shift</label>
+              <select class="form-control" id="fShift"><option value="">No Default Shift</option></select>
             </div>
           </div>
           <div style="border-top:1px solid var(--border);padding-top:12px;margin-bottom:12px">
-            <div style="font-size:0.7rem;color:var(--muted);text-transform:uppercase;letter-spacing:0.8px;margin-bottom:10px">Login Account (for Employee Portal)</div>
+            <div style="font-size:0.68rem;color:var(--muted);text-transform:uppercase;letter-spacing:0.8px;margin-bottom:10px;font-weight:600">Login Account</div>
             <div class="grid2">
               <div class="form-group"><label>Email</label><input class="form-control" id="fUserEmail" type="email" placeholder="emp@company.com"></div>
               <div class="form-group"><label>Password</label><input class="form-control" id="fUserPassword" type="password" placeholder="Min. 6 chars"></div>
             </div>
           </div>
           <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:8px">
-            <span id="sampleCount" style="font-size:0.75rem;color:var(--muted)">0 / 10 samples</span>
-            <button class="btn btn-outline btn-sm" onclick="clearSamples()">Clear Samples</button>
+            <span id="sampleCount" style="font-size:0.73rem;color:var(--muted)">0 / 10 samples</span>
+            <button class="btn btn-outline btn-sm" onclick="clearSamples()">Clear</button>
           </div>
-          <div id="regSampleBar" style="height:6px;background:var(--border);border-radius:4px;margin-bottom:12px">
+          <div id="regSampleBar" style="height:5px;background:var(--border);border-radius:4px;margin-bottom:12px">
             <div id="sampleProgress" style="height:100%;background:var(--accent);border-radius:4px;width:0%;transition:width 0.3s"></div>
           </div>
           <div id="regErr" class="alert alert-error" style="display:none"></div>
           <div id="regOk2" class="alert alert-success" style="display:none"></div>
-          <button class="btn btn-primary" style="width:100%" id="saveBtn" onclick="saveFace()" disabled>Save Person &amp; Create Account</button>
+          <button class="btn btn-primary" style="width:100%" id="saveBtn" onclick="saveFace()" disabled>💾 Save Person &amp; Create Account</button>
         </div>
         <div class="card">
           <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:14px">
@@ -1404,12 +1397,52 @@ app.get('/admin', (_, res) => {
             <div class="form-group"><label>End Time</label><input class="form-control" id="shEnd" type="time"></div>
           </div>
           <div id="shErr" class="alert alert-error" style="display:none"></div>
-          <button class="btn btn-primary" style="width:100%" onclick="addShift()">Add Shift</button>
+          <button class="btn btn-primary" style="width:100%" onclick="addShift()">➕ Add Shift</button>
         </div>
         <div class="card">
           <div style="font-weight:700;margin-bottom:14px">Your Shifts</div>
           <div id="shiftList"></div>
         </div>
+      </div>
+    </div>
+
+    <!-- USERS TAB -->
+    <div id="tab-users" style="display:none">
+      <div class="card">
+        <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:16px;flex-wrap:wrap;gap:8px">
+          <span style="font-weight:700">Employee Accounts</span>
+          <span id="userCount" class="chip chip-blue"></span>
+        </div>
+        <div class="table-wrap">
+          <table>
+            <thead><tr><th>Name</th><th>Email</th><th>Dept / Shift</th><th>Notifications</th><th>Joined</th><th>Actions</th></tr></thead>
+            <tbody id="userTableBody"><tr><td colspan="6" style="text-align:center;color:var(--muted);padding:24px">Loading...</td></tr></tbody>
+          </table>
+        </div>
+      </div>
+    </div>
+
+    <!-- REPORTS TAB -->
+    <div id="tab-reports" style="display:none">
+      <div class="card">
+        <div style="font-weight:700;margin-bottom:16px;font-size:0.95rem">📊 Export Attendance Records</div>
+        <div class="grid2" style="margin-bottom:16px">
+          <div class="form-group">
+            <label>Month</label>
+            <select class="form-control" id="expMonth">
+              ${['January','February','March','April','May','June','July','August','September','October','November','December'].map((m,i)=>`<option value="${i+1}">${m}</option>`).join('')}
+            </select>
+          </div>
+          <div class="form-group">
+            <label>Year</label>
+            <input class="form-control" type="number" id="expYear" value="${new Date().getFullYear()}" min="2020" max="2030">
+          </div>
+        </div>
+        <div style="display:flex;gap:10px;flex-wrap:wrap">
+          <button class="btn btn-primary" onclick="exportAttendance('csv')">⬇️ Export CSV</button>
+          <button class="btn btn-outline" onclick="previewReport()">👁 Preview</button>
+        </div>
+        <div id="reportPreview" style="margin-top:18px"></div>
       </div>
     </div>
 
@@ -1421,7 +1454,7 @@ app.get('/admin', (_, res) => {
           <span id="calTitle" style="font-weight:700"></span>
           <button class="btn btn-outline btn-sm" onclick="changeMonth(1)">Next &#8250;</button>
         </div>
-        <div style="font-size:0.72rem;color:var(--muted);margin-bottom:10px">Click a date to manage holidays.</div>
+        <div style="font-size:0.7rem;color:var(--muted);margin-bottom:10px">Click a date to manage holidays.</div>
         <div class="cal-grid" id="calHead"></div>
         <div class="cal-grid" style="margin-top:4px" id="calGrid"></div>
       </div>
@@ -1439,8 +1472,33 @@ app.get('/admin', (_, res) => {
         </div>
       </div>
     </div>
-  </div>
+
+  </div><!-- /dashboard -->
 </main>
+
+<!-- Shift Selection Modal -->
+<div id="shiftModal" class="modal-backdrop">
+  <div class="modal" style="max-width:420px">
+    <div class="modal-title">
+      <span>Select Shifts to Mark</span>
+      <button class="modal-close" onclick="closeShiftModal()">✕</button>
+    </div>
+    <div id="shiftModalFaceName" style="font-size:1rem;font-weight:700;margin-bottom:6px;color:var(--accent)"></div>
+    <div style="font-size:0.75rem;color:var(--muted);margin-bottom:14px" id="shiftModalTime"></div>
+
+    <div style="display:flex;gap:8px;margin-bottom:10px">
+      <button class="btn btn-sm btn-outline" onclick="selectAllShifts()">Select All</button>
+      <button class="btn btn-sm btn-outline" onclick="clearShiftSelection()">Clear</button>
+    </div>
+
+    <div class="shift-select-box" id="shiftCheckboxList"></div>
+
+    <div style="margin-top:14px;display:flex;gap:10px">
+      <button class="btn btn-primary" style="flex:1" onclick="confirmShiftMark()">✅ Mark Attendance</button>
+      <button class="btn btn-outline" onclick="closeShiftModal()">Cancel</button>
+    </div>
+  </div>
+</div>
 
 <script src="/faceapi.js"></script>
 <script>
@@ -1449,6 +1507,7 @@ let adminToken=localStorage.getItem(TOKEN_KEY);
 let adminShifts=[],adminFaces=[],regSamples=[],autoMode=false,autoTimer=null;
 let calYear=new Date().getFullYear(),calMonth=new Date().getMonth()+1;
 let calData={attendance:[],holidays:[]},selectedCalDate=null;
+let pendingScanResult=null; // holds face_identified result waiting for shift selection
 
 function switchAuthTab(t,btn){
   document.querySelectorAll('.tabs .tab').forEach(b=>b.classList.remove('active'));
@@ -1497,23 +1556,26 @@ async function showDashboard(r){
   const me=r||await fetch('/api/admin/me',{headers:{'x-token':adminToken}}).then(x=>x.json()).catch(()=>null);
   if(!me||me.error){localStorage.removeItem(TOKEN_KEY);location.reload();return;}
   let logoHtml='';
-  if(me.logo_base64) logoHtml=\`<img src="\${me.logo_base64}" class="logo-preview" style="height:32px;margin-right:6px">\`;
+  if(me.logo_base64) logoHtml=\`<img src="\${me.logo_base64}" class="logo-preview" style="height:30px;margin-right:6px">\`;
   document.getElementById('navLogo').innerHTML=logoHtml+'Face<span style="color:var(--accent)">Attend</span>';
   document.getElementById('navRight').innerHTML=\`
-    <span style="font-size:0.75rem;color:var(--muted)">\${me.org_name||''}</span>
+    <span style="font-size:0.73rem;color:var(--muted);display:none;display:inline" class="hide-xs">\${me.org_name||''}</span>
     <span class="badge badge-admin">Admin</span>
     <button class="btn btn-sm btn-outline" onclick="adminLogout()">Logout</button>\`;
   loadShifts();loadFaceList();loadScanTab();startCamera('video','overlay',true);
+  // set report month to current
+  document.getElementById('expMonth').value=new Date().getMonth()+1;
 }
 
 function switchTab(t,btn){
   document.querySelectorAll('#dashTabs .tab').forEach(b=>b.classList.remove('active'));
   btn.classList.add('active');
-  ['scan','faces','shifts','calendar'].forEach(tab=>{
+  ['scan','faces','shifts','users','reports','calendar'].forEach(tab=>{
     document.getElementById('tab-'+tab).style.display=tab===t?'block':'none';
   });
   if(t==='faces') startCamera('regVideo','regOverlay',false);
   if(t==='calendar') renderCalendar();
+  if(t==='users') loadUsers();
 }
 
 let streams={};
@@ -1527,7 +1589,7 @@ async function startCamera(videoId,overlayId,isScan){
     if(isScan){
       document.getElementById('scanBtn').disabled=false;
       document.getElementById('statusDot').style.background='var(--accent)';
-      document.getElementById('statusText').textContent='Camera ready';
+      document.getElementById('statusText').textContent='Camera ready — press Scan';
     } else {
       document.getElementById('captureBtn').disabled=false;
       document.getElementById('regStatus').textContent='Camera ready — capture 10 samples';
@@ -1569,10 +1631,10 @@ async function saveFace(){
   const label=document.getElementById('fName').value.trim();
   const email=document.getElementById('fUserEmail').value.trim();
   const password=document.getElementById('fUserPassword').value;
-  if(!label){document.getElementById('regErr').textContent='Name required';document.getElementById('regErr').style.display='block';return;}
-  if(!email){document.getElementById('regErr').textContent='Email required';document.getElementById('regErr').style.display='block';return;}
-  if(!password||password.length<6){document.getElementById('regErr').textContent='Password must be at least 6 characters';document.getElementById('regErr').style.display='block';return;}
-  if(regSamples.length<5){document.getElementById('regErr').textContent='Need at least 5 face samples';document.getElementById('regErr').style.display='block';return;}
+  if(!label){showFaceErr('Name required');return;}
+  if(!email){showFaceErr('Email required');return;}
+  if(!password||password.length<6){showFaceErr('Password must be at least 6 characters');return;}
+  if(regSamples.length<5){showFaceErr('Need at least 5 face samples');return;}
   const r=await fetch('/api/admin/faces',{method:'POST',headers:{'Content-Type':'application/json','x-token':adminToken},
     body:JSON.stringify({
       label,employee_id:document.getElementById('fEmpId').value,
@@ -1582,7 +1644,7 @@ async function saveFace(){
       descriptors:regSamples,accuracy:Math.round(100-Math.random()*5)
     })
   }).then(x=>x.json());
-  if(r.error){document.getElementById('regErr').textContent=r.error;document.getElementById('regErr').style.display='block';return;}
+  if(r.error){showFaceErr(r.error);return;}
   document.getElementById('regOk2').textContent='Person registered & account created! ✅';
   document.getElementById('regOk2').style.display='block';
   document.getElementById('regErr').style.display='none';
@@ -1591,6 +1653,7 @@ async function saveFace(){
   document.getElementById('fUserPassword').value='';document.getElementById('fShift').value='';
   clearSamples();loadFaceList();
 }
+function showFaceErr(msg){document.getElementById('regErr').textContent=msg;document.getElementById('regErr').style.display='block';}
 
 async function loadFaceList(){
   const faces=await fetch('/api/admin/faces',{headers:{'x-token':adminToken}}).then(x=>x.json());
@@ -1601,15 +1664,15 @@ async function loadFaceList(){
     <div style="display:flex;align-items:flex-start;justify-content:space-between;padding:10px 0;border-bottom:1px solid var(--border)">
       <div>
         <span style="font-weight:600">\${f.label}</span>
-        \${f.employee_id?\`<span style="color:var(--muted);font-size:0.7rem;margin-left:6px">#\${f.employee_id}</span>\`:''}
+        \${f.employee_id?\`<span style="color:var(--muted);font-size:0.68rem;margin-left:6px">#\${f.employee_id}</span>\`:''}
         <br>
-        <span style="color:var(--muted);font-size:0.7rem">\${f.department||''}\${f.shift_name?' · '+f.shift_name:''}</span>
-        \${f.user_email?\`<br><span style="font-size:0.68rem;color:var(--accent)">📧 \${f.user_email}</span>\`:''}
-        \${f.notifications_enabled?\`<span class="chip chip-green" style="margin-left:4px;font-size:0.6rem">🔔 notif on</span>\`:''}
+        <span style="color:var(--muted);font-size:0.68rem">\${f.department||''}\${f.shift_name?' · '+f.shift_name:''}</span>
+        \${f.user_email?\`<br><span style="font-size:0.66rem;color:var(--accent)">📧 \${f.user_email}</span>\`:''}
+        \${f.notifications_enabled?\`<span class="chip chip-green" style="margin-left:4px;font-size:0.58rem">🔔 notif</span>\`:''}
       </div>
       <button class="btn btn-danger btn-sm" onclick="deleteFace(\${f.id})">✕</button>
     </div>\`).join('')
-    :'<p style="color:var(--muted);font-size:0.82rem">No people registered yet.</p>';
+    :'<p style="color:var(--muted);font-size:0.8rem">No people registered yet.</p>';
   document.getElementById('faceList').innerHTML=html;
 }
 
@@ -1622,16 +1685,17 @@ async function deleteFace(id){
 async function loadShifts(){
   adminShifts=await fetch('/api/admin/shifts',{headers:{'x-token':adminToken}}).then(x=>x.json());
   const sel=document.getElementById('fShift');
-  if(sel) sel.innerHTML='<option value="">No Shift</option>'+adminShifts.map(s=>\`<option value="\${s.id}">\${s.name} (\${s.start_time.slice(0,5)}-\${s.end_time.slice(0,5)})</option>\`).join('');
+  if(sel) sel.innerHTML='<option value="">No Default Shift</option>'+adminShifts.map(s=>\`<option value="\${s.id}">\${s.name} (\${s.start_time.slice(0,5)}-\${s.end_time.slice(0,5)})</option>\`).join('');
   const list=document.getElementById('shiftList');
   if(list) list.innerHTML=adminShifts.length?adminShifts.map(s=>\`
     <div style="display:flex;align-items:center;justify-content:space-between;padding:10px 0;border-bottom:1px solid var(--border)">
-      <div><span style="font-weight:600">\${s.name}</span>
-        <span style="color:var(--muted);font-size:0.75rem;margin-left:8px">\${s.start_time.slice(0,5)} – \${s.end_time.slice(0,5)}</span>
+      <div>
+        <span style="font-weight:600">\${s.name}</span>
+        <span style="color:var(--muted);font-size:0.73rem;margin-left:8px">\${s.start_time.slice(0,5)} – \${s.end_time.slice(0,5)}</span>
       </div>
       <button class="btn btn-danger btn-sm" onclick="deleteShift(\${s.id})">✕</button>
     </div>\`).join('')
-    :'<p style="color:var(--muted);font-size:0.82rem">No shifts defined yet.</p>';
+    :'<p style="color:var(--muted);font-size:0.8rem">No shifts defined yet.</p>';
 }
 
 async function addShift(){
@@ -1649,6 +1713,70 @@ async function deleteShift(id){
   loadShifts();
 }
 
+// ── Users management ──────────────────────────────────────────────────────────
+async function loadUsers(){
+  const users=await fetch('/api/admin/users',{headers:{'x-token':adminToken}}).then(x=>x.json());
+  const countEl=document.getElementById('userCount');
+  if(countEl) countEl.textContent=users.length+' users';
+  const tbody=document.getElementById('userTableBody');
+  if(!users.length){tbody.innerHTML='<tr><td colspan="6" style="text-align:center;color:var(--muted);padding:24px">No employee accounts yet</td></tr>';return;}
+  tbody.innerHTML=users.map(u=>\`
+    <tr>
+      <td style="font-weight:600">\${u.name}</td>
+      <td style="font-size:0.75rem;color:var(--muted)">\${u.email}</td>
+      <td style="font-size:0.73rem">\${u.department||''}\${u.shift_name?' · <span class="chip chip-blue">'+u.shift_name+'</span>':''}</td>
+      <td>\${u.notifications_enabled?\`<span class="chip chip-green">🔔 On</span>\`:\`<span class="chip chip-gray">Off</span>\`}</td>
+      <td style="font-size:0.72rem;color:var(--muted)">\${(u.created_at+'').slice(0,10)}</td>
+      <td style="white-space:nowrap">
+        <button class="btn btn-sm btn-outline" onclick="resetPassword(\${u.id},'\${u.name.replace(/'/g,'&apos;')}')">🔑 Reset</button>
+        <button class="btn btn-sm btn-danger" style="margin-left:4px" onclick="deleteUser(\${u.id})">✕</button>
+      </td>
+    </tr>\`).join('');
+}
+
+async function resetPassword(id,name){
+  const pwd=prompt('New password for '+name+' (min 6 chars):');
+  if(!pwd||pwd.length<6){alert('Password too short');return;}
+  const r=await fetch('/api/admin/users/'+id+'/reset-password',{method:'PUT',headers:{'Content-Type':'application/json','x-token':adminToken},body:JSON.stringify({password:pwd})}).then(x=>x.json());
+  alert(r.ok?'Password reset successfully!':r.error);
+}
+
+async function deleteUser(id){
+  if(!confirm('Delete this user account? Their face profile remains.')) return;
+  await fetch('/api/admin/users/'+id,{method:'DELETE',headers:{'x-token':adminToken}});
+  loadUsers();
+}
+
+// ── Export ────────────────────────────────────────────────────────────────────
+async function exportAttendance(fmt){
+  const month=document.getElementById('expMonth').value;
+  const year=document.getElementById('expYear').value;
+  window.open('/api/admin/attendance/export?month='+month+'&year='+year+'&format='+fmt+'&_t='+adminToken,'_blank');
+}
+
+async function previewReport(){
+  const month=document.getElementById('expMonth').value;
+  const year=document.getElementById('expYear').value;
+  const rows=await fetch('/api/admin/attendance?month='+month+'&year='+year,{headers:{'x-token':adminToken}}).then(x=>x.json());
+  const el=document.getElementById('reportPreview');
+  if(!rows.length){el.innerHTML='<p style="color:var(--muted);margin-top:10px">No records for this period.</p>';return;}
+  const html=\`<div style="font-size:0.75rem;margin-top:6px;margin-bottom:8px;color:var(--muted)">\${rows.length} records found</div>
+  <div class="table-wrap"><table>
+    <thead><tr><th>Name</th><th>Date</th><th>Shift</th><th>In</th><th>Out</th><th>Status</th></tr></thead>
+    <tbody>\${rows.slice(0,30).map(r=>\`<tr>
+      <td style="font-weight:600">\${r.name}</td>
+      <td>\${(r.date+'').slice(0,10)}</td>
+      <td>\${r.shift_name||'—'}</td>
+      <td style="font-family:monospace">\${r.time_in||'—'}</td>
+      <td style="font-family:monospace">\${r.time_out||'—'}</td>
+      <td><span class="chip \${r.status==='present'?'chip-green':'chip-red'}">\${r.status}</span></td>
+    </tr>\`).join('')}
+    \${rows.length>30?'<tr><td colspan="6" style="text-align:center;color:var(--muted)">...and '+(rows.length-30)+' more</td></tr>':''}</tbody>
+  </table></div>\`;
+  el.innerHTML=html;
+}
+
+// ── SCAN (multi-shift) ────────────────────────────────────────────────────────
 let modelsLoaded=false;
 async function ensureModels(){
   if(modelsLoaded) return;
@@ -1667,28 +1795,125 @@ async function doScan(){
   const mode=document.getElementById('scanMode').value;
   const r=await fetch('/api/admin/scan',{method:'POST',headers:{'Content-Type':'application/json','x-token':adminToken},
     body:JSON.stringify({descriptor:Array.from(det.descriptor),mode})}).then(x=>x.json());
-  showResult(r);
+
+  if(r.event==='face_identified'){
+    // Show shift selection modal
+    pendingScanResult=r;
+    openShiftModal(r);
+  } else {
+    showResult(r);
+    loadScanTab();
+  }
+}
+
+function openShiftModal(r){
+  document.getElementById('shiftModalFaceName').textContent='👤 '+r.name;
+  const now=new Date();
+  document.getElementById('shiftModalTime').textContent='Scan time: '+now.toLocaleTimeString();
+
+  const container=document.getElementById('shiftCheckboxList');
+  const pending=r.pending_shifts||[];
+  const allShifts=r.all_shifts||[];
+
+  if(!allShifts.length){
+    // No shifts configured — just a no-shift mark
+    if(r.has_no_shift_attendance){
+      container.innerHTML='<div style="padding:14px;text-align:center;color:var(--muted);font-size:0.82rem">✅ Attendance already marked today (no-shift)</div>';
+    } else {
+      container.innerHTML='<div style="padding:12px;color:var(--muted);font-size:0.82rem">No shifts configured. Will mark as general attendance.</div>';
+    }
+    document.getElementById('shiftModal').classList.add('open');
+    return;
+  }
+
+  const markedIds=r.marked_shift_ids||[];
+  container.innerHTML=allShifts.map(s=>{
+    const isDone=markedIds.includes(s.id);
+    return \`<label class="shift-select-item\${isDone?' already-done':''}">
+      <input type="checkbox" value="\${s.id}" \${isDone?'disabled checked':''} class="shift-cb">
+      <div style="flex:1">
+        <span style="font-weight:600">\${s.name}</span>
+        <span class="shift-badge">\${s.start_time.slice(0,5)} – \${s.end_time.slice(0,5)}</span>
+      </div>
+      \${isDone?'<span class="done-badge">✅ Done</span>':''}
+    </label>\`;
+  }).join('');
+
+  document.getElementById('shiftModal').classList.add('open');
+}
+
+function closeShiftModal(){
+  document.getElementById('shiftModal').classList.remove('open');
+  pendingScanResult=null;
+}
+
+function selectAllShifts(){
+  document.querySelectorAll('#shiftCheckboxList .shift-cb:not(:disabled)').forEach(cb=>cb.checked=true);
+}
+function clearShiftSelection(){
+  document.querySelectorAll('#shiftCheckboxList .shift-cb:not(:disabled)').forEach(cb=>cb.checked=false);
+}
+
+async function confirmShiftMark(){
+  if(!pendingScanResult) return;
+  const allShifts=pendingScanResult.all_shifts||[];
+  let selectedIds=[];
+  if(allShifts.length){
+    selectedIds=Array.from(document.querySelectorAll('#shiftCheckboxList .shift-cb:not(:disabled):checked')).map(cb=>parseInt(cb.value));
+    if(!selectedIds.length&&!pendingScanResult.has_no_shift_attendance){
+      // no shifts at all — mark with null
+      selectedIds=[];
+    } else if(!selectedIds.length){
+      alert('Please select at least one shift to mark.');
+      return;
+    }
+  }
+  closeShiftModal();
+
+  const r=await fetch('/api/admin/mark-attendance',{method:'POST',
+    headers:{'Content-Type':'application/json','x-token':adminToken},
+    body:JSON.stringify({face_id:pendingScanResult.face_id,shift_ids:selectedIds})
+  }).then(x=>x.json());
+
+  showMultiResult(r);
   loadScanTab();
 }
 
+function showMultiResult(r){
+  if(!r||r.error){showResult({event:'error',message:r?.error||'Error'},'❌');return;}
+  const marked=r.results?.filter(x=>x.ok)||[];
+  const skipped=r.results?.filter(x=>x.skipped)||[];
+  const color='var(--green)';
+  document.getElementById('resultBody').innerHTML=\`
+    <div style="text-align:center;padding:10px">
+      <div style="font-size:2rem">✅</div>
+      <div style="font-size:1rem;font-weight:700;color:\${color};margin:6px 0">\${r.name}</div>
+      <div style="font-size:0.8rem;color:var(--muted)">⏱ In: \${r.time_in}</div>
+      \${marked.length?'<div style="margin-top:8px;font-size:0.75rem;color:var(--text)">Marked: '+marked.map(x=>'<span class="chip chip-green" style="margin:1px">'+( x.shift_name||'General')+'</span>').join('')+'</div>':''}
+      \${skipped.length?'<div style="margin-top:4px;font-size:0.73rem;color:var(--muted)">Already marked: '+skipped.map(x=>'<span class="chip chip-gray" style="margin:1px">'+(x.shift_name||'General')+'</span>').join('')+'</div>':''}
+    </div>\`;
+}
+
 function showResult(r,icon=''){
-  const icons={checkin:'✅',checkout:'👋',unknown:'❓',already_checked_in:'ℹ️',already_checked_out:'ℹ️',not_checked_in:'⚠️'};
+  const icons={checkin:'✅',checkout:'👋',unknown:'❓',already_checked_in:'ℹ️',already_checked_out:'ℹ️',not_checked_in:'⚠️',no_face:'⚠️',no_faces:'ℹ️',error:'❌'};
   const ic=icon||icons[r.event]||'📋';
-  const color={checkin:'var(--green)',checkout:'var(--accent)',unknown:'var(--red)',already_checked_in:'var(--yellow)'}[r.event]||'var(--muted)';
+  const color={checkin:'var(--green)',checkout:'var(--accent)',unknown:'var(--red)',already_checked_in:'var(--yellow)',no_face:'var(--yellow)'}[r.event]||'var(--muted)';
+  // Always show label — use name or event as fallback
+  const label=r.name||(r.event?r.event.replace(/_/g,' '):'');
   document.getElementById('resultBody').innerHTML=\`
     <div style="text-align:center;padding:10px">
       <div style="font-size:2rem">\${ic}</div>
-      <div style="font-size:1rem;font-weight:700;color:\${color};margin:6px 0">\${r.name||r.event}</div>
+      <div style="font-size:1rem;font-weight:700;color:\${color};margin:6px 0">\${label}</div>
       \${r.time_in?\`<div style="font-size:0.8rem;color:var(--muted)">In: \${r.time_in}</div>\`:''}
       \${r.time_out?\`<div style="font-size:0.8rem;color:var(--muted)">Out: \${r.time_out}</div>\`:''}
       \${r.shift?\`<div style="font-size:0.72rem;color:var(--accent)">Shift: \${r.shift}</div>\`:''}
-      \${r.message?\`<div style="font-size:0.78rem;color:var(--muted);margin-top:4px">\${r.message}</div>\`:''}
+      \${r.message?\`<div style="font-size:0.76rem;color:var(--muted);margin-top:4px">\${r.message}</div>\`:''}
     </div>\`;
 }
 
 async function loadScanTab(){
   const today=new Date().toISOString().split('T')[0];
-  const rows=await fetch(\`/api/admin/attendance?date=\${today}\`,{headers:{'x-token':adminToken}}).then(x=>x.json());
+  const rows=await fetch('/api/admin/attendance?date='+today,{headers:{'x-token':adminToken}}).then(x=>x.json());
   const allFaces=await fetch('/api/admin/faces',{headers:{'x-token':adminToken}}).then(x=>x.json());
   const present=rows.filter(r=>r.status==='present').length,total=allFaces.length;
   document.getElementById('todayStats').innerHTML=\`
@@ -1698,24 +1923,28 @@ async function loadScanTab(){
     <div class="stat card-sm"><div class="stat-val yellow">\${rows.filter(r=>r.time_out).length}</div><div class="stat-label">Checked Out</div></div>
   \`;
   document.getElementById('todayList').innerHTML=rows.map(r=>\`
-    <div style="display:flex;justify-content:space-between;padding:6px 0;border-bottom:1px solid var(--surface)">
-      <span>\${r.name}</span>
-      <span style="color:var(--muted);font-size:0.72rem">\${r.time_in} \${r.time_out?'→ '+r.time_out:''}</span>
-    </div>\`).join('')||'<p style="color:var(--muted);font-size:0.8rem">No attendance today</p>';
+    <div style="display:flex;justify-content:space-between;align-items:center;padding:6px 0;border-bottom:1px solid var(--surface)">
+      <div>
+        <span style="font-weight:600">\${r.name}</span>
+        \${r.shift_name?\`<span class="chip chip-blue" style="margin-left:4px;font-size:0.58rem">\${r.shift_name}</span>\`:''}
+      </div>
+      <span style="color:var(--muted);font-size:0.7rem;white-space:nowrap">\${r.time_in}\${r.time_out?' → '+r.time_out:''}</span>
+    </div>\`).join('')||'<p style="color:var(--muted);font-size:0.78rem;text-align:center;padding:16px 0">No attendance today</p>';
 }
 
 function toggleAuto(){
   autoMode=!autoMode;
   const btn=document.getElementById('autoBtn');
-  if(autoMode){btn.textContent='Stop Auto';btn.classList.add('active');autoTimer=setInterval(()=>doScan(),3000);}
+  if(autoMode){btn.textContent='⏹ Stop';btn.classList.add('active');autoTimer=setInterval(()=>doScan(),3000);}
   else{btn.textContent='Auto';btn.classList.remove('active');clearInterval(autoTimer);}
 }
 
+// ── Calendar ──────────────────────────────────────────────────────────────────
 const MONTH_NAMES=['January','February','March','April','May','June','July','August','September','October','November','December'];
 function changeMonth(d){calMonth+=d;if(calMonth>12){calMonth=1;calYear++;}if(calMonth<1){calMonth=12;calYear--;}renderCalendar();}
 
 async function renderCalendar(){
-  calData=await fetch(\`/api/admin/calendar?month=\${calMonth}&year=\${calYear}\`,{headers:{'x-token':adminToken}}).then(x=>x.json());
+  calData=await fetch('/api/admin/calendar?month='+calMonth+'&year='+calYear,{headers:{'x-token':adminToken}}).then(x=>x.json());
   document.getElementById('calTitle').textContent=MONTH_NAMES[calMonth-1]+' '+calYear;
   document.getElementById('calHead').innerHTML=['Sun','Mon','Tue','Wed','Thu','Fri','Sat'].map(d=>\`<div class="cal-head">\${d}</div>\`).join('');
   const first=new Date(calYear,calMonth-1,1).getDay(),days=new Date(calYear,calMonth,0).getDate(),today=new Date();
@@ -1774,7 +2003,7 @@ async function toggleHoliday(){
 });
 
 // ═══════════════════════════════════════════════════════════════════════════════
-//  USER PAGE — auto notification modal after 5 seconds
+//  USER PAGE
 // ═══════════════════════════════════════════════════════════════════════════════
 app.get('/user', (_, res) => {
   res.send(htmlBase('Employee Portal', `
@@ -1784,21 +2013,24 @@ app.get('/user', (_, res) => {
 </nav>
 <main id="app">
   <!-- Login -->
-  <div id="loginSection" style="max-width:400px;margin:60px auto">
+  <div id="loginSection" style="max-width:400px;margin:50px auto">
     <div class="page-title">👤 Employee Login</div>
     <div class="card">
       <div id="loginErr" class="alert alert-error" style="display:none"></div>
-      <div class="form-group"><label>Email</label><input class="form-control" id="uEmail" type="email"></div>
-      <div class="form-group"><label>Password</label><input class="form-control" id="uPass" type="password"></div>
+      <div class="form-group"><label>Email</label><input class="form-control" id="uEmail" type="email" autocomplete="email"></div>
+      <div class="form-group"><label>Password</label><input class="form-control" id="uPass" type="password" autocomplete="current-password"></div>
       <button class="btn btn-primary" style="width:100%" onclick="doUserLogin()">Login</button>
+      <div style="text-align:center;margin-top:12px;font-size:0.75rem;color:var(--muted)">
+        <a href="/portal" style="color:var(--accent);text-decoration:none">← Back to Portal</a>
+      </div>
     </div>
   </div>
 
   <!-- Dashboard -->
   <div id="userDash" style="display:none">
-    <div class="grid4" id="statsRow" style="margin-bottom:18px"></div>
+    <div class="grid4" id="statsRow" style="margin-bottom:16px"></div>
     <div class="card">
-      <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:16px">
+      <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:14px;flex-wrap:wrap;gap:8px">
         <button class="btn btn-outline btn-sm" onclick="changeMonth(-1)">&#8249; Prev</button>
         <span id="calTitle" style="font-weight:700"></span>
         <button class="btn btn-outline btn-sm" onclick="changeMonth(1)">Next &#8250;</button>
@@ -1815,10 +2047,10 @@ app.get('/user', (_, res) => {
 
 <!-- Notification Permission Modal -->
 <div id="notifModal" class="modal-backdrop">
-  <div class="modal" style="text-align:center;max-width:380px">
+  <div class="modal" style="text-align:center;max-width:360px">
     <div class="notif-modal-icon">🔔</div>
-    <div style="font-weight:700;font-size:1.05rem;margin-bottom:8px">Enable Attendance Alerts</div>
-    <div style="font-size:0.82rem;color:var(--muted);margin-bottom:20px;line-height:1.6">
+    <div style="font-weight:700;font-size:1rem;margin-bottom:8px">Enable Attendance Alerts</div>
+    <div style="font-size:0.8rem;color:var(--muted);margin-bottom:18px;line-height:1.6">
       Get instant push notifications when your attendance is marked — check-in &amp; check-out alerts sent right to your device.
     </div>
     <div style="display:flex;flex-direction:column;gap:10px">
@@ -1853,48 +2085,50 @@ async function showUserDash(r){
   document.getElementById('loginSection').style.display='none';
   document.getElementById('userDash').style.display='block';
   let logoHtml='';
-  if(r.logo_base64) logoHtml=\`<img src="\${r.logo_base64}" style="height:32px;border-radius:6px;margin-right:6px">\`;
+  if(r.logo_base64) logoHtml=\`<img src="\${r.logo_base64}" style="height:30px;border-radius:6px;margin-right:6px">\`;
   document.getElementById('navLogo').innerHTML=logoHtml+'Face<span style="color:var(--accent)">Attend</span>';
   document.getElementById('navRight').innerHTML=\`
-    <span style="font-size:0.75rem;color:var(--muted)">\${r.name||''}</span>
+    <span style="font-size:0.72rem;color:var(--muted)">\${r.name||''}</span>
     <span class="badge badge-user">Employee</span>
     <button class="btn btn-sm btn-outline" onclick="userLogout()">Logout</button>\`;
 
   renderCalendar();
 
-  // Auto-show notification modal after 5 seconds — only if not already enabled
-  // and browser supports push + permission not yet decided
+  // Fix: register SW first, THEN request push permission
   if('serviceWorker' in navigator && 'PushManager' in navigator){
-    await navigator.serviceWorker.register('/sw.js');
-    const notifPerm=Notification.permission;
-    const alreadyEnabled=r.notifications_enabled;
-    if(!alreadyEnabled && notifPerm!=='denied'){
-      setTimeout(()=>{
-        document.getElementById('notifModal').classList.add('open');
-      }, 5000);
-    }
+    try{
+      const reg=await navigator.serviceWorker.register('/sw.js');
+      await navigator.serviceWorker.ready; // wait until active
+      const notifPerm=Notification.permission;
+      const alreadyEnabled=r.notifications_enabled;
+      if(!alreadyEnabled && notifPerm!=='denied'){
+        setTimeout(()=>{
+          document.getElementById('notifModal').classList.add('open');
+        }, 5000);
+      }
+    }catch(e){ console.warn('SW registration failed:',e.message); }
   }
 }
 
 async function enableNotif(){
   dismissNotifModal();
   const perm=await Notification.requestPermission();
-  if(perm!=='granted'){alert('Notifications were blocked. You can enable them from browser settings.');return;}
+  if(perm!=='granted'){showToast('⚠️ Notifications blocked. Enable from browser settings.');return;}
   try{
     const reg=await navigator.serviceWorker.ready;
     const vapid=await fetch('/api/vapid-public').then(x=>x.json());
-    if(!vapid.key){alert('Push notifications not configured on this server yet.');return;}
+    if(!vapid.key){showToast('ℹ️ Push notifications not configured on this server.');return;}
     const sub=await reg.pushManager.subscribe({
       userVisibleOnly:true,
       applicationServerKey:urlBase64ToUint8Array(vapid.key)
     });
-    await fetch('/api/user/push-subscribe',{method:'POST',
+    const result=await fetch('/api/user/push-subscribe',{method:'POST',
       headers:{'Content-Type':'application/json','x-token':userToken},
-      body:JSON.stringify({subscription:sub.toJSON()})});
-    // Show success toast
-    showToast('✅ Notifications enabled! You will be notified on every attendance mark.');
+      body:JSON.stringify({subscription:sub.toJSON()})}).then(x=>x.json());
+    if(result.ok) showToast('✅ Notifications enabled! You will be notified on every attendance mark.');
+    else showToast('❌ Subscription failed: '+result.error);
   } catch(e){
-    alert('Could not subscribe: '+e.message);
+    showToast('❌ Could not subscribe: '+e.message);
   }
 }
 
@@ -1904,7 +2138,7 @@ function dismissNotifModal(){
 
 function showToast(msg){
   const t=document.createElement('div');
-  t.style.cssText='position:fixed;bottom:20px;left:50%;transform:translateX(-50%);background:#1f2937;color:white;padding:12px 20px;border-radius:12px;font-size:0.82rem;z-index:9999;box-shadow:0 8px 24px rgba(0,0,0,0.2);transition:opacity 0.4s';
+  t.style.cssText='position:fixed;bottom:24px;left:50%;transform:translateX(-50%);background:#1f2937;color:white;padding:12px 20px;border-radius:12px;font-size:0.8rem;z-index:9999;box-shadow:0 8px 24px rgba(0,0,0,0.2);transition:opacity 0.4s;max-width:90vw;text-align:center';
   t.textContent=msg;
   document.body.appendChild(t);
   setTimeout(()=>{t.style.opacity='0';setTimeout(()=>t.remove(),400);},4000);
@@ -1920,7 +2154,7 @@ function urlBase64ToUint8Array(base64String){
 function changeMonth(d){calMonth+=d;if(calMonth>12){calMonth=1;calYear++;}if(calMonth<1){calMonth=12;calYear--;}renderCalendar();}
 
 async function renderCalendar(){
-  calData=await fetch(\`/api/user/attendance?month=\${calMonth}&year=\${calYear}\`,{headers:{'x-token':userToken}}).then(x=>x.json());
+  calData=await fetch('/api/user/attendance?month='+calMonth+'&year='+calYear,{headers:{'x-token':userToken}}).then(x=>x.json());
   document.getElementById('calTitle').textContent=MONTH_NAMES[calMonth-1]+' '+calYear;
   const present=calData.attendance.filter(a=>a.status==='present').length;
   const absent=calData.attendance.filter(a=>a.status==='absent').length;
@@ -1929,8 +2163,8 @@ async function renderCalendar(){
   document.getElementById('statsRow').innerHTML=\`
     <div class="stat"><div class="stat-val green">\${present}</div><div class="stat-label">Present</div></div>
     <div class="stat"><div class="stat-val red">\${absent}</div><div class="stat-label">Absent</div></div>
-    <div class="stat"><div class="stat-val">\${total}</div><div class="stat-label">Days Marked</div></div>
-    <div class="stat"><div class="stat-val \${pct>=80?'green':pct>=60?'yellow':'red'}">\${pct}%</div><div class="stat-label">Attendance %</div></div>
+    <div class="stat"><div class="stat-val">\${total}</div><div class="stat-label">Marked</div></div>
+    <div class="stat"><div class="stat-val \${pct>=80?'green':pct>=60?'yellow':'red'}">\${pct}%</div><div class="stat-label">Rate</div></div>
   \`;
   document.getElementById('calHead').innerHTML=['Sun','Mon','Tue','Wed','Thu','Fri','Sat'].map(d=>\`<div class="cal-head">\${d}</div>\`).join('');
   const first=new Date(calYear,calMonth-1,1).getDay(),days=new Date(calYear,calMonth,0).getDate(),today=new Date();
@@ -1938,37 +2172,37 @@ async function renderCalendar(){
   for(let i=0;i<first;i++) cells+=\`<div class="cal-day other-month"></div>\`;
   for(let d=1;d<=days;d++){
     const dateStr=calYear+'-'+String(calMonth).padStart(2,'0')+'-'+String(d).padStart(2,'0');
-    const att=calData.attendance.find(a=>(a.date+'').startsWith(dateStr));
+    const dayAtts=calData.attendance.filter(a=>(a.date+'').startsWith(dateStr));
     const hol=calData.holidays.find(h=>(h.date+'').startsWith(dateStr));
     const isToday=today.getDate()===d&&today.getMonth()===calMonth-1&&today.getFullYear()===calYear;
+    const presentAtts=dayAtts.filter(a=>a.status==='present');
     cells+=\`<div class="cal-day\${isToday?' today':''}\${hol?' holiday':''}">
       <div class="cal-day-num">\${d}</div>
-      \${att?\`<span class="cal-event \${att.status==='present'?'cal-present':'cal-absent'}">\${att.status==='present'?'✅':'❌'}\${att.shift_name?' '+att.shift_name:''}</span>\`:''}
+      \${presentAtts.length?\`<span class="cal-event cal-present">✅\${presentAtts.length>1?' ×'+presentAtts.length:presentAtts[0].shift_name?' '+presentAtts[0].shift_name:''}</span>\`:''}
       \${hol?\`<span class="cal-event cal-holiday-tag">\${hol.label}</span>\`:''}
     </div>\`;
   }
   document.getElementById('calGrid').innerHTML=cells;
 
-  const recent=calData.attendance.slice(0,10);
+  const recent=calData.attendance.slice(0,15);
   document.getElementById('recentList').innerHTML=recent.length?recent.map(a=>\`
-    <div style="display:flex;justify-content:space-between;padding:8px 0;border-bottom:1px solid var(--surface)">
+    <div style="display:flex;justify-content:space-between;align-items:center;padding:8px 0;border-bottom:1px solid var(--surface)">
       <div>
         <span class="chip \${a.status==='present'?'chip-green':'chip-red'}">\${a.status==='present'?'✅ Present':'❌ Absent'}</span>
         \${a.shift_name?\`<span class="chip chip-blue" style="margin-left:4px">\${a.shift_name}</span>\`:''}
       </div>
-      <div style="text-align:right;font-size:0.75rem;color:var(--muted)">
+      <div style="text-align:right;font-size:0.72rem;color:var(--muted)">
         <div>\${(a.date+'').slice(0,10)}</div>
-        \${a.time_in?\`<div>In: \${a.time_in}\${a.time_out?' | Out: '+a.time_out:''}</div>\`:''}
+        \${a.time_in?\`<div>\${a.time_in}\${a.time_out?' → '+a.time_out:''}</div>\`:''}
       </div>
-    </div>\`).join(''):'<p style="color:var(--muted);font-size:0.82rem">No attendance records for this month</p>';
+    </div>\`).join(''):'<p style="color:var(--muted);font-size:0.8rem">No attendance records for this month</p>';
 }
 
 (async function(){
   if(userToken){
     const r=await fetch('/api/user/notif-status',{headers:{'x-token':userToken}}).then(x=>x.json()).catch(()=>null);
     if(r!==null&&!r.error){
-      const tok=userToken;
-      const parts=tok.split('.');
+      const parts=userToken.split('.');
       const pay=JSON.parse(atob(parts[1]));
       showUserDash({name:pay.name,logo_base64:null,notifications_enabled:r.enabled});
     } else {
