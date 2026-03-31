@@ -1854,43 +1854,61 @@ function clearShiftSelection(){
 }
 
 async function confirmShiftMark(){
-  if(!pendingScanResult) return;
-  const allShifts=pendingScanResult.all_shifts||[];
-  let selectedIds=[];
+  if(!pendingScanResult) return;                    // guard
+  const saved = pendingScanResult;                  // ← save BEFORE closing
+  const allShifts = saved.all_shifts || [];
+  let selectedIds = [];
+
   if(allShifts.length){
-    selectedIds=Array.from(document.querySelectorAll('#shiftCheckboxList .shift-cb:not(:disabled):checked')).map(cb=>parseInt(cb.value));
-    if(!selectedIds.length&&!pendingScanResult.has_no_shift_attendance){
-      // no shifts at all — mark with null
-      selectedIds=[];
-    } else if(!selectedIds.length){
+    selectedIds = Array.from(
+      document.querySelectorAll('#shiftCheckboxList .shift-cb:not(:disabled):checked')
+    ).map(cb => parseInt(cb.value));
+
+    if(!selectedIds.length && !saved.has_no_shift_attendance){
       alert('Please select at least one shift to mark.');
       return;
     }
   }
-  closeShiftModal();
 
-  const r=await fetch('/api/admin/mark-attendance',{method:'POST',
-    headers:{'Content-Type':'application/json','x-token':adminToken},
-    body:JSON.stringify({face_id:pendingScanResult.face_id,shift_ids:selectedIds})
-  }).then(x=>x.json());
+  closeShiftModal();                                // ← now safe to close
+
+  const r = await fetch('/api/admin/mark-attendance', {
+    method: 'POST',
+    headers: {'Content-Type':'application/json','x-token': adminToken},
+    body: JSON.stringify({face_id: saved.face_id, shift_ids: selectedIds})
+  }).then(x => x.json());
 
   showMultiResult(r);
   loadScanTab();
 }
 
-function showMultiResult(r){
-  if(!r||r.error){showResult({event:'error',message:r?.error||'Error'},'❌');return;}
-  const marked=r.results?.filter(x=>x.ok)||[];
-  const skipped=r.results?.filter(x=>x.skipped)||[];
-  const color='var(--green)';
-  document.getElementById('resultBody').innerHTML=\`
+function showResult(r, icon=''){
+  const icons = {
+    checkin:'✅', checkout:'👋', unknown:'❓',
+    already_checked_in:'ℹ️', already_checked_out:'ℹ️',
+    not_checked_in:'⚠️', no_face:'⚠️', no_faces:'ℹ️', error:'❌'
+  };
+  const ic = icon || icons[r.event] || '📋';
+  const colorMap = {
+    checkin:'var(--green)', checkout:'var(--accent)',
+    unknown:'var(--red)', no_face:'var(--yellow)',
+    already_checked_in:'var(--yellow)'
+  };
+  const color = colorMap[r.event] || 'var(--muted)';
+
+  // ← always show something as label
+  const label = r.name
+    || (r.event ? r.event.replace(/_/g,' ') : 'Unknown');
+
+  document.getElementById('resultBody').innerHTML = `
     <div style="text-align:center;padding:10px">
-      <div style="font-size:2rem">✅</div>
-      <div style="font-size:1rem;font-weight:700;color:\${color};margin:6px 0">\${r.name}</div>
-      <div style="font-size:0.8rem;color:var(--muted)">⏱ In: \${r.time_in}</div>
-      \${marked.length?'<div style="margin-top:8px;font-size:0.75rem;color:var(--text)">Marked: '+marked.map(x=>'<span class="chip chip-green" style="margin:1px">'+( x.shift_name||'General')+'</span>').join('')+'</div>':''}
-      \${skipped.length?'<div style="margin-top:4px;font-size:0.73rem;color:var(--muted)">Already marked: '+skipped.map(x=>'<span class="chip chip-gray" style="margin:1px">'+(x.shift_name||'General')+'</span>').join('')+'</div>':''}
-    </div>\`;
+      <div style="font-size:2rem">${ic}</div>
+      <div style="font-size:1rem;font-weight:700;color:${color};margin:6px 0">${label}</div>
+      ${r.time_in  ? `<div style="font-size:0.8rem;color:var(--muted)">In: ${r.time_in}</div>`  : ''}
+      ${r.time_out ? `<div style="font-size:0.8rem;color:var(--muted)">Out: ${r.time_out}</div>` : ''}
+      ${r.shift    ? `<div style="font-size:0.72rem;color:var(--accent)">Shift: ${r.shift}</div>` : ''}
+      ${r.message  ? `<div style="font-size:0.76rem;color:var(--muted);margin-top:4px">${r.message}</div>` : ''}
+    </div>`;
 }
 
 function showResult(r,icon=''){
