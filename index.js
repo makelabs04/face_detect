@@ -366,6 +366,15 @@ function download(url, dest) {
   });
 }
 
+// Minimum expected sizes for each model file (bytes) — shards must be > 1 MB
+const MODEL_MIN_SIZES = {
+  'ssd_mobilenetv1_model-shard1': 2_000_000,
+  'ssd_mobilenetv1_model-shard2': 2_000_000,
+  'face_landmark_68_model-shard1': 300_000,
+  'face_recognition_model-shard1': 6_000_000,
+  'face_recognition_model-shard2': 1_000_000,
+};
+
 async function setup() {
   [PUBLIC_DIR, MODELS_DIR, UNKNOWN_IMAGES_DIR].forEach(d => {
     if (!fs.existsSync(d)) fs.mkdirSync(d, { recursive: true });
@@ -379,12 +388,18 @@ async function setup() {
   const missing = MODEL_FILES.filter(f => {
     const fp = path.join(MODELS_DIR, f);
     if (!fs.existsSync(fp)) return true;
-    if (fs.statSync(fp).size < 100) { fs.unlinkSync(fp); return true; }
+    const size = fs.statSync(fp).size;
+    const minSize = MODEL_MIN_SIZES[f] || 500; // default 500 bytes for JSON manifests
+    if (size < minSize) {
+      console.log(`⚠️  Deleting corrupted/truncated model: ${f} (${size} bytes, expected ≥ ${minSize})`);
+      fs.unlinkSync(fp);
+      return true;
+    }
     return false;
   });
-  if (!missing.length) { console.log('✅ All models cached'); }
+  if (!missing.length) { console.log('✅ All models cached and valid'); }
   else {
-    console.log('📥 Downloading models...');
+    console.log('📥 Downloading', missing.length, 'model file(s)...');
     for (const f of missing) {
       try { await download(MODEL_BASE_URL+f, path.join(MODELS_DIR,f)); console.log('  ✅', f); }
       catch(e) { console.log('  ❌', f, e.message); }
@@ -392,6 +407,22 @@ async function setup() {
   }
   console.log('\n🚀 FaceAttend SaaS running on http://localhost:' + PORT + '\n');
 }
+
+// ── Admin API: force re-download corrupted models ────────────────────────────
+app.post('/api/admin/reload-models', authMiddleware('admin'), async (req, res) => {
+  try {
+    let deleted = 0;
+    for (const f of MODEL_FILES) {
+      const fp = path.join(MODELS_DIR, f);
+      if (fs.existsSync(fp)) { fs.unlinkSync(fp); deleted++; }
+    }
+    // Re-download in background
+    setup().catch(e => console.warn('Model reload error:', e.message));
+    res.json({ ok: true, message: `Deleted ${deleted} cached model files. Re-downloading now — reload the page in ~30 seconds.` });
+  } catch(e) {
+    res.json({ error: e.message });
+  }
+});
 
 // ═══════════════════════════════════════════════════════════════════════════════
 //  SHARED CSS
@@ -1470,6 +1501,10 @@ app.get('/admin', (_, res) => {
             </div>
           </div>
           <div style="display:grid;grid-template-columns:repeat(4,1fr);gap:8px;margin-top:10px" id="todayStats"></div>
+          <div id="modelErrorBanner" style="display:none;margin-top:10px;padding:10px 14px;background:rgba(248,113,113,0.1);border:1px solid rgba(248,113,113,0.3);border-radius:10px;font-size:0.78rem;color:var(--red);display:flex;align-items:center;justify-content:space-between;gap:10px">
+            <span>⚠️ Face recognition models are corrupted or missing. Click to fix.</span>
+            <button class="btn btn-sm btn-danger" onclick="reloadModels()">🔄 Fix Models</button>
+          </div>
         </div>
         <div>
           <div class="result-card" id="resultCard">
@@ -2025,20 +2060,54 @@ async function previewReport(){
   el.innerHTML=html;
 }
 
-// ── SCAN (multi-shift) ────────────────────────────────────────────────────────
+// ── SCAN (multi-period) ────────────────────────────────────────────────────────
 let modelsLoaded=false;
 async function ensureModels(){
   if(modelsLoaded) return;
-  await faceapi.nets.ssdMobilenetv1.loadFromUri('/models');
-  await faceapi.nets.faceLandmark68Net.loadFromUri('/models');
-  await faceapi.nets.faceRecognitionNet.loadFromUri('/models');
-  modelsLoaded=true;
+  try {
+    await faceapi.nets.ssdMobilenetv1.loadFromUri('/models');
+    await faceapi.nets.faceLandmark68Net.loadFromUri('/models');
+    await faceapi.nets.faceRecognitionNet.loadFromUri('/models');
+    modelsLoaded=true;
+    // Hide error banner if it was shown
+    const banner=document.getElementById('modelErrorBanner');
+    if(banner) banner.style.display='none';
+  } catch(e) {
+    // Show the fix banner
+    const banner=document.getElementById('modelErrorBanner');
+    if(banner) banner.style.display='flex';
+    throw e; // re-throw so doScan catches it
+  }
+}
+
+async function reloadModels(){
+  const btn=document.querySelector('#modelErrorBanner button');
+  if(btn){btn.disabled=true;btn.textContent='⏳ Re-downloading...';}
+  try {
+    const r=await fetch('/api/admin/reload-models',{method:'POST',headers:{'x-token':adminToken}}).then(x=>x.json());
+    if(r.ok){
+      showToast('✅ '+r.message);
+      modelsLoaded=false; // force reload next scan
+      setTimeout(()=>location.reload(), 3000);
+    } else {
+      showToast('❌ '+(r.error||'Failed'));
+      if(btn){btn.disabled=false;btn.textContent='🔄 Fix Models';}
+    }
+  } catch(e) {
+    showToast('❌ '+e.message);
+    if(btn){btn.disabled=false;btn.textContent='🔄 Fix Models';}
+  }
 }
 
 async function doScan(){
   const v=document.getElementById('video');
   if(!v||!v.srcObject) return;
-  await ensureModels();
+  try {
+    await ensureModels();
+  } catch(e) {
+    showResult({event:'error',message:'Model error — click "Fix Models" above'},'❌');
+    return;
+  }
   const det=await faceapi.detectSingleFace(v).withFaceLandmarks().withFaceDescriptor();
   if(!det){showResult({event:'no_face',message:'No face detected'},'⚠️');return;}
   const mode=document.getElementById('scanMode').value;
