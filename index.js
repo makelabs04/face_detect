@@ -1,18 +1,3 @@
-/**
- * FaceAttend SaaS — Multi-tenant Face Recognition Attendance
- * Roles: super_admin | admin (tenant) | user (employee)
- *
- * Changes v3 → v4:
- *  - Multi-shift attendance: select one / multiple / all pending shifts per scan
- *  - Duplicate scan prevention per shift per day
- *  - Admin: export attendance (CSV/Excel)
- *  - Admin: user management tab (view/delete users)
- *  - Notification subscription fix (service worker registration order)
- *  - Scan result label always shown
- *  - Improved UI mobile responsiveness across all pages
- *  - Attendance table updated: UNIQUE KEY now per face+date+shift combo
- */
-
 'use strict';
 
 require('dotenv').config();
@@ -432,6 +417,8 @@ tr:hover td{background:var(--surface)}
 .cam-wrap video,.cam-wrap canvas{position:absolute;inset:0;width:100%;height:100%;object-fit:cover}
 .scan-line{position:absolute;left:0;right:0;height:2px;background:linear-gradient(90deg,transparent,var(--accent),transparent);animation:scan 3s ease-in-out infinite;opacity:0.4;pointer-events:none}
 @keyframes scan{0%{top:0}50%{top:calc(100% - 2px)}100%{top:0}}
+.detect-label{position:absolute;bottom:10px;left:50%;transform:translateX(-50%);background:rgba(0,0,0,0.65);color:#fff;font-size:0.72rem;font-family:'JetBrains Mono',monospace;padding:4px 12px;border-radius:20px;pointer-events:none;white-space:nowrap;z-index:10;transition:opacity 0.3s;opacity:0}
+.detect-label.visible{opacity:1}
 .cam-controls{padding:10px 12px;background:var(--surface);display:flex;gap:6px;align-items:center;flex-wrap:wrap}
 .btn-checkin{background:var(--accent);color:#fff}.btn-checkin:hover:not(:disabled){background:#009ed8;transform:translateY(-1px)}
 .btn-checkin:disabled{opacity:0.5;cursor:not-allowed}
@@ -1305,6 +1292,7 @@ app.get('/admin', (_, res) => {
               <video id="video" autoplay muted playsinline></video>
               <canvas id="overlay"></canvas>
               <div class="scan-line"></div>
+              <div class="detect-label" id="detectLabel"></div>
             </div>
             <div class="cam-controls">
               <div style="flex:1;display:flex;align-items:center;gap:8px;font-size:0.72rem;color:var(--muted);min-width:0">
@@ -1788,21 +1776,38 @@ async function ensureModels(){
   modelsLoaded=true;
 }
 
+function showDetectLabel(text, duration=2000){
+  const el=document.getElementById('detectLabel');
+  if(!el) return;
+  el.textContent=text;
+  el.classList.add('visible');
+  clearTimeout(el._t);
+  if(duration>0) el._t=setTimeout(()=>el.classList.remove('visible'), duration);
+}
+
 async function doScan(){
   const v=document.getElementById('video');
   if(!v||!v.srcObject) return;
+  showDetectLabel('🔍 Scanning…', 0);          // stage 1: scanning
   await ensureModels();
   const det=await faceapi.detectSingleFace(v).withFaceLandmarks().withFaceDescriptor();
-  if(!det){showResult({event:'no_face',message:'No face detected'},'⚠️');return;}
+  if(!det){
+    showDetectLabel('⚠️ No face detected');
+    showResult({event:'no_face',message:'No face detected'},'⚠️');
+    return;
+  }
+  showDetectLabel('⏳ Identifying…', 0);        // stage 2: identifying
   const mode=document.getElementById('scanMode').value;
   const r=await fetch('/api/admin/scan',{method:'POST',headers:{'Content-Type':'application/json','x-token':adminToken},
     body:JSON.stringify({descriptor:Array.from(det.descriptor),mode})}).then(x=>x.json());
 
   if(r.event==='face_identified'){
-    // Show shift selection modal
+    showDetectLabel('✅ '+r.name);              // stage 3: result
     pendingScanResult=r;
     openShiftModal(r);
   } else {
+    const icon = r.event==='unknown'?'❓':'ℹ️';
+    showDetectLabel(icon+' '+(r.name||r.message||r.event));
     showResult(r);
     loadScanTab();
   }
