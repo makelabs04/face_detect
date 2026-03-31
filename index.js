@@ -15,6 +15,8 @@
 
 'use strict';
 
+require('dotenv').config();
+
 const express   = require('express');
 const mysql     = require('mysql2');
 const https     = require('https');
@@ -1481,7 +1483,7 @@ app.get('/admin', (_, res) => {
   <div class="modal" style="max-width:420px">
     <div class="modal-title">
       <span>Select Shifts to Mark</span>
-      <button class="modal-close" onclick="closeShiftModal()">✕</button>
+      <button class="modal-close" onclick="dismissShiftModal()">✕</button>
     </div>
     <div id="shiftModalFaceName" style="font-size:1rem;font-weight:700;margin-bottom:6px;color:var(--accent)"></div>
     <div style="font-size:0.75rem;color:var(--muted);margin-bottom:14px" id="shiftModalTime"></div>
@@ -1495,7 +1497,7 @@ app.get('/admin', (_, res) => {
 
     <div style="margin-top:14px;display:flex;gap:10px">
       <button class="btn btn-primary" style="flex:1" onclick="confirmShiftMark()">✅ Mark Attendance</button>
-      <button class="btn btn-outline" onclick="closeShiftModal()">Cancel</button>
+      <button class="btn btn-outline" onclick="dismissShiftModal()">Cancel</button>
     </div>
   </div>
 </div>
@@ -1844,6 +1846,12 @@ function openShiftModal(r){
 
 function closeShiftModal(){
   document.getElementById('shiftModal').classList.remove('open');
+  // Note: do NOT null pendingScanResult here — confirmShiftMark needs it after closing
+}
+
+function dismissShiftModal(){
+  // Cancel button — close and discard
+  document.getElementById('shiftModal').classList.remove('open');
   pendingScanResult=null;
 }
 
@@ -1856,23 +1864,31 @@ function clearShiftSelection(){
 
 async function confirmShiftMark(){
   if(!pendingScanResult) return;
+
   const allShifts=pendingScanResult.all_shifts||[];
   let selectedIds=[];
+
   if(allShifts.length){
-    selectedIds=Array.from(document.querySelectorAll('#shiftCheckboxList .shift-cb:not(:disabled):checked')).map(cb=>parseInt(cb.value));
-    if(!selectedIds.length&&!pendingScanResult.has_no_shift_attendance){
-      // no shifts at all — mark with null
-      selectedIds=[];
-    } else if(!selectedIds.length){
+    selectedIds=Array.from(document.querySelectorAll('#shiftCheckboxList .shift-cb:not(:disabled):checked'))
+      .map(cb=>parseInt(cb.value));
+    if(!selectedIds.length){
       alert('Please select at least one shift to mark.');
       return;
     }
   }
-  closeShiftModal();
+  // else: no shifts configured → mark as no-shift (empty array)
+
+  // Save needed values BEFORE closing modal (which would null pendingScanResult)
+  const faceId=pendingScanResult.face_id;
+  const faceName=pendingScanResult.name;
+
+  // Close modal and clear state
+  document.getElementById('shiftModal').classList.remove('open');
+  pendingScanResult=null;
 
   const r=await fetch('/api/admin/mark-attendance',{method:'POST',
     headers:{'Content-Type':'application/json','x-token':adminToken},
-    body:JSON.stringify({face_id:pendingScanResult.face_id,shift_ids:selectedIds})
+    body:JSON.stringify({face_id:faceId,shift_ids:selectedIds})
   }).then(x=>x.json());
 
   showMultiResult(r);
