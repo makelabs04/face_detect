@@ -1,10 +1,10 @@
 /**
  * FaceAttend SaaS — Multi-tenant Face Recognition Attendance
- * Roles: super_admin | admin (tenant) | user (employee)
+ * Roles: super_admin | admin (tenant) | user (student)
  *
  * Changes v3 → v4:
- *  - Multi-shift attendance: select one / multiple / all pending shifts per scan
- *  - Duplicate scan prevention per shift per day
+ *  - Multi-period attendance: select one / multiple / all pending shifts per scan
+ *  - Duplicate scan prevention per period per day
  *  - Admin: export attendance (CSV/Excel)
  *  - Admin: user management tab (view/delete users)
  *  - Notification subscription fix (service worker registration order)
@@ -145,8 +145,56 @@ function euclidean(a, b) {
 db.connect(err => {
   if (err) { console.error('❌ MySQL error:', err.message); process.exit(1); }
   console.log('✅ MySQL connected →', DB_CONFIG.database);
-  initTables().then(() => setup());
+  initTables().then(() => {
+    setup();
+    startAbsentCron();
+  });
 });
+
+// ── Auto-absent cron: every 5 minutes, mark absent for expired periods ────────
+function startAbsentCron() {
+  setInterval(async () => {
+    try {
+      const now = new Date();
+      const dateStr = now.toISOString().split('T')[0];
+      const timeStr = pad2(now.getHours())+':'+pad2(now.getMinutes())+':'+pad2(now.getSeconds());
+
+      // Get all admins that are approved
+      const admins = await dbQuery("SELECT id FROM admins WHERE status='approved'");
+      for (const admin of admins) {
+        // Get all shifts that have ended (end_time < current time)
+        const expiredShifts = await dbQuery(
+          'SELECT * FROM shifts WHERE admin_id=? AND end_time < ?',
+          [admin.id, timeStr]
+        );
+        for (const shift of expiredShifts) {
+          // Get all faces assigned to this period (via face_periods)
+          const assignedFaces = await dbQuery(
+            'SELECT f.* FROM faces f JOIN face_periods fp ON fp.face_id=f.id WHERE fp.shift_id=? AND f.admin_id=?',
+            [shift.id, admin.id]
+          );
+          for (const face of assignedFaces) {
+            // Check if already marked (present or absent) for this face+date+shift
+            const existing = await dbQuery(
+              'SELECT id FROM attendance WHERE face_id=? AND date=? AND shift_id=?',
+              [face.id, dateStr, shift.id]
+            );
+            if (!existing.length) {
+              // Mark as absent
+              await dbQuery(
+                'INSERT IGNORE INTO attendance (admin_id,face_id,shift_id,name,date,time_in,status) VALUES (?,?,?,?,?,?,?)',
+                [admin.id, face.id, shift.id, face.label, dateStr, shift.end_time, 'absent']
+              );
+            }
+          }
+        }
+      }
+    } catch(e) {
+      console.warn('Auto-absent cron error:', e.message);
+    }
+  }, 5 * 60 * 1000); // every 5 minutes
+  console.log('✅ Auto-absent cron started (runs every 5 min)');
+}
 
 async function initTables() {
   const sql = `
@@ -262,6 +310,15 @@ async function initTables() {
       sent_at DATETIME DEFAULT CURRENT_TIMESTAMP,
       FOREIGN KEY (admin_id) REFERENCES admins(id) ON DELETE CASCADE,
       FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
+    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+
+    CREATE TABLE IF NOT EXISTS face_periods (
+      id INT AUTO_INCREMENT PRIMARY KEY,
+      face_id INT NOT NULL,
+      shift_id INT NOT NULL,
+      UNIQUE KEY uq_face_period (face_id, shift_id),
+      FOREIGN KEY (face_id) REFERENCES faces(id) ON DELETE CASCADE,
+      FOREIGN KEY (shift_id) REFERENCES shifts(id) ON DELETE CASCADE
     ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
   `;
   try {
@@ -594,13 +651,52 @@ app.get('/api/admin/faces', authMiddleware('admin'), async (req, res) => {
      WHERE f.admin_id=? ORDER BY f.label`,
     [req.user.id]
   );
-  res.json(rows.map(r => ({ ...r, descriptor: JSON.parse(r.descriptor) })));
+  // Attach assigned periods for each face
+  const faceIds = rows.map(r => r.id);
+  let periodMap = {};
+  if (faceIds.length) {
+    const periods = await dbQuery(
+      `SELECT fp.face_id, sh.id as shift_id, sh.name, sh.start_time, sh.end_time
+       FROM face_periods fp JOIN shifts sh ON sh.id=fp.shift_id
+       WHERE fp.face_id IN (?)`, [faceIds]
+    );
+    for (const p of periods) {
+      if (!periodMap[p.face_id]) periodMap[p.face_id] = [];
+      periodMap[p.face_id].push({ id: p.shift_id, name: p.name, start_time: p.start_time, end_time: p.end_time });
+    }
+  }
+  res.json(rows.map(r => ({ ...r, descriptor: JSON.parse(r.descriptor), assigned_periods: periodMap[r.id]||[] })));
+});
+
+// ── Get/Set assigned periods for a face ──────────────────────────────────────
+app.get('/api/admin/faces/:id/periods', authMiddleware('admin'), async (req, res) => {
+  const rows = await dbQuery(
+    `SELECT sh.* FROM face_periods fp JOIN shifts sh ON sh.id=fp.shift_id
+     WHERE fp.face_id=? AND sh.admin_id=?`, [req.params.id, req.user.id]
+  );
+  res.json(rows);
+});
+
+app.post('/api/admin/faces/:id/periods', authMiddleware('admin'), async (req, res) => {
+  const { shift_ids } = req.body; // array of shift IDs
+  const faceId = parseInt(req.params.id);
+  // Verify face belongs to this admin
+  const face = await dbQuery('SELECT id FROM faces WHERE id=? AND admin_id=?', [faceId, req.user.id]);
+  if (!face.length) return res.json({ error: 'Face not found' });
+  // Replace all periods
+  await dbQuery('DELETE FROM face_periods WHERE face_id=?', [faceId]);
+  if (shift_ids && shift_ids.length) {
+    for (const sid of shift_ids) {
+      await dbQuery('INSERT IGNORE INTO face_periods (face_id,shift_id) VALUES (?,?)', [faceId, sid]);
+    }
+  }
+  res.json({ ok: true });
 });
 
 app.post('/api/admin/faces', authMiddleware('admin'), async (req, res) => {
   const { label, employee_id, department, shift_id, user_email, user_password, descriptors, accuracy } = req.body;
   if (!label||!descriptors?.length) return res.json({ error: 'Label and descriptors required' });
-  if (!user_email) return res.json({ error: 'Email is required for the employee account' });
+  if (!user_email) return res.json({ error: 'Email is required for the student account' });
   if (!user_password || user_password.length < 6) return res.json({ error: 'Password must be at least 6 characters' });
 
   try {
@@ -731,7 +827,7 @@ app.get('/api/admin/attendance/export', authMiddleware('admin'), async (req, res
     params
   );
 
-  const headers = ['Name','Date','Shift','Time In','Time Out','Status'];
+  const headers = ['Name','Date','Period','Time In','Time Out','Status'];
   const csvRows = rows.map(r => [
     r.name, r.date, r.shift_name||'', r.time_in||'', r.time_out||'', r.status
   ].map(v => `"${String(v).replace(/"/g,'""')}"`).join(','));
@@ -850,6 +946,15 @@ app.post('/api/admin/scan', authMiddleware('admin'), async (req, res) => {
     return res.json({ event: 'checkout', name: best.label, time_out: timeStr });
   }
 
+  // Get this face's assigned periods
+  const assignedPeriods = await dbQuery(
+    `SELECT shift_id FROM face_periods WHERE face_id=?`, [best.id]
+  );
+  const assignedPeriodIds = assignedPeriods.map(p => p.shift_id);
+
+  // Auto-select: only pending shifts that are in the student's assigned periods
+  const autoSelectShifts = pendingShifts.filter(s => assignedPeriodIds.includes(s.id));
+
   // Return face info + pending shifts for the frontend to display multiselect
   return res.json({
     event: 'face_identified',
@@ -861,7 +966,9 @@ app.post('/api/admin/scan', authMiddleware('admin'), async (req, res) => {
     all_shifts: allShifts,
     marked_shift_ids: markedShiftIds,
     has_no_shift_attendance: hasNoShiftAttendance,
-    today_attendance: todayAtt
+    today_attendance: todayAtt,
+    assigned_period_ids: assignedPeriodIds,
+    auto_select_shift_ids: autoSelectShifts.map(s => s.id)
   });
 });
 
@@ -903,7 +1010,7 @@ app.post('/api/admin/mark-attendance', authMiddleware('admin'), async (req, res)
     if (f.user_email) {
       const user = await dbQuery('SELECT id FROM users WHERE email=? AND admin_id=?', [f.user_email, adminId]);
       if (user.length) {
-        const shiftInfo = shiftRow ? ` (${shiftRow.name} shift)` : '';
+        const shiftInfo = shiftRow ? ` (${shiftRow.name} period)` : '';
         await sendPushToUser(user[0].id, '✅ Attendance Marked', `${f.label}, your attendance was recorded at ${fmtTime(timeStr)}${shiftInfo}`, adminId);
         await dbQuery('UPDATE attendance SET notification_sent=1 WHERE id=?', [r.insertId]);
       }
@@ -1134,19 +1241,19 @@ app.get('/portal', (_, res) => {
       <a href="/admin" class="portal-card">
         <div class="card-icon-wrap icon-admin">🏢</div>
         <div class="card-title">Admin</div>
-        <div class="card-desc">Manage people, shifts, scan attendance &amp; export reports.</div>
+        <div class="card-desc">Manage people, periods, scan attendance &amp; export reports.</div>
         <div class="card-cta cta-admin">Enter Portal →</div>
       </a>
       <a href="/user" class="portal-card">
         <div class="card-icon-wrap icon-user">👤</div>
-        <div class="card-title">Employee</div>
+        <div class="card-title">Student</div>
         <div class="card-desc">View your attendance calendar and enable push notifications.</div>
         <div class="card-cta cta-user">Enter Portal →</div>
       </a>
     </div>
     <div class="features">
       <div class="feat"><div class="feat-dot"></div>Real-time Face Recognition</div>
-      <div class="feat"><div class="feat-dot"></div>Multi-shift Attendance</div>
+      <div class="feat"><div class="feat-dot"></div>Multi-period Attendance</div>
       <div class="feat"><div class="feat-dot"></div>Web Push Notifications</div>
       <div class="feat"><div class="feat-dot"></div>Export CSV/Excel</div>
       <div class="feat"><div class="feat-dot"></div>Holiday Calendar</div>
@@ -1241,7 +1348,7 @@ async function loadDashboard(){
     <div class="stat"><div class="stat-val">\${total}</div><div class="stat-label">Total Orgs</div></div>
     <div class="stat"><div class="stat-val green">\${approved}</div><div class="stat-label">Approved</div></div>
     <div class="stat"><div class="stat-val yellow">\${pending}</div><div class="stat-label">Pending</div></div>
-    <div class="stat"><div class="stat-val">\${totalUsers}</div><div class="stat-label">Employees</div></div>
+    <div class="stat"><div class="stat-val">\${totalUsers}</div><div class="stat-label">Students</div></div>
   \`;
   const rows=admins.map(a=>\`
     <tr>
@@ -1332,7 +1439,7 @@ app.get('/admin', (_, res) => {
     <div class="tabs" id="dashTabs">
       <button class="tab active" onclick="switchTab('scan',this)">📷 Scan</button>
       <button class="tab" onclick="switchTab('faces',this)">👥 People</button>
-      <button class="tab" onclick="switchTab('shifts',this)">⏰ Shifts</button>
+      <button class="tab" onclick="switchTab('shifts',this)">⏰ Periods</button>
       <button class="tab" onclick="switchTab('users',this)">🔑 Users</button>
       <button class="tab" onclick="switchTab('reports',this)">📊 Reports</button>
       <button class="tab" onclick="switchTab('calendar',this)">📅 Calendar</button>
@@ -1383,7 +1490,7 @@ app.get('/admin', (_, res) => {
         <div class="card">
           <div style="font-weight:700;margin-bottom:12px;font-size:0.95rem">Register New Person</div>
           <div class="alert alert-info" style="font-size:0.73rem;margin-bottom:12px">
-            📌 This creates both the <strong>face profile</strong> and the <strong>employee login account</strong> in one step.
+            📌 This creates both the <strong>face profile</strong> and the <strong>student login account</strong> in one step.
           </div>
           <div class="cam-card" style="margin-bottom:12px">
             <div class="cam-wrap"><video id="regVideo" autoplay muted playsinline></video><canvas id="regOverlay"></canvas></div>
@@ -1393,20 +1500,22 @@ app.get('/admin', (_, res) => {
             </div>
           </div>
           <div class="grid2">
-            <div class="form-group"><label>Full Name</label><input class="form-control" id="fName" placeholder="Employee Name"></div>
-            <div class="form-group"><label>Employee ID</label><input class="form-control" id="fEmpId" placeholder="EMP001"></div>
+            <div class="form-group"><label>Full Name</label><input class="form-control" id="fName" placeholder="Student Name"></div>
+            <div class="form-group"><label>Student ID</label><input class="form-control" id="fEmpId" placeholder="STU001"></div>
           </div>
-          <div class="grid2">
-            <div class="form-group"><label>Department</label><input class="form-control" id="fDept" placeholder="Engineering"></div>
-            <div class="form-group">
-              <label>Default Shift</label>
-              <select class="form-control" id="fShift"><option value="">No Default Shift</option></select>
+          <div class="form-group">
+            <label>Department</label><input class="form-control" id="fDept" placeholder="Engineering">
+          </div>
+          <div class="form-group">
+            <label>Assigned Periods <span style="font-size:0.68rem;color:var(--muted)">(select all that apply)</span></label>
+            <div id="fPeriodsBox" style="border:1px solid var(--border);border-radius:8px;padding:8px;max-height:140px;overflow-y:auto;background:var(--surface)">
+              <div style="color:var(--muted);font-size:0.75rem">No periods defined yet. Add periods first.</div>
             </div>
           </div>
           <div style="border-top:1px solid var(--border);padding-top:12px;margin-bottom:12px">
             <div style="font-size:0.68rem;color:var(--muted);text-transform:uppercase;letter-spacing:0.8px;margin-bottom:10px;font-weight:600">Login Account</div>
             <div class="grid2">
-              <div class="form-group"><label>Email</label><input class="form-control" id="fUserEmail" type="email" placeholder="emp@company.com"></div>
+              <div class="form-group"><label>Email</label><input class="form-control" id="fUserEmail" type="email" placeholder="student@school.com"></div>
               <div class="form-group"><label>Password</label><input class="form-control" id="fUserPassword" type="password" placeholder="Min. 6 chars"></div>
             </div>
           </div>
@@ -1435,17 +1544,17 @@ app.get('/admin', (_, res) => {
     <div id="tab-shifts" style="display:none">
       <div class="grid2" style="gap:14px;align-items:start">
         <div class="card">
-          <div style="font-weight:700;margin-bottom:14px">Add Shift</div>
-          <div class="form-group"><label>Shift Name</label><input class="form-control" id="shName" placeholder="Morning / Night / A / B"></div>
+          <div style="font-weight:700;margin-bottom:14px">Add Period</div>
+          <div class="form-group"><label>Period Name</label><input class="form-control" id="shName" placeholder="Morning / Night / A / B"></div>
           <div class="grid2">
             <div class="form-group"><label>Start Time</label><input class="form-control" id="shStart" type="time"></div>
             <div class="form-group"><label>End Time</label><input class="form-control" id="shEnd" type="time"></div>
           </div>
           <div id="shErr" class="alert alert-error" style="display:none"></div>
-          <button class="btn btn-primary" style="width:100%" onclick="addShift()">➕ Add Shift</button>
+          <button class="btn btn-primary" style="width:100%" onclick="addShift()">➕ Add Period</button>
         </div>
         <div class="card">
-          <div style="font-weight:700;margin-bottom:14px">Your Shifts</div>
+          <div style="font-weight:700;margin-bottom:14px">Your Periods</div>
           <div id="shiftList"></div>
         </div>
       </div>
@@ -1455,12 +1564,12 @@ app.get('/admin', (_, res) => {
     <div id="tab-users" style="display:none">
       <div class="card">
         <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:16px;flex-wrap:wrap;gap:8px">
-          <span style="font-weight:700">Employee Accounts</span>
+          <span style="font-weight:700">Student Accounts</span>
           <span id="userCount" class="chip chip-blue"></span>
         </div>
         <div class="table-wrap">
           <table>
-            <thead><tr><th>Name</th><th>Email</th><th>Dept / Shift</th><th>Notifications</th><th>Joined</th><th>Actions</th></tr></thead>
+            <thead><tr><th>Name</th><th>Email</th><th>Dept / Period</th><th>Notifications</th><th>Joined</th><th>Actions</th></tr></thead>
             <tbody id="userTableBody"><tr><td colspan="6" style="text-align:center;color:var(--muted);padding:24px">Loading...</td></tr></tbody>
           </table>
         </div>
@@ -1552,7 +1661,7 @@ app.get('/admin', (_, res) => {
 <div id="shiftModal" class="modal-backdrop">
   <div class="modal" style="max-width:420px">
     <div class="modal-title">
-      <span>Select Shifts to Mark</span>
+      <span id="shiftModalTitle">Select Periods to Mark</span>
       <button class="modal-close" onclick="dismissShiftModal()">✕</button>
     </div>
     <div id="shiftModalFaceName" style="font-size:1rem;font-weight:700;margin-bottom:6px;color:var(--accent)"></div>
@@ -1708,22 +1817,34 @@ async function saveFace(){
   if(!email){showFaceErr('Email required');return;}
   if(!password||password.length<6){showFaceErr('Password must be at least 6 characters');return;}
   if(regSamples.length<5){showFaceErr('Need at least 5 face samples');return;}
+  // Collect selected period IDs
+  const selectedPeriodIds=Array.from(document.querySelectorAll('#fPeriodsBox input[type=checkbox]:checked')).map(cb=>parseInt(cb.value));
   const r=await fetch('/api/admin/faces',{method:'POST',headers:{'Content-Type':'application/json','x-token':adminToken},
     body:JSON.stringify({
       label,employee_id:document.getElementById('fEmpId').value,
       department:document.getElementById('fDept').value,
-      shift_id:document.getElementById('fShift').value||null,
+      shift_id:selectedPeriodIds[0]||null,
       user_email:email,user_password:password,
       descriptors:regSamples,accuracy:Math.round(100-Math.random()*5)
     })
   }).then(x=>x.json());
   if(r.error){showFaceErr(r.error);return;}
-  document.getElementById('regOk2').textContent='Person registered & account created! ✅';
+  // Save assigned periods
+  if(r.id || true){
+    const faces2=await fetch('/api/admin/faces',{headers:{'x-token':adminToken}}).then(x=>x.json());
+    const saved=faces2.find(f=>f.label===label);
+    if(saved && selectedPeriodIds.length){
+      await fetch('/api/admin/faces/'+saved.id+'/periods',{method:'POST',
+        headers:{'Content-Type':'application/json','x-token':adminToken},
+        body:JSON.stringify({shift_ids:selectedPeriodIds})}).then(x=>x.json());
+    }
+  }
+  document.getElementById('regOk2').textContent='Student registered & account created! ✅';
   document.getElementById('regOk2').style.display='block';
   document.getElementById('regErr').style.display='none';
   document.getElementById('fName').value='';document.getElementById('fEmpId').value='';
   document.getElementById('fDept').value='';document.getElementById('fUserEmail').value='';
-  document.getElementById('fUserPassword').value='';document.getElementById('fShift').value='';
+  document.getElementById('fUserPassword').value='';
   clearSamples();loadFaceList();
 }
 function showFaceErr(msg){document.getElementById('regErr').textContent=msg;document.getElementById('regErr').style.display='block';}
@@ -1733,32 +1854,87 @@ async function loadFaceList(){
   adminFaces=faces;
   const countEl=document.getElementById('faceCount');
   if(countEl) countEl.textContent=faces.length+' people';
-  const html=faces.length?faces.map(f=>\`
-    <div style="display:flex;align-items:flex-start;justify-content:space-between;padding:10px 0;border-bottom:1px solid var(--border)">
-      <div>
+  const html=faces.length?faces.map(f=>{
+    const periods=f.assigned_periods||[];
+    const periodTags=periods.map(p=>\`<span class="chip chip-blue" style="font-size:0.58rem;margin:1px">\${p.name}</span>\`).join('');
+    return \`<div style="display:flex;align-items:flex-start;justify-content:space-between;padding:10px 0;border-bottom:1px solid var(--border)">
+      <div style="flex:1;min-width:0">
         <span style="font-weight:600">\${f.label}</span>
         \${f.employee_id?\`<span style="color:var(--muted);font-size:0.68rem;margin-left:6px">#\${f.employee_id}</span>\`:''}
         <br>
-        <span style="color:var(--muted);font-size:0.68rem">\${f.department||''}\${f.shift_name?' · '+f.shift_name:''}</span>
+        <span style="color:var(--muted);font-size:0.68rem">\${f.department||''}</span>
         \${f.user_email?\`<br><span style="font-size:0.66rem;color:var(--accent)">📧 \${f.user_email}</span>\`:''}
         \${f.notifications_enabled?\`<span class="chip chip-green" style="margin-left:4px;font-size:0.58rem">🔔 notif</span>\`:''}
+        \${periods.length?\`<br><span style="font-size:0.65rem;color:var(--muted)">Periods: </span>\${periodTags}\`:\`<br><span style="font-size:0.65rem;color:var(--muted)">No periods assigned</span>\`}
       </div>
-      <button class="btn btn-danger btn-sm" onclick="deleteFace(\${f.id})">✕</button>
-    </div>\`).join('')
+      <div style="display:flex;gap:4px;flex-shrink:0;margin-left:8px">
+        <button class="btn btn-sm btn-outline" onclick="editFacePeriods(\${f.id},'\${f.label.replace(/'/g,'&apos;')}')">📋 Periods</button>
+        <button class="btn btn-danger btn-sm" onclick="deleteFace(\${f.id})">✕</button>
+      </div>
+    </div>\`;
+  }).join('')
     :'<p style="color:var(--muted);font-size:0.8rem">No people registered yet.</p>';
   document.getElementById('faceList').innerHTML=html;
 }
 
+// Edit assigned periods for an existing student
+async function editFacePeriods(faceId, faceName){
+  if(!adminShifts.length){alert('No periods defined yet. Add periods first.');return;}
+  const current=await fetch('/api/admin/faces/'+faceId+'/periods',{headers:{'x-token':adminToken}}).then(x=>x.json());
+  const currentIds=current.map(p=>p.id);
+  const checkboxes=adminShifts.map(s=>\`
+    <label style="display:flex;align-items:center;gap:8px;padding:6px 4px;cursor:pointer;font-size:0.85rem">
+      <input type="checkbox" value="\${s.id}" \${currentIds.includes(s.id)?'checked':''} class="edit-period-cb" style="accent-color:var(--accent);width:15px;height:15px">
+      <span style="font-weight:600">\${s.name}</span>
+      <span style="color:var(--muted);font-size:0.72rem">\${s.start_time.slice(0,5)} – \${s.end_time.slice(0,5)}</span>
+    </label>\`).join('');
+  // Create inline modal via existing modal structure
+  const modal=document.getElementById('shiftModal');
+  document.getElementById('shiftModalFaceName').textContent='📋 '+faceName+' — Edit Periods';
+  document.getElementById('shiftModalTime').textContent='Check periods this student attends';
+  document.getElementById('shiftCheckboxList').innerHTML=checkboxes;
+  // Replace confirm button temporarily
+  const confirmBtn=modal.querySelector('button[onclick="confirmShiftMark()"]');
+  confirmBtn.textContent='💾 Save Periods';
+  confirmBtn.setAttribute('onclick','saveEditedPeriods('+faceId+')');
+  modal.classList.add('open');
+}
+
+async function saveEditedPeriods(faceId){
+  const ids=Array.from(document.querySelectorAll('#shiftCheckboxList .edit-period-cb:checked')).map(cb=>parseInt(cb.value));
+  await fetch('/api/admin/faces/'+faceId+'/periods',{method:'POST',
+    headers:{'Content-Type':'application/json','x-token':adminToken},
+    body:JSON.stringify({shift_ids:ids})}).then(x=>x.json());
+  // Restore confirm button
+  const confirmBtn=document.querySelector('#shiftModal button[onclick*="saveEditedPeriods"]');
+  if(confirmBtn){confirmBtn.textContent='✅ Mark Attendance';confirmBtn.setAttribute('onclick','confirmShiftMark()');}
+  document.getElementById('shiftModal').classList.remove('open');
+  loadFaceList();
+  showToast('✅ Periods updated for student');
+}
+
 async function deleteFace(id){
-  if(!confirm('Delete this person and their login account?')) return;
+  if(!confirm('Delete this person and their student account?')) return;
   await fetch('/api/admin/faces/'+id,{method:'DELETE',headers:{'x-token':adminToken}});
   loadFaceList();
 }
 
 async function loadShifts(){
   adminShifts=await fetch('/api/admin/shifts',{headers:{'x-token':adminToken}}).then(x=>x.json());
-  const sel=document.getElementById('fShift');
-  if(sel) sel.innerHTML='<option value="">No Default Shift</option>'+adminShifts.map(s=>\`<option value="\${s.id}">\${s.name} (\${s.start_time.slice(0,5)}-\${s.end_time.slice(0,5)})</option>\`).join('');
+  // Populate period checkboxes in register form
+  const box=document.getElementById('fPeriodsBox');
+  if(box){
+    if(!adminShifts.length){
+      box.innerHTML='<div style="color:var(--muted);font-size:0.75rem">No periods defined yet. Add periods first.</div>';
+    } else {
+      box.innerHTML=adminShifts.map(s=>\`
+        <label style="display:flex;align-items:center;gap:8px;padding:5px 4px;cursor:pointer;font-size:0.82rem">
+          <input type="checkbox" value="\${s.id}" class="period-reg-cb" style="accent-color:var(--accent);width:15px;height:15px">
+          <span style="font-weight:600">\${s.name}</span>
+          <span style="color:var(--muted);font-size:0.7rem">\${s.start_time.slice(0,5)} – \${s.end_time.slice(0,5)}</span>
+        </label>\`).join('');
+    }
+  }
   const list=document.getElementById('shiftList');
   if(list) list.innerHTML=adminShifts.length?adminShifts.map(s=>\`
     <div style="display:flex;align-items:center;justify-content:space-between;padding:10px 0;border-bottom:1px solid var(--border)">
@@ -1768,7 +1944,7 @@ async function loadShifts(){
       </div>
       <button class="btn btn-danger btn-sm" onclick="deleteShift(\${s.id})">✕</button>
     </div>\`).join('')
-    :'<p style="color:var(--muted);font-size:0.8rem">No shifts defined yet.</p>';
+    :'<p style="color:var(--muted);font-size:0.8rem">No periods defined yet.</p>';
 }
 
 async function addShift(){
@@ -1781,7 +1957,7 @@ async function addShift(){
 }
 
 async function deleteShift(id){
-  if(!confirm('Delete this shift?')) return;
+  if(!confirm('Delete this period?')) return;
   await fetch('/api/admin/shifts/'+id,{method:'DELETE',headers:{'x-token':adminToken}});
   loadShifts();
 }
@@ -1792,7 +1968,7 @@ async function loadUsers(){
   const countEl=document.getElementById('userCount');
   if(countEl) countEl.textContent=users.length+' users';
   const tbody=document.getElementById('userTableBody');
-  if(!users.length){tbody.innerHTML='<tr><td colspan="6" style="text-align:center;color:var(--muted);padding:24px">No employee accounts yet</td></tr>';return;}
+  if(!users.length){tbody.innerHTML='<tr><td colspan="6" style="text-align:center;color:var(--muted);padding:24px">No student accounts yet</td></tr>';return;}
   tbody.innerHTML=users.map(u=>\`
     <tr>
       <td style="font-weight:600">\${u.name}</td>
@@ -1815,7 +1991,7 @@ async function resetPassword(id,name){
 }
 
 async function deleteUser(id){
-  if(!confirm('Delete this user account? Their face profile remains.')) return;
+  if(!confirm('Delete this student account? Their face profile remains.')) return;
   await fetch('/api/admin/users/'+id,{method:'DELETE',headers:{'x-token':adminToken}});
   loadUsers();
 }
@@ -1835,7 +2011,7 @@ async function previewReport(){
   if(!rows.length){el.innerHTML='<p style="color:var(--muted);margin-top:10px">No records for this period.</p>';return;}
   const html=\`<div style="font-size:0.75rem;margin-top:6px;margin-bottom:8px;color:var(--muted)">\${rows.length} records found</div>
   <div class="table-wrap"><table>
-    <thead><tr><th>Name</th><th>Date</th><th>Shift</th><th>In</th><th>Out</th><th>Status</th></tr></thead>
+    <thead><tr><th>Name</th><th>Date</th><th>Period</th><th>In</th><th>Out</th><th>Status</th></tr></thead>
     <tbody>\${rows.slice(0,30).map(r=>\`<tr>
       <td style="font-weight:600">\${r.name}</td>
       <td>\${(r.date+'').slice(0,10)}</td>
@@ -1870,7 +2046,7 @@ async function doScan(){
     body:JSON.stringify({descriptor:Array.from(det.descriptor),mode})}).then(x=>x.json());
 
   if(r.event==='face_identified'){
-    // Show shift selection modal
+    // Show period selection modal
     pendingScanResult=r;
     openShiftModal(r);
   } else {
@@ -1881,6 +2057,7 @@ async function doScan(){
 
 function openShiftModal(r){
   document.getElementById('shiftModalFaceName').textContent='👤 '+r.name;
+  document.getElementById('shiftModalTitle').textContent='Select Periods to Mark';
   const now=new Date();
   document.getElementById('shiftModalTime').textContent='Scan time: '+now.toLocaleTimeString();
 
@@ -1889,11 +2066,11 @@ function openShiftModal(r){
   const allShifts=r.all_shifts||[];
 
   if(!allShifts.length){
-    // No shifts configured — just a no-shift mark
+    // No periods configured — just a no-period mark
     if(r.has_no_shift_attendance){
-      container.innerHTML='<div style="padding:14px;text-align:center;color:var(--muted);font-size:0.82rem">✅ Attendance already marked today (no-shift)</div>';
+      container.innerHTML='<div style="padding:14px;text-align:center;color:var(--muted);font-size:0.82rem">✅ Attendance already marked today (no period)</div>';
     } else {
-      container.innerHTML='<div style="padding:12px;color:var(--muted);font-size:0.82rem">No shifts configured. Will mark as general attendance.</div>';
+      container.innerHTML='<div style="padding:12px;color:var(--muted);font-size:0.82rem">No periods configured. Will mark as general attendance.</div>';
     }
     document.getElementById('shiftModal').classList.add('open');
     return;
@@ -1924,6 +2101,10 @@ function dismissShiftModal(){
   // Cancel button — close and discard
   document.getElementById('shiftModal').classList.remove('open');
   pendingScanResult=null;
+  // Restore confirm button in case it was overridden by editFacePeriods
+  const confirmBtn=document.querySelector('#shiftModal button[onclick*="saveEditedPeriods"]');
+  if(confirmBtn){confirmBtn.textContent='✅ Mark Attendance';confirmBtn.setAttribute('onclick','confirmShiftMark()');}
+  document.getElementById('shiftModalTitle').textContent='Select Periods to Mark';
 }
 
 function selectAllShifts(){
@@ -1943,11 +2124,11 @@ async function confirmShiftMark(){
     selectedIds=Array.from(document.querySelectorAll('#shiftCheckboxList .shift-cb:not(:disabled):checked'))
       .map(cb=>parseInt(cb.value));
     if(!selectedIds.length){
-      alert('Please select at least one shift to mark.');
+      alert('Please select at least one period to mark.');
       return;
     }
   }
-  // else: no shifts configured → mark as no-shift (empty array)
+  // else: no periods configured → mark as no-period (empty array)
 
   // Save needed values BEFORE closing modal (which would null pendingScanResult)
   const faceId=pendingScanResult.face_id;
@@ -1976,8 +2157,8 @@ function showMultiResult(r){
       <div style="font-size:2rem">✅</div>
       <div style="font-size:1rem;font-weight:700;color:\${color};margin:6px 0">\${r.name}</div>
       <div style="font-size:0.8rem;color:var(--muted)">⏱ In: \${r.time_in}</div>
-      \${marked.length?'<div style="margin-top:8px;font-size:0.75rem;color:var(--text)">Marked: '+marked.map(x=>'<span class="chip chip-green" style="margin:1px">'+( x.shift_name||'General')+'</span>').join('')+'</div>':''}
-      \${skipped.length?'<div style="margin-top:4px;font-size:0.73rem;color:var(--muted)">Already marked: '+skipped.map(x=>'<span class="chip chip-gray" style="margin:1px">'+(x.shift_name||'General')+'</span>').join('')+'</div>':''}
+      \${marked.length?'<div style="margin-top:8px;font-size:0.75rem;color:var(--text)">Marked: '+marked.map(x=>'<span class="chip chip-green" style="margin:1px">'+( x.shift_name||'General Period')+'</span>').join('')+'</div>':''}
+      \${skipped.length?'<div style="margin-top:4px;font-size:0.73rem;color:var(--muted)">Already marked: '+skipped.map(x=>'<span class="chip chip-gray" style="margin:1px">'+(x.shift_name||'General Period')+'</span>').join('')+'</div>':''}
     </div>\`;
 }
 
@@ -2198,7 +2379,7 @@ app.get('/user', (_, res) => {
 <main id="app">
   <!-- Login -->
   <div id="loginSection" style="max-width:400px;margin:50px auto">
-    <div class="page-title">👤 Employee Login</div>
+    <div class="page-title">👤 Student Login</div>
     <div class="card">
       <div id="loginErr" class="alert alert-error" style="display:none"></div>
       <div class="form-group"><label>Email</label><input class="form-control" id="uEmail" type="email" autocomplete="email"></div>
@@ -2273,7 +2454,7 @@ async function showUserDash(r){
   document.getElementById('navLogo').innerHTML=logoHtml+'Face<span style="color:var(--accent)">Attend</span>';
   document.getElementById('navRight').innerHTML=\`
     <span style="font-size:0.72rem;color:var(--muted)">\${r.name||''}</span>
-    <span class="badge badge-user">Employee</span>
+    <span class="badge badge-user">Student</span>
     <button class="btn btn-sm btn-outline" id="notifNavBtn" onclick="openNotifModal()" title="Enable notifications">🔔</button>
     <button class="btn btn-sm btn-outline" onclick="userLogout()">Logout</button>\`;
 
