@@ -2046,7 +2046,47 @@ async function doScan(){
     body:JSON.stringify({descriptor:Array.from(det.descriptor),mode})}).then(x=>x.json());
 
   if(r.event==='face_identified'){
-    // Show period selection modal
+    const autoIds=r.auto_select_shift_ids||[];
+    const pendingShifts=r.pending_shifts||[];
+    const allShifts=r.all_shifts||[];
+
+    // ── AUTO-MARK: student has assigned periods & there are pending ones ──────
+    if(autoIds.length > 0){
+      // Show instant result while marking
+      document.getElementById('resultBody').innerHTML=\`
+        <div style="text-align:center;padding:10px">
+          <div style="font-size:2rem">⏳</div>
+          <div style="font-size:1rem;font-weight:700;color:var(--accent);margin:6px 0">\${r.name}</div>
+          <div style="font-size:0.8rem;color:var(--muted)">Marking assigned periods...</div>
+        </div>\`;
+      const mr=await fetch('/api/admin/mark-attendance',{method:'POST',
+        headers:{'Content-Type':'application/json','x-token':adminToken},
+        body:JSON.stringify({face_id:r.face_id,shift_ids:autoIds})
+      }).then(x=>x.json());
+      showMultiResult(mr);
+      loadScanTab();
+      return;
+    }
+
+    // ── ALL assigned periods already marked today ──────────────────────────────
+    if(r.assigned_period_ids&&r.assigned_period_ids.length>0 && autoIds.length===0){
+      // All assigned periods are already done
+      const markedNames=(r.marked_shift_ids||[]).map(id=>{
+        const s=allShifts.find(x=>x.id===id);
+        return s?s.name:'';
+      }).filter(Boolean);
+      document.getElementById('resultBody').innerHTML=\`
+        <div style="text-align:center;padding:10px">
+          <div style="font-size:2rem">✅</div>
+          <div style="font-size:1rem;font-weight:700;color:var(--green);margin:6px 0">\${r.name}</div>
+          <div style="font-size:0.8rem;color:var(--muted);margin-top:4px">All assigned periods already marked today.</div>
+          \${markedNames.length?'<div style="margin-top:8px">'+markedNames.map(n=>'<span class="chip chip-green" style="margin:1px">✅ '+n+'</span>').join('')+'</div>':''}
+        </div>\`;
+      loadScanTab();
+      return;
+    }
+
+    // ── NO assigned periods — show manual selection modal ─────────────────────
     pendingScanResult=r;
     openShiftModal(r);
   } else {
@@ -2077,7 +2117,14 @@ function openShiftModal(r){
   }
 
   const markedIds=r.marked_shift_ids||[];
-  container.innerHTML=allShifts.map(s=>{
+  const assignedIds=r.assigned_period_ids||[];
+
+  // Add a note explaining why the modal appeared
+  const noteHtml = assignedIds.length===0
+    ? '<div style="font-size:0.72rem;color:var(--yellow);background:rgba(251,191,36,0.1);border-radius:6px;padding:6px 10px;margin-bottom:10px">⚠️ No periods assigned to this student yet. Please select manually or assign periods via the People tab.</div>'
+    : '';
+
+  container.innerHTML = noteHtml + allShifts.map(s=>{
     const isDone=markedIds.includes(s.id);
     return \`<label class="shift-select-item\${isDone?' already-done':''}">
       <input type="checkbox" value="\${s.id}" \${isDone?'disabled checked':''} class="shift-cb">
