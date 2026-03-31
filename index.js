@@ -1720,6 +1720,14 @@ app.get('/admin', (_, res) => {
 <script>
 const TOKEN_KEY='admin_token';
 let adminToken=localStorage.getItem(TOKEN_KEY);
+
+function showToast(msg){
+  const t=document.createElement('div');
+  t.style.cssText='position:fixed;bottom:24px;left:50%;transform:translateX(-50%);background:#1f2937;color:white;padding:12px 20px;border-radius:12px;font-size:0.8rem;z-index:9999;box-shadow:0 8px 24px rgba(0,0,0,0.2);transition:opacity 0.4s;max-width:90vw;text-align:center';
+  t.textContent=msg;
+  document.body.appendChild(t);
+  setTimeout(()=>{t.style.opacity='0';setTimeout(()=>t.remove(),400);},4000);
+}
 let adminShifts=[],adminFaces=[],regSamples=[],autoMode=false,autoTimer=null;
 let calYear=new Date().getFullYear(),calMonth=new Date().getMonth()+1;
 let calData={attendance:[],holidays:[]},selectedCalDate=null;
