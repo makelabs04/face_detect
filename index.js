@@ -340,7 +340,7 @@ async function initTables() {
 
 // ── Model / face-api download ─────────────────────────────────────────────────
 const FACEAPI_URL    = 'https://unpkg.com/face-api.js@0.22.2/dist/face-api.min.js';
-const MODEL_BASE_URL = 'https://raw.githubusercontent.com/justadudewhohacks/face-api.js/master/weights/';
+const MODEL_BASE_URL = 'https://cdn.jsdelivr.net/npm/face-api.js@0.22.2/weights/';
 const MODEL_FILES    = [
   'ssd_mobilenetv1_model-weights_manifest.json','ssd_mobilenetv1_model-shard1','ssd_mobilenetv1_model-shard2',
   'face_landmark_68_model-weights_manifest.json','face_landmark_68_model-shard1',
@@ -1828,9 +1828,7 @@ async function startCamera(videoId,overlayId,isScan){
 async function captureSample(){
   const v=document.getElementById('regVideo');
   if(!v||!v.srcObject) return;
-  await faceapi.nets.ssdMobilenetv1.loadFromUri('/models');
-  await faceapi.nets.faceLandmark68Net.loadFromUri('/models');
-  await faceapi.nets.faceRecognitionNet.loadFromUri('/models');
+  await ensureModels();
   const det=await faceapi.detectSingleFace(v).withFaceLandmarks().withFaceDescriptor();
   if(!det){document.getElementById('regStatus').textContent='No face detected — try again';return;}
   regSamples.push(Array.from(det.descriptor));
@@ -2073,18 +2071,17 @@ let modelsLoaded=false;
 async function ensureModels(){
   if(modelsLoaded) return;
   try {
-    await faceapi.nets.ssdMobilenetv1.loadFromUri('/models');
-    await faceapi.nets.faceLandmark68Net.loadFromUri('/models');
-    await faceapi.nets.faceRecognitionNet.loadFromUri('/models');
+    const CDN='https://cdn.jsdelivr.net/npm/face-api.js@0.22.2/weights';
+    await faceapi.nets.ssdMobilenetv1.loadFromUri(CDN);
+    await faceapi.nets.faceLandmark68Net.loadFromUri(CDN);
+    await faceapi.nets.faceRecognitionNet.loadFromUri(CDN);
     modelsLoaded=true;
-    // Hide error banner if it was shown
     const banner=document.getElementById('modelErrorBanner');
     if(banner) banner.style.display='none';
   } catch(e) {
-    // Show the fix banner
     const banner=document.getElementById('modelErrorBanner');
     if(banner) banner.style.display='flex';
-    throw e; // re-throw so doScan catches it
+    throw e;
   }
 }
 
