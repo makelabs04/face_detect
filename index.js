@@ -2601,6 +2601,8 @@ async function showUserDash(r){
 
 async function enableNotif(){
   dismissNotifModal();
+  showToast(`Notification: ${typeof Notification}, PushManager: ${'PushManager' in navigator}, Protocol: ${location.protocol}`);
+    return;
   if(typeof Notification === 'undefined' || !('PushManager' in navigator)){
     showToast('⚠️ Push notifications not supported in this browser.');
     return;
