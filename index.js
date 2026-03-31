@@ -12,9 +12,8 @@
  *  - Improved UI mobile responsiveness across all pages
  *  - Attendance table updated: UNIQUE KEY now per face+date+shift combo
  */
-
+require('dotenv').config();
 'use strict';
-
 const express   = require('express');
 const mysql     = require('mysql2');
 const https     = require('https');
