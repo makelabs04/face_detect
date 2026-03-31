@@ -1,18 +1,3 @@
-/**
- * FaceAttend SaaS — Multi-tenant Face Recognition Attendance
- * Roles: super_admin | admin (tenant) | user (employee)
- *
- * Changes v3 → v4:
- *  - Multi-shift attendance: select one / multiple / all pending shifts per scan
- *  - Duplicate scan prevention per shift per day
- *  - Admin: export attendance (CSV/Excel)
- *  - Admin: user management tab (view/delete users)
- *  - Notification subscription fix (service worker registration order)
- *  - Scan result label always shown
- *  - Improved UI mobile responsiveness across all pages
- *  - Attendance table updated: UNIQUE KEY now per face+date+shift combo
- */
-
 'use strict';
 
 require('dotenv').config();
@@ -637,6 +622,18 @@ app.post('/api/admin/faces', authMiddleware('admin'), async (req, res) => {
     }
 
     await dbQuery('UPDATE faces SET user_email=? WHERE id=?', [user_email, faceId]);
+
+    // Send push notification to the employee
+    const userRow = await dbQuery('SELECT id FROM users WHERE email=? AND admin_id=?', [user_email, req.user.id]);
+    if (userRow.length) {
+      const isUpdate = existingUser.length > 0;
+      const pushTitle = isUpdate ? '✏️ Profile Updated' : '🎉 Account Created';
+      const pushBody  = isUpdate
+        ? `${label}, your profile details have been updated by your admin.`
+        : `${label}, your account has been registered. You can now log in with ${user_email}.`;
+      await sendPushToUser(userRow[0].id, pushTitle, pushBody, req.user.id);
+    }
+
     res.json({ ok: true });
   } catch(e) {
     if (e.code === 'ER_DUP_ENTRY') return res.json({ error: 'A person with this name or email already exists' });
@@ -679,6 +676,9 @@ app.put('/api/admin/users/:id/reset-password', authMiddleware('admin'), async (r
   if (!password || password.length < 6) return res.json({ error: 'Password min 6 chars' });
   const hash = await bcrypt.hash(password, 12);
   await dbQuery('UPDATE users SET password=? WHERE id=? AND admin_id=?', [hash, req.params.id, req.user.id]);
+  // Notify the user their password was changed
+  const uRow = await dbQuery('SELECT name FROM users WHERE id=? AND admin_id=?', [req.params.id, req.user.id]);
+  if (uRow.length) await sendPushToUser(parseInt(req.params.id), '🔑 Password Changed', `${uRow[0].name}, your login password has been reset by your admin.`, req.user.id);
   res.json({ ok: true });
 });
 
@@ -2258,17 +2258,18 @@ async function showUserDash(r){
 
   renderCalendar();
 
-  // Fix: register SW first, THEN request push permission
-  if('serviceWorker' in navigator && 'PushManager' in navigator){
+  // Register SW and show notification modal if not yet enabled
+  if('serviceWorker' in navigator && 'PushManager' in navigator && typeof Notification !== 'undefined'){
     try{
       const reg=await navigator.serviceWorker.register('/sw.js');
-      await navigator.serviceWorker.ready; // wait until active
-      const notifPerm=Notification.permission;
+      await navigator.serviceWorker.ready;
       const alreadyEnabled=r.notifications_enabled;
-      if(!alreadyEnabled && notifPerm!=='denied'){
+      const perm=Notification.permission;
+      // Show modal if not already subscribed AND browser hasn't permanently blocked
+      if(!alreadyEnabled && perm!=='denied'){
         setTimeout(()=>{
           document.getElementById('notifModal').classList.add('open');
-        }, 5000);
+        }, 2000);
       }
     }catch(e){ console.warn('SW registration failed:',e.message); }
   }
@@ -2276,21 +2277,41 @@ async function showUserDash(r){
 
 async function enableNotif(){
   dismissNotifModal();
+  if(typeof Notification === 'undefined'){
+    showToast('⚠️ Notifications not supported in this browser.');
+    return;
+  }
   const perm=await Notification.requestPermission();
-  if(perm!=='granted'){showToast('⚠️ Notifications blocked. Enable from browser settings.');return;}
+  if(perm==='denied'){
+    showToast('⚠️ Notifications blocked. Please enable them in your browser settings, then re-login.');
+    return;
+  }
+  if(perm!=='granted'){
+    showToast('⚠️ Notification permission not granted.');
+    return;
+  }
   try{
     const reg=await navigator.serviceWorker.ready;
     const vapid=await fetch('/api/vapid-public').then(x=>x.json());
-    if(!vapid.key){showToast('ℹ️ Push notifications not configured on this server.');return;}
+    if(!vapid.key){
+      showToast('ℹ️ Push not configured on this server — contact admin.');
+      return;
+    }
+    // Unsubscribe any stale subscription first
+    const existing=await reg.pushManager.getSubscription();
+    if(existing) await existing.unsubscribe();
+
     const sub=await reg.pushManager.subscribe({
       userVisibleOnly:true,
       applicationServerKey:urlBase64ToUint8Array(vapid.key)
     });
-    const result=await fetch('/api/user/push-subscribe',{method:'POST',
+    const result=await fetch('/api/user/push-subscribe',{
+      method:'POST',
       headers:{'Content-Type':'application/json','x-token':userToken},
-      body:JSON.stringify({subscription:sub.toJSON()})}).then(x=>x.json());
-    if(result.ok) showToast('✅ Notifications enabled! You will be notified on every attendance mark.');
-    else showToast('❌ Subscription failed: '+result.error);
+      body:JSON.stringify({subscription:sub.toJSON()})
+    }).then(x=>x.json());
+    if(result.ok) showToast('✅ Notifications enabled! You will be alerted for attendance & account changes.');
+    else showToast('❌ Subscription failed: '+(result.error||'unknown error'));
   } catch(e){
     showToast('❌ Could not subscribe: '+e.message);
   }
