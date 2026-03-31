@@ -340,7 +340,7 @@ async function initTables() {
 
 // ── Model / face-api download ─────────────────────────────────────────────────
 const FACEAPI_URL    = 'https://unpkg.com/face-api.js@0.22.2/dist/face-api.min.js';
-const MODEL_BASE_URL = 'https://unpkg.com/face-api.js@0.22.2/weights/';
+const MODEL_BASE_URL = 'https://raw.githubusercontent.com/justadudewhohacks/face-api.js/master/weights/';
 const MODEL_FILES    = [
   'ssd_mobilenetv1_model-weights_manifest.json','ssd_mobilenetv1_model-shard1','ssd_mobilenetv1_model-shard2',
   'face_landmark_68_model-weights_manifest.json','face_landmark_68_model-shard1',
