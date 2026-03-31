@@ -507,6 +507,7 @@ tr:hover td{background:#f8fafc}
 .cam-wrap video,.cam-wrap canvas{position:absolute;inset:0;width:100%;height:100%;object-fit:cover}
 .scan-line{position:absolute;left:0;right:0;height:2px;background:linear-gradient(90deg,transparent,var(--accent),transparent);animation:scan 3s ease-in-out infinite;opacity:0.5;pointer-events:none;z-index:5}
 @keyframes scan{0%{top:0}50%{top:calc(100% - 2px)}100%{top:0}}
+@keyframes pulse{0%,100%{opacity:1}50%{opacity:0.5}}
 .cam-controls{padding:10px 12px;background:#f8fafc;display:flex;gap:6px;align-items:center;flex-wrap:wrap;border-top:1px solid var(--border)}
 .live-dot{width:7px;height:7px;border-radius:50%;background:var(--accent);animation:livepulse 2s infinite;flex-shrink:0}
 @keyframes livepulse{0%,100%{opacity:1}50%{opacity:0.3}}
@@ -569,6 +570,7 @@ input:checked+.slider:before{transform:translateX(18px)}
 @media(max-width:768px){
   .grid2,.grid3,.grid4{grid-template-columns:1fr}
   .grid4.stats-grid{grid-template-columns:1fr 1fr}
+  #statsRow{grid-template-columns:1fr 1fr!important}
   .mobile-nav{display:block}
   .has-mobile-nav main{padding-bottom:72px}
   .desktop-tabs{display:none}
@@ -916,7 +918,35 @@ app.post('/api/admin/detect', authMiddleware('admin'), async (req, res) => {
   });
 });
 
-// POST: actual mark attendance for selected shift(s)
+// POST: refresh pending shifts for a known face_id (no descriptor needed)
+app.post('/api/admin/detect-by-id', authMiddleware('admin'), async (req, res) => {
+  const { face_id } = req.body;
+  if (!face_id) return res.json({ event: 'error', message: 'face_id required' });
+  const adminId = req.user.id;
+
+  const faceRow = await dbQuery('SELECT id,label,user_email FROM faces WHERE id=? AND admin_id=?', [face_id, adminId]);
+  if (!faceRow.length) return res.json({ event: 'error', message: 'Face not found' });
+  const face = faceRow[0];
+
+  const shifts = await dbQuery(
+    `SELECT s.* FROM face_shifts fs JOIN shifts s ON s.id=fs.shift_id
+     WHERE fs.face_id=? AND fs.admin_id=?`, [face_id, adminId]
+  );
+  const today = new Date().toISOString().split('T')[0];
+  const markedShifts = await dbQuery(
+    'SELECT shift_id FROM attendance WHERE face_id=? AND date=?', [face_id, today]
+  );
+  const markedIds = markedShifts.map(m => m.shift_id);
+  const pendingShifts = shifts.filter(s => !markedIds.includes(s.id));
+
+  return res.json({
+    event: 'recognized', name: face.label, face_id: face.id,
+    shifts, pending_shifts: pendingShifts,
+    marked_today: markedShifts.length, no_shift: shifts.length === 0
+  });
+});
+
+
 app.post('/api/admin/scan', authMiddleware('admin'), async (req, res) => {
   const { face_id, shift_id, mode } = req.body;
   if (!face_id) return res.json({ event: 'error', message: 'face_id required' });
@@ -931,10 +961,10 @@ app.post('/api/admin/scan', authMiddleware('admin'), async (req, res) => {
   const timeStr = pad2(now.getHours())+':'+pad2(now.getMinutes())+':'+pad2(now.getSeconds());
   const shiftRow = shift_id ? (await dbQuery('SELECT * FROM shifts WHERE id=?', [shift_id]))[0] : null;
 
-  const existing = await dbQuery(
-    'SELECT * FROM attendance WHERE face_id=? AND date=? AND (shift_id=? OR (shift_id IS NULL AND ?=0))',
-    [face_id, dateStr, shift_id||null, shift_id?1:0]
-  );
+  // MySQL NULL != NULL so we need IS NULL for no-shift persons
+  const existing = shift_id
+    ? await dbQuery('SELECT * FROM attendance WHERE face_id=? AND date=? AND shift_id=?', [face_id, dateStr, shift_id])
+    : await dbQuery('SELECT * FROM attendance WHERE face_id=? AND date=? AND shift_id IS NULL', [face_id, dateStr]);
 
   if (mode === 'checkout') {
     if (!existing.length) return res.json({ event: 'not_checked_in', name: face.label });
@@ -1055,6 +1085,17 @@ app.get('/api/user/notif-status', authMiddleware('user'), async (req, res) => {
   res.json({ enabled: rows[0]?.notifications_enabled === 1 });
 });
 
+app.get('/api/user/profile', authMiddleware('user'), async (req, res) => {
+  const rows = await dbQuery(
+    `SELECT u.name, u.email, a.org_name, a.attendance_title, a.logo_base64
+     FROM users u JOIN admins a ON a.id=u.admin_id
+     WHERE u.id=? AND u.admin_id=?`,
+    [req.user.id, req.user.admin_id]
+  );
+  if (!rows.length) return res.json({ error: 'Not found' });
+  res.json(rows[0]);
+});
+
 app.get('/api/vapid-public', (_, res) => res.json({ key: VAPID.public, enabled: pushEnabled }));
 
 // ── Service Worker & icon ──────────────────────────────────────────────
@@ -1090,12 +1131,14 @@ app.get('/icon-192.png', (_, res) => {
 // ═══════════════════════════════════════════════════════════════════════
 //  HTML helpers
 // ═══════════════════════════════════════════════════════════════════════
-function htmlBase(title, body, extraHead='') {
+function htmlBase(title, body) {
   return `<!DOCTYPE html><html lang="en"><head>
 <meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1">
 <meta name="theme-color" content="#00adee">
+<meta name="mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-capable" content="yes">
 <title>${escH(title)} — FaceAttend</title>
-${SHARED_CSS}${extraHead}
+${SHARED_CSS}
 </head><body>${body}</body></html>`;
 }
 
@@ -1229,7 +1272,7 @@ app.get('/super-admin', (_, res) => {
   </div>
   <div id="dashboard" style="display:none">
     <div class="page-title">🛡️ Super Admin Dashboard</div>
-    <div id="statsRow" class="grid4 stats-grid" style="margin-bottom:16px"></div>
+    <div id="statsRow" style="display:grid;grid-template-columns:repeat(5,1fr);gap:10px;margin-bottom:16px"></div>
     <div class="card">
       <div class="card-header">
         <span class="card-title">Registered Organisations</span>
@@ -1274,22 +1317,30 @@ async function loadDashboard(){
   if(admins.error){localStorage.removeItem(TOKEN_KEY);location.reload();return;}
   const total=admins.length,approved=admins.filter(a=>a.status==='approved').length,
     pending=admins.filter(a=>a.status==='pending').length,
+    suspended=admins.filter(a=>a.status==='suspended').length,
     totalUsers=admins.reduce((s,a)=>s+(a.user_count||0),0);
+  // Show pending badge in nav
+  document.getElementById('navRight').innerHTML=
+    (pending>0?'<span class="chip chip-yellow" style="animation:pulse 2s infinite">⏳ '+pending+' Pending</span>':'')+
+    '<span class="badge badge-sa">Super Admin</span>'+
+    '<button class="btn btn-sm btn-outline" onclick="logout()">Logout</button>';
   document.getElementById('statsRow').innerHTML=
     '<div class="stat"><div class="stat-val">'+total+'</div><div class="stat-label">Total Orgs</div></div>'+
     '<div class="stat"><div class="stat-val green">'+approved+'</div><div class="stat-label">Approved</div></div>'+
     '<div class="stat"><div class="stat-val yellow">'+pending+'</div><div class="stat-label">Pending</div></div>'+
-    '<div class="stat"><div class="stat-val">'+totalUsers+'</div><div class="stat-label">Employees</div></div>';
+    '<div class="stat"><div class="stat-val red">'+suspended+'</div><div class="stat-label">Suspended</div></div>'+
+    '<div class="stat"><div class="stat-val">'+totalUsers+'</div><div class="stat-label">Total Employees</div></div>';
   const rows=admins.map(a=>'<tr>'+
     '<td><strong>'+a.org_name+'</strong><br><span style="color:var(--muted);font-size:0.7rem">'+a.email+'</span></td>'+
     '<td class="hide-mobile">'+a.org_type+'</td>'+
     '<td><span class="chip chip-'+(a.status==='approved'?'green':a.status==='pending'?'yellow':a.status==='rejected'?'red':'gray')+'">'+a.status+'</span></td>'+
-    '<td class="hide-mobile" style="font-family:\'JetBrains Mono\',monospace;font-size:0.75rem">'+(a.face_count||0)+' / '+(a.user_count||0)+'</td>'+
+    '<td class="hide-mobile" style="font-family:\'JetBrains Mono\',monospace;font-size:0.75rem">'+(a.face_count||0)+' faces / '+(a.user_count||0)+' users</td>'+
     '<td><span class="chip chip-blue">'+(a.today_attendance||0)+' today</span></td>'+
-    '<td>'+
-      (a.status!=='approved'?'<button class="btn btn-xs btn-success" onclick="setStatus('+a.id+',\'approved\')">Approve</button> ':
-        '<button class="btn btn-xs btn-danger" onclick="setStatus('+a.id+',\'suspended\')">Suspend</button> ')+
-      (a.status==='pending'||a.status==='suspended'?'<button class="btn btn-xs btn-danger" onclick="setStatus('+a.id+',\'rejected\')">Reject</button>':'')+
+    '<td style="white-space:nowrap">'+
+      (a.status!=='approved'?'<button class="btn btn-xs btn-success" onclick="setStatus('+a.id+',\'approved\')">✓ Approve</button> ':
+        '<button class="btn btn-xs btn-warn" onclick="setStatus('+a.id+',\'suspended\')">Suspend</button> ')+
+      (a.status==='pending'||a.status==='suspended'?'<button class="btn btn-xs btn-danger" onclick="setStatus('+a.id+',\'rejected\')">✕ Reject</button>':
+        (a.status==='rejected'?'<button class="btn btn-xs btn-success" onclick="setStatus('+a.id+',\'approved\')">Re-approve</button>':''))+
     '</td></tr>').join('');
   document.getElementById('adminTable').innerHTML=
     '<table><thead><tr><th>Organisation</th><th class="hide-mobile">Type</th><th>Status</th><th class="hide-mobile">Faces/Users</th><th>Today</th><th>Action</th></tr></thead>'+
@@ -1640,26 +1691,34 @@ async function showDashboard(r){
   if(me.logo_base64) logoHtml='<img src="'+me.logo_base64+'" style="height:28px;border-radius:5px;margin-right:6px">';
   document.getElementById('navLogo').innerHTML=logoHtml+'Face<span style="color:var(--accent)">Attend</span>';
   document.getElementById('navRight').innerHTML=
-    '<span style="font-size:0.72rem;color:var(--muted);max-width:100px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">'+
-    (me.org_name||'')+'</span><span class="badge badge-admin">Admin</span>'+
+    '<span style="font-size:0.72rem;color:var(--muted);max-width:100px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">'+(me.org_name||'')+'</span>'+
+    '<span class="badge badge-admin">Admin</span>'+
     '<button class="btn btn-sm btn-outline" onclick="adminLogout()">Logout</button>';
+  // Show scan tab by default
+  switchTab('scan', document.querySelector('#dashTabs .tab'));
   await loadShifts();
   await loadFaceList();
   loadScanTab();
   startCamera('video','overlay',true);
-  populateExportMonthYear();
 }
 
 // ── Tab switching ──
 function switchTab(t,btn){
   document.querySelectorAll('#dashTabs .tab').forEach(b=>b.classList.remove('active'));
   if(btn) btn.classList.add('active');
+  else {
+    // activate matching desktop tab by index
+    const tabMap={scan:0,people:1,shifts:2,attendance:3,calendar:4};
+    const tabs=document.querySelectorAll('#dashTabs .tab');
+    if(tabs[tabMap[t]]) tabs[tabMap[t]].classList.add('active');
+  }
   ['scan','people','shifts','attendance','calendar'].forEach(tab=>{
     const el=document.getElementById('tab-'+tab);
     if(el) el.style.display=tab===t?'block':'none';
   });
   if(t==='people') startCamera('regVideo','regOverlay',false);
   if(t==='calendar') renderCalendar();
+  if(t==='attendance'){ populateExportMonthYear(); loadAttendanceRecords(); }
 }
 
 function mobileTab(t,btn){
@@ -1731,6 +1790,7 @@ async function doDetect(){
 
   if(r.event==='recognized'){
     detectedFace=r;
+    detectedFace._descriptor=Array.from(det.descriptor); // cache for re-detect
     lbl.textContent='✅ '+r.name;lbl.className='detected-label green';
 
     const mode=document.getElementById('scanMode').value;
@@ -1803,8 +1863,36 @@ async function markAttendance(shiftId){
     body:JSON.stringify({face_id:detectedFace.face_id,shift_id:shiftId,mode})}).then(x=>x.json());
   showResult(r);
   loadScanTab();
-  // Re-detect to update pending
-  if(r.event==='checkin') showToast('✅ '+r.name+' marked '+(r.shift?'['+r.shift+']':''),'success');
+  if(r.event==='checkin'){
+    showToast('✅ '+r.name+' marked'+(r.shift?' ['+r.shift+']':''),'success');
+    // Refresh pending shifts from server using face_id directly
+    const updated=await fetch('/api/admin/detect-by-id',{method:'POST',
+      headers:{'Content-Type':'application/json','x-token':adminToken},
+      body:JSON.stringify({face_id:detectedFace.face_id})}).then(x=>x.json()).catch(()=>null);
+    // If we have cached detect result, update from server
+    if(updated&&updated.event==='recognized'){
+      detectedFace=updated;
+      if(updated.pending_shifts.length===0){
+        document.getElementById('shiftSelectCard').style.display='none';
+        showToast('✅ All shifts marked for '+r.name,'success');
+      } else {
+        // Re-render pending
+        const s=updated.pending_shifts;
+        document.getElementById('detectedMeta').textContent=s.length+' shift'+(s.length>1?'s':'')+' remaining:';
+        let html='';
+        s.forEach(sh=>{
+          html+='<button class="btn btn-success btn-sm" style="margin:3px;display:inline-flex;flex-direction:column;align-items:flex-start;height:auto;padding:8px 12px" onclick="markAttendance('+sh.id+')">'+
+            '<span style="font-weight:700">'+sh.name+'</span>'+
+            '<span style="font-size:0.65rem;opacity:0.8">'+fmtT(sh.start_time)+' – '+fmtT(sh.end_time)+'</span>'+
+            '</button>';
+        });
+        if(s.length>1) html+='<button class="btn btn-primary btn-sm" style="margin:3px" onclick="markAllShifts()">✅ Mark All ('+s.length+')</button>';
+        document.getElementById('pendingShiftsList').innerHTML=html;
+      }
+    } else {
+      document.getElementById('shiftSelectCard').style.display='none';
+    }
+  }
   if(r.event==='checkout') showToast('👋 '+r.name+' checked out'+(r.shift?' ['+r.shift+']':''),'info');
 }
 
@@ -1821,7 +1909,7 @@ async function markAllShifts(){
   showResult({event:'checkin',name:detectedFace.name,message:'All '+detectedFace.pending_shifts.length+' shifts marked'});
 }
 
-function fmtT(t){if(!t)return'';const p=t.split(':');const h=parseInt(p[0]),m=p[1]||'00';return(h%12||12)+':'+m+(h>=12?' PM':' AM');}
+
 
 function showResult(r,icon=''){
   const icons={checkin:'✅',checkout:'👋',unknown:'❓',already_checked_in:'ℹ️',already_checked_out:'ℹ️',not_checked_in:'⚠️',recognized:'👤',no_face:'⚠️'};
@@ -1926,11 +2014,18 @@ function renderShiftCheckboxes(selectedIds=[]){
 }
 
 function shiftHoursJS(start,end){
-  const [sh,sm]=start.split(':').map(Number);
-  const [eh,em]=end.split(':').map(Number);
+  // MySQL TIME returns HH:MM:SS — take only first two parts
+  const sp=String(start).split(':'),ep=String(end).split(':');
+  const sh=+sp[0],sm=+sp[1]||0,eh=+ep[0],em=+ep[1]||0;
   let mins=(eh*60+em)-(sh*60+sm);if(mins<0)mins+=24*60;
   const h=Math.floor(mins/60),m=mins%60;
   return m?h+'h '+m+'m':h+'h';
+}
+function fmtT(t){
+  if(!t)return'';
+  const p=String(t).split(':');
+  const h=parseInt(p[0]),m=p[1]||'00';
+  return(h%12||12)+':'+m+(h>=12?' PM':' AM');
 }
 
 function getSelectedShiftIds(){
@@ -2114,7 +2209,10 @@ async function deleteShift(id){
 }
 
 // ── Attendance Records ──
+let exportPopulated=false;
 function populateExportMonthYear(){
+  if(exportPopulated) return;
+  exportPopulated=true;
   const now=new Date();
   const months=['January','February','March','April','May','June','July','August','September','October','November','December'];
   const mSel=document.getElementById('expMonth');
@@ -2221,7 +2319,7 @@ async function toggleHoliday(){
     else localStorage.removeItem(TOKEN_KEY);
   }
 })();
-</script>`, `<meta name="apple-mobile-web-app-capable" content="yes">`));
+</script>`));
 });
 
 // ═══════════════════════════════════════════════════════════════════════
@@ -2503,14 +2601,23 @@ async function renderCalendar(){
 (async function(){
   if(userToken){
     try{
-      const r=await fetch('/api/user/notif-status',{headers:{'x-token':userToken}}).then(x=>x.json());
-      if(r&&!r.error){
+      // Fetch full profile + notif status together
+      const [notifR, profileR] = await Promise.all([
+        fetch('/api/user/notif-status',{headers:{'x-token':userToken}}).then(x=>x.json()),
+        fetch('/api/user/profile',{headers:{'x-token':userToken}}).then(x=>x.json()).catch(()=>null)
+      ]);
+      if(notifR&&!notifR.error){
         const parts=userToken.split('.');
         const pay=JSON.parse(atob(parts[1]));
-        currentUser={name:pay.name,logo_base64:null,notifications_enabled:r.enabled};
+        currentUser={
+          name:pay.name,
+          logo_base64: profileR&&!profileR.error ? profileR.logo_base64 : null,
+          org_name: profileR&&!profileR.error ? profileR.org_name : '',
+          notifications_enabled: notifR.enabled
+        };
         await showUserDash(currentUser);
-      } else {localStorage.removeItem(TOKEN_KEY);}
-    }catch(e){localStorage.removeItem(TOKEN_KEY);}
+      } else { localStorage.removeItem(TOKEN_KEY); }
+    }catch(e){ localStorage.removeItem(TOKEN_KEY); }
   }
 })();
 </script>`));
