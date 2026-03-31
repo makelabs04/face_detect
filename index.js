@@ -637,6 +637,18 @@ app.post('/api/admin/faces', authMiddleware('admin'), async (req, res) => {
     }
 
     await dbQuery('UPDATE faces SET user_email=? WHERE id=?', [user_email, faceId]);
+
+    // Send push notification to the employee
+    const userRow = await dbQuery('SELECT id FROM users WHERE email=? AND admin_id=?', [user_email, req.user.id]);
+    if (userRow.length) {
+      const isUpdate = existingUser.length > 0;
+      const pushTitle = isUpdate ? '✏️ Profile Updated' : '🎉 Account Created';
+      const pushBody  = isUpdate
+        ? `${label}, your profile details have been updated by your admin.`
+        : `${label}, your account has been registered. You can now log in with ${user_email}.`;
+      await sendPushToUser(userRow[0].id, pushTitle, pushBody, req.user.id);
+    }
+
     res.json({ ok: true });
   } catch(e) {
     if (e.code === 'ER_DUP_ENTRY') return res.json({ error: 'A person with this name or email already exists' });
@@ -679,6 +691,9 @@ app.put('/api/admin/users/:id/reset-password', authMiddleware('admin'), async (r
   if (!password || password.length < 6) return res.json({ error: 'Password min 6 chars' });
   const hash = await bcrypt.hash(password, 12);
   await dbQuery('UPDATE users SET password=? WHERE id=? AND admin_id=?', [hash, req.params.id, req.user.id]);
+  // Notify the user their password was changed
+  const uRow = await dbQuery('SELECT name FROM users WHERE id=? AND admin_id=?', [req.params.id, req.user.id]);
+  if (uRow.length) await sendPushToUser(parseInt(req.params.id), '🔑 Password Changed', `${uRow[0].name}, your login password has been reset by your admin.`, req.user.id);
   res.json({ ok: true });
 });
 
@@ -990,7 +1005,12 @@ app.get('/api/vapid-public', (_, res) => res.json({ key: VAPID.public }));
 // ── Service worker + icon ─────────────────────────────────────────────────────
 app.get('/sw.js', (_, res) => {
   res.setHeader('Content-Type', 'application/javascript');
+  res.setHeader('Cache-Control', 'no-cache, no-store, must-revalidate');
+  res.setHeader('Service-Worker-Allowed', '/');
   res.send(`
+'use strict';
+self.addEventListener('install', e => self.skipWaiting());
+self.addEventListener('activate', e => e.waitUntil(clients.claim()));
 self.addEventListener('push', e => {
   let data = {};
   try { data = e.data.json(); } catch(_) { data = { title: 'FaceAttend', body: e.data?.text() || '' }; }
@@ -2258,41 +2278,66 @@ async function showUserDash(r){
 
   renderCalendar();
 
-  // Fix: register SW first, THEN request push permission
-  if('serviceWorker' in navigator && 'PushManager' in navigator){
+  // Register SW and show notification modal if not yet enabled
+  if('serviceWorker' in navigator && 'PushManager' in navigator && typeof Notification !== 'undefined'){
     try{
-      const reg=await navigator.serviceWorker.register('/sw.js');
-      await navigator.serviceWorker.ready; // wait until active
-      const notifPerm=Notification.permission;
+      await navigator.serviceWorker.register('/sw.js');
       const alreadyEnabled=r.notifications_enabled;
-      if(!alreadyEnabled && notifPerm!=='denied'){
+      const perm=Notification.permission;
+      if(!alreadyEnabled && perm!=='denied'){
         setTimeout(()=>{
           document.getElementById('notifModal').classList.add('open');
-        }, 5000);
+        }, 1500);
       }
-    }catch(e){ console.warn('SW registration failed:',e.message); }
+    }catch(e){
+      console.warn('SW registration failed:',e.message);
+    }
   }
 }
 
 async function enableNotif(){
   dismissNotifModal();
+  if(typeof Notification === 'undefined'){
+    showToast('⚠️ Notifications not supported in this browser.');
+    return;
+  }
   const perm=await Notification.requestPermission();
-  if(perm!=='granted'){showToast('⚠️ Notifications blocked. Enable from browser settings.');return;}
+  if(perm==='denied'){
+    showToast('⚠️ Notifications blocked. Enable in browser Site Settings, then re-login.');
+    return;
+  }
+  if(perm!=='granted'){
+    showToast('⚠️ Notification permission not granted.');
+    return;
+  }
   try{
-    const reg=await navigator.serviceWorker.ready;
+    // Wait for SW with a 5s timeout
+    const reg = await Promise.race([
+      navigator.serviceWorker.ready,
+      new Promise((_,rej)=>setTimeout(()=>rej(new Error('SW timeout')),5000))
+    ]);
     const vapid=await fetch('/api/vapid-public').then(x=>x.json());
-    if(!vapid.key){showToast('ℹ️ Push notifications not configured on this server.');return;}
+    if(!vapid.key){
+      showToast('ℹ️ Push not configured on this server — contact admin.');
+      return;
+    }
+    // Clear any stale subscription first
+    const existing=await reg.pushManager.getSubscription();
+    if(existing) await existing.unsubscribe();
+
     const sub=await reg.pushManager.subscribe({
       userVisibleOnly:true,
       applicationServerKey:urlBase64ToUint8Array(vapid.key)
     });
-    const result=await fetch('/api/user/push-subscribe',{method:'POST',
+    const result=await fetch('/api/user/push-subscribe',{
+      method:'POST',
       headers:{'Content-Type':'application/json','x-token':userToken},
-      body:JSON.stringify({subscription:sub.toJSON()})}).then(x=>x.json());
-    if(result.ok) showToast('✅ Notifications enabled! You will be notified on every attendance mark.');
-    else showToast('❌ Subscription failed: '+result.error);
+      body:JSON.stringify({subscription:sub.toJSON()})
+    }).then(x=>x.json());
+    if(result.ok) showToast('✅ Notifications enabled! You will be alerted for attendance & account changes.');
+    else showToast('❌ Subscription failed: '+(result.error||'unknown error'));
   } catch(e){
-    showToast('❌ Could not subscribe: '+e.message);
+    showToast('❌ Could not enable notifications: '+e.message);
   }
 }
 
