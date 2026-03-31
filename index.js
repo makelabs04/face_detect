@@ -1,3 +1,18 @@
+/**
+ * FaceAttend SaaS — Multi-tenant Face Recognition Attendance
+ * Roles: super_admin | admin (tenant) | user (employee)
+ *
+ * Changes v3 → v4:
+ *  - Multi-shift attendance: select one / multiple / all pending shifts per scan
+ *  - Duplicate scan prevention per shift per day
+ *  - Admin: export attendance (CSV/Excel)
+ *  - Admin: user management tab (view/delete users)
+ *  - Notification subscription fix (service worker registration order)
+ *  - Scan result label always shown
+ *  - Improved UI mobile responsiveness across all pages
+ *  - Attendance table updated: UNIQUE KEY now per face+date+shift combo
+ */
+
 'use strict';
 
 require('dotenv').config();
@@ -417,8 +432,6 @@ tr:hover td{background:var(--surface)}
 .cam-wrap video,.cam-wrap canvas{position:absolute;inset:0;width:100%;height:100%;object-fit:cover}
 .scan-line{position:absolute;left:0;right:0;height:2px;background:linear-gradient(90deg,transparent,var(--accent),transparent);animation:scan 3s ease-in-out infinite;opacity:0.4;pointer-events:none}
 @keyframes scan{0%{top:0}50%{top:calc(100% - 2px)}100%{top:0}}
-.detect-label{position:absolute;bottom:10px;left:50%;transform:translateX(-50%);background:rgba(0,0,0,0.65);color:#fff;font-size:0.72rem;font-family:'JetBrains Mono',monospace;padding:4px 12px;border-radius:20px;pointer-events:none;white-space:nowrap;z-index:10;transition:opacity 0.3s;opacity:0}
-.detect-label.visible{opacity:1}
 .cam-controls{padding:10px 12px;background:var(--surface);display:flex;gap:6px;align-items:center;flex-wrap:wrap}
 .btn-checkin{background:var(--accent);color:#fff}.btn-checkin:hover:not(:disabled){background:#009ed8;transform:translateY(-1px)}
 .btn-checkin:disabled{opacity:0.5;cursor:not-allowed}
@@ -713,6 +726,28 @@ app.get('/api/admin/attendance/export', authMiddleware('admin'), async (req, res
   res.setHeader('Content-Type', 'text/csv');
   res.setHeader('Content-Disposition', `attachment; filename="${filename}"`);
   res.send(csv);
+});
+
+// ── Per-person attendance for Records tab ─────────────────────────────────────
+app.get('/api/admin/person-attendance', authMiddleware('admin'), async (req, res) => {
+  const { face_id, month, year } = req.query;
+  if (!face_id) return res.json({ error: 'face_id required' });
+  const m = parseInt(month), y = parseInt(year);
+  const [attend, holidays] = await Promise.all([
+    dbQuery(
+      `SELECT a.date, a.time_in, a.time_out, a.status, s.name as shift_name
+       FROM attendance a
+       LEFT JOIN shifts s ON s.id=a.shift_id
+       WHERE a.admin_id=? AND a.face_id=? AND MONTH(a.date)=? AND YEAR(a.date)=?
+       ORDER BY a.date, a.time_in`,
+      [req.user.id, face_id, m, y]
+    ),
+    dbQuery(
+      'SELECT date, label FROM holidays WHERE admin_id=? AND MONTH(date)=? AND YEAR(date)=?',
+      [req.user.id, m, y]
+    )
+  ]);
+  res.json({ attendance: attend, holidays });
 });
 
 app.get('/api/admin/calendar', authMiddleware('admin'), async (req, res) => {
@@ -1281,6 +1316,7 @@ app.get('/admin', (_, res) => {
       <button class="tab" onclick="switchTab('users',this)">🔑 Users</button>
       <button class="tab" onclick="switchTab('reports',this)">📊 Reports</button>
       <button class="tab" onclick="switchTab('calendar',this)">📅 Calendar</button>
+      <button class="tab" onclick="switchTab('records',this)">🗂 Records</button>
     </div>
 
     <!-- SCAN TAB -->
@@ -1292,7 +1328,6 @@ app.get('/admin', (_, res) => {
               <video id="video" autoplay muted playsinline></video>
               <canvas id="overlay"></canvas>
               <div class="scan-line"></div>
-              <div class="detect-label" id="detectLabel"></div>
             </div>
             <div class="cam-controls">
               <div style="flex:1;display:flex;align-items:center;gap:8px;font-size:0.72rem;color:var(--muted);min-width:0">
@@ -1463,6 +1498,33 @@ app.get('/admin', (_, res) => {
       </div>
     </div>
 
+    <!-- RECORDS TAB -->
+    <div id="tab-records" style="display:none">
+      <div class="grid2" style="gap:14px;align-items:start">
+        <div class="card">
+          <div style="font-weight:700;margin-bottom:14px;font-size:0.95rem">🗂 Person-wise Records</div>
+          <div id="recordsPeopleList"></div>
+        </div>
+        <div id="recordsCalPanel" style="display:none">
+          <div class="card">
+            <div style="display:flex;align-items:center;gap:10px;margin-bottom:14px;flex-wrap:wrap">
+              <button class="btn btn-outline btn-sm" onclick="recChangeMonth(-1)">&#8249; Prev</button>
+              <span id="recCalTitle" style="font-weight:700;flex:1;text-align:center"></span>
+              <button class="btn btn-outline btn-sm" onclick="recChangeMonth(1)">Next &#8250;</button>
+            </div>
+            <div style="display:flex;align-items:center;gap:8px;margin-bottom:14px;flex-wrap:wrap">
+              <div style="width:10px;height:10px;border-radius:50%;background:var(--green);flex-shrink:0"></div><span style="font-size:0.72rem;color:var(--muted)">Present</span>
+              <div style="width:10px;height:10px;border-radius:50%;background:var(--red);flex-shrink:0;margin-left:8px"></div><span style="font-size:0.72rem;color:var(--muted)">Absent</span>
+              <div style="width:10px;height:10px;border-radius:50%;background:var(--yellow);flex-shrink:0;margin-left:8px"></div><span style="font-size:0.72rem;color:var(--muted)">Holiday</span>
+            </div>
+            <div style="display:grid;grid-template-columns:repeat(4,1fr);gap:8px;margin-bottom:14px" id="recStats"></div>
+            <div class="cal-grid" id="recCalHead"></div>
+            <div class="cal-grid" style="margin-top:4px" id="recCalGrid"></div>
+          </div>
+        </div>
+      </div>
+    </div>
+
   </div><!-- /dashboard -->
 </main>
 
@@ -1560,12 +1622,13 @@ async function showDashboard(r){
 function switchTab(t,btn){
   document.querySelectorAll('#dashTabs .tab').forEach(b=>b.classList.remove('active'));
   btn.classList.add('active');
-  ['scan','faces','shifts','users','reports','calendar'].forEach(tab=>{
+  ['scan','faces','shifts','users','reports','calendar','records'].forEach(tab=>{
     document.getElementById('tab-'+tab).style.display=tab===t?'block':'none';
   });
   if(t==='faces') startCamera('regVideo','regOverlay',false);
   if(t==='calendar') renderCalendar();
   if(t==='users') loadUsers();
+  if(t==='records') loadRecordsPeople();
 }
 
 let streams={};
@@ -1776,38 +1839,21 @@ async function ensureModels(){
   modelsLoaded=true;
 }
 
-function showDetectLabel(text, duration=2000){
-  const el=document.getElementById('detectLabel');
-  if(!el) return;
-  el.textContent=text;
-  el.classList.add('visible');
-  clearTimeout(el._t);
-  if(duration>0) el._t=setTimeout(()=>el.classList.remove('visible'), duration);
-}
-
 async function doScan(){
   const v=document.getElementById('video');
   if(!v||!v.srcObject) return;
-  showDetectLabel('🔍 Scanning…', 0);          // stage 1: scanning
   await ensureModels();
   const det=await faceapi.detectSingleFace(v).withFaceLandmarks().withFaceDescriptor();
-  if(!det){
-    showDetectLabel('⚠️ No face detected');
-    showResult({event:'no_face',message:'No face detected'},'⚠️');
-    return;
-  }
-  showDetectLabel('⏳ Identifying…', 0);        // stage 2: identifying
+  if(!det){showResult({event:'no_face',message:'No face detected'},'⚠️');return;}
   const mode=document.getElementById('scanMode').value;
   const r=await fetch('/api/admin/scan',{method:'POST',headers:{'Content-Type':'application/json','x-token':adminToken},
     body:JSON.stringify({descriptor:Array.from(det.descriptor),mode})}).then(x=>x.json());
 
   if(r.event==='face_identified'){
-    showDetectLabel('✅ '+r.name);              // stage 3: result
+    // Show shift selection modal
     pendingScanResult=r;
     openShiftModal(r);
   } else {
-    const icon = r.event==='unknown'?'❓':'ℹ️';
-    showDetectLabel(icon+' '+(r.name||r.message||r.event));
     showResult(r);
     loadScanTab();
   }
@@ -2020,6 +2066,103 @@ async function toggleHoliday(){
     else localStorage.removeItem(TOKEN_KEY);
   }
 })();
+
+// ── Records Tab (person-wise calendar) ────────────────────────────────────────
+let recYear=new Date().getFullYear(), recMonth=new Date().getMonth()+1;
+let recFaceId=null, recFaceName='', recData={attendance:[],holidays:[]};
+
+async function loadRecordsPeople(){
+  const faces=await fetch('/api/admin/faces',{headers:{'x-token':adminToken}}).then(x=>x.json());
+  const html=faces.length?faces.map(f=>\`
+    <div onclick="openPersonCalendar(\${f.id},'\${f.label.replace(/'/g,"\\\\'")}',this)"
+         style="display:flex;align-items:center;justify-content:space-between;padding:10px 12px;border-radius:10px;cursor:pointer;transition:background 0.15s;border:1px solid transparent;margin-bottom:6px"
+         onmouseover="this.style.background='var(--surface)'" onmouseout="if(!this.classList.contains('rec-active'))this.style.background=''">
+      <div>
+        <span style="font-weight:600">\${f.label}</span>
+        \${f.employee_id?\`<span style="color:var(--muted);font-size:0.68rem;margin-left:6px">#\${f.employee_id}</span>\`:''}
+        <br><span style="color:var(--muted);font-size:0.68rem">\${f.department||''}\${f.shift_name?' · '+f.shift_name:''}</span>
+      </div>
+      <span style="color:var(--accent);font-size:0.75rem">View →</span>
+    </div>\`).join('')
+    :'<p style="color:var(--muted);font-size:0.8rem">No people registered yet.</p>';
+  document.getElementById('recordsPeopleList').innerHTML=html;
+  document.getElementById('recordsCalPanel').style.display='none';
+}
+
+async function openPersonCalendar(faceId,name,el){
+  document.querySelectorAll('#recordsPeopleList > div').forEach(d=>{
+    d.classList.remove('rec-active');
+    d.style.background='';
+    d.style.border='1px solid transparent';
+  });
+  el.classList.add('rec-active');
+  el.style.background='rgba(0,173,238,0.06)';
+  el.style.border='1px solid rgba(0,173,238,0.2)';
+  recFaceId=faceId; recFaceName=name;
+  recYear=new Date().getFullYear(); recMonth=new Date().getMonth()+1;
+  document.getElementById('recordsCalPanel').style.display='block';
+  await renderRecCalendar();
+}
+
+function recChangeMonth(d){
+  recMonth+=d;
+  if(recMonth>12){recMonth=1;recYear++;}
+  if(recMonth<1){recMonth=12;recYear--;}
+  renderRecCalendar();
+}
+
+async function renderRecCalendar(){
+  if(!recFaceId) return;
+  recData=await fetch('/api/admin/person-attendance?face_id='+recFaceId+'&month='+recMonth+'&year='+recYear,
+    {headers:{'x-token':adminToken}}).then(x=>x.json());
+
+  document.getElementById('recCalTitle').textContent=recFaceName+' \u2014 '+MONTH_NAMES[recMonth-1]+' '+recYear;
+
+  const presentDays=new Set(recData.attendance.filter(a=>a.status==='present').map(a=>(a.date+'').slice(0,10))).size;
+  const absentDays=new Set(recData.attendance.filter(a=>a.status==='absent').map(a=>(a.date+'').slice(0,10))).size;
+  const holCount=recData.holidays.length;
+  const rate=presentDays+absentDays>0?Math.round(presentDays/(presentDays+absentDays)*100):0;
+  document.getElementById('recStats').innerHTML=\`
+    <div class="stat card-sm"><div class="stat-val green">\${presentDays}</div><div class="stat-label">Present Days</div></div>
+    <div class="stat card-sm"><div class="stat-val red">\${absentDays}</div><div class="stat-label">Absent Days</div></div>
+    <div class="stat card-sm"><div class="stat-val yellow">\${holCount}</div><div class="stat-label">Holidays</div></div>
+    <div class="stat card-sm"><div class="stat-val \${rate>=80?'green':rate>=60?'yellow':'red'}">\${rate}%</div><div class="stat-label">Rate</div></div>
+  \`;
+
+  document.getElementById('recCalHead').innerHTML=['Sun','Mon','Tue','Wed','Thu','Fri','Sat'].map(d=>\`<div class="cal-head">\${d}</div>\`).join('');
+
+  const first=new Date(recYear,recMonth-1,1).getDay();
+  const days=new Date(recYear,recMonth,0).getDate();
+  const today=new Date();
+  let cells='';
+  for(let i=0;i<first;i++) cells+=\`<div class="cal-day other-month"></div>\`;
+
+  for(let d=1;d<=days;d++){
+    const dateStr=recYear+'-'+String(recMonth).padStart(2,'0')+'-'+String(d).padStart(2,'0');
+    const dayAtts=recData.attendance.filter(a=>(a.date+'').startsWith(dateStr));
+    const hol=recData.holidays.find(h=>(h.date+'').startsWith(dateStr));
+    const isToday=today.getDate()===d&&today.getMonth()===recMonth-1&&today.getFullYear()===recYear;
+    const presentAtts=dayAtts.filter(a=>a.status==='present');
+    const isAbsent=dayAtts.some(a=>a.status==='absent');
+
+    let dayStyle='';
+    if(presentAtts.length) dayStyle='border-color:var(--green);background:rgba(52,211,153,0.08)';
+    else if(isAbsent) dayStyle='border-color:var(--red);background:rgba(248,113,113,0.08)';
+    else if(hol) dayStyle='border-color:var(--yellow);background:rgba(251,191,36,0.08)';
+
+    const shiftTags=presentAtts.map(a=>
+      \`<span class="cal-event cal-present" style="font-size:0.52rem">\${a.shift_name||'✅'}</span>\`
+    ).join('');
+
+    cells+=\`<div class="cal-day\${isToday?' today':''}" style="\${dayStyle}">
+      <div class="cal-day-num" style="\${presentAtts.length?'color:var(--green)':isAbsent?'color:var(--red)':hol?'color:#92400e':''}">\${d}</div>
+      \${shiftTags}
+      \${isAbsent&&!presentAtts.length?'<span class="cal-event cal-absent">Absent</span>':''}
+      \${hol?\`<span class="cal-event cal-holiday-tag">\${hol.label}</span>\`:''}
+    </div>\`;
+  }
+  document.getElementById('recCalGrid').innerHTML=cells;
+}
 </script>`));
 });
 
