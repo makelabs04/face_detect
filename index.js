@@ -2581,7 +2581,7 @@ async function showUserDash(r){
   renderCalendar();
 
   // Show notification modal after short delay — independent of SW registration
-  if(typeof Notification !== 'undefined' && 'PushManager' in navigator){
+  if(typeof Notification !== 'undefined'){
     const alreadyEnabled = r.notifications_enabled;
     const perm = Notification.permission;
     if(!alreadyEnabled && perm !== 'denied'){
@@ -2601,10 +2601,10 @@ async function showUserDash(r){
 
 async function enableNotif(){
   dismissNotifModal();
-  if(typeof Notification === 'undefined' || !('PushManager' in navigator)){
-    showToast('⚠️ Push notifications not supported in this browser.');
-    return;
-  }
+  if(typeof Notification === 'undefined'){
+  showToast('⚠️ Notifications not supported in this browser.');
+  return;
+}
   const perm = await Notification.requestPermission();
   if(perm === 'denied'){
     showToast('⚠️ Notifications blocked. Go to Site Settings → Notifications → Allow, then re-login.');
@@ -2655,12 +2655,10 @@ function dismissNotifModal(){
   document.getElementById('notifModal').classList.remove('open');
 }
 function openNotifModal(){
-  if(typeof Notification === 'undefined' || !('PushManager' in navigator)){
-    showToast('⚠️ Please open in Chrome or Edge browser to enable notifications.');
+  if(typeof Notification === 'undefined'){
+    showToast('⚠️ Notifications not supported in this browser.');
     return;
   }
-  document.getElementById('notifModal').classList.add('open');
-}
 
 function showToast(msg){
   const t=document.createElement('div');
