@@ -2136,38 +2136,29 @@ async function doScan(){
       return;
     }
 
-    // ── ALL assigned periods already marked today ──────────────────────────────
-   if (r.assigned_period_ids && r.assigned_period_ids.length > 0 && autoIds.length === 0) {
-      // Check if there's a pending shift that just doesn't match current time
-      const pendingAssigned = (r.pending_shifts || []).filter(s => r.assigned_period_ids.includes(s.id));
-      const allDone = pendingAssigned.length === 0;
-      // All assigned periods are already done
-      const markedNames=(r.marked_shift_ids||[]).map(id=>{
-        const s=allShifts.find(x=>x.id===id);
-        return s?s.name:'';
-      }).filter(Boolean);
-     // REPLACE the innerHTML inside that block with:
-    document.getElementById('resultBody').innerHTML = `
-      <div style="text-align:center;padding:10px">
-        <div style="font-size:2rem">${allDone ? '✅' : '⏰'}</div>
-        <div style="font-size:1rem;font-weight:700;color:${allDone ? 'var(--green)' : 'var(--yellow)'};margin:6px 0">${r.name}</div>
-        <div style="font-size:0.8rem;color:var(--muted);margin-top:4px">
-          ${allDone
-            ? 'All assigned periods already marked today.'
-            : 'No active period right now. Please scan during your assigned period time.'}
-        </div>
-        ${(r.marked_shift_ids || []).length
-          ? '<div style="margin-top:8px">' +
-            (r.all_shifts || [])
-              .filter(s => r.marked_shift_ids.includes(s.id))
-              .map(s => `<span class="chip chip-green" style="margin:1px">✅ ${s.name}</span>`)
-              .join('') +
-            '</div>'
-          : ''}
-      </div>`;
-      loadScanTab();
-      return;
-    }
+    if (r.assigned_period_ids && r.assigned_period_ids.length > 0 && autoIds.length === 0) {
+  const pendingAssigned = (r.pending_shifts || []).filter(s => r.assigned_period_ids.includes(s.id));
+  const allDone = pendingAssigned.length === 0;
+  const markedNames = (r.marked_shift_ids || []).map(id => {
+    const s = allShifts.find(x => x.id === id);
+    return s ? s.name : '';
+  }).filter(Boolean);
+  document.getElementById('resultBody').innerHTML = \`
+    <div style="text-align:center;padding:10px">
+      <div style="font-size:2rem">\${allDone ? '✅' : '⏰'}</div>
+      <div style="font-size:1rem;font-weight:700;color:\${allDone ? 'var(--green)' : 'var(--yellow)'};margin:6px 0">\${r.name}</div>
+      <div style="font-size:0.8rem;color:var(--muted);margin-top:4px">
+        \${allDone
+          ? 'All assigned periods already marked today.'
+          : 'No active period right now. Please scan during your assigned period time.'}
+      </div>
+      \${markedNames.length
+        ? '<div style="margin-top:8px">' + markedNames.map(n => \`<span class="chip chip-green" style="margin:1px">✅ \${n}</span>\`).join('') + '</div>'
+        : ''}
+    </div>\`;
+  loadScanTab();
+  return;
+}
 
     // ── NO assigned periods — show manual selection modal ─────────────────────
     pendingScanResult=r;
