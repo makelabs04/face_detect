@@ -2616,13 +2616,8 @@ async function enableNotif(){
   }
   try{
     showToast('⏳ Setting up notifications...');
-    // Register (or get existing) SW
-    let reg = await navigator.serviceWorker.getRegistration('/');
-    if(!reg){
-      reg = await navigator.serviceWorker.register('/sw.js', { scope: '/' });
-    }
-    // Wait for it to be active with a 6s timeout
-    await Promise.race([
+    // Always use the ready registration — guaranteed to be active
+    const reg = await Promise.race([
       navigator.serviceWorker.ready,
       new Promise((_,rej) => setTimeout(()=>rej(new Error('Service worker timed out — try refreshing page')), 6000))
     ]);
