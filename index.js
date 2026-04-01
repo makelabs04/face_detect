@@ -983,8 +983,12 @@ app.post('/api/admin/scan', authMiddleware('admin'), async (req, res) => {
   );
   const assignedPeriodIds = assignedPeriods.map(p => p.shift_id);
 
-  // Auto-select: only pending shifts that are in the student's assigned periods
-  const autoSelectShifts = pendingShifts.filter(s => assignedPeriodIds.includes(s.id));
+ // Auto-select: only pending shifts that are assigned AND currently active (within time window)
+  const autoSelectShifts = pendingShifts.filter(s => {
+    if (!assignedPeriodIds.includes(s.id)) return false;
+    const now = timeStr; // already computed as HH:MM:SS
+    return now >= s.start_time && now <= s.end_time;
+  });
 
   // Return face info + pending shifts for the frontend to display multiselect
   return res.json({
