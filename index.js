@@ -2648,7 +2648,8 @@ async function enableNotif(){
   } catch(e){
     showToast('❌ '+e.message);
     console.error('enableNotif error:', e);
-  }}
+  }
+}
 
 function dismissNotifModal(){
   document.getElementById('notifModal').classList.remove('open');
