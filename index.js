@@ -1,18 +1,3 @@
-/**
- * FaceAttend SaaS — Multi-tenant Face Recognition Attendance
- * Roles: super_admin | admin (tenant) | user (student)
- *
- * Changes v3 → v4:
- *  - Multi-period attendance: select one / multiple / all pending shifts per scan
- *  - Duplicate scan prevention per period per day
- *  - Admin: export attendance (CSV/Excel)
- *  - Admin: user management tab (view/delete users)
- *  - Notification subscription fix (service worker registration order)
- *  - Scan result label always shown
- *  - Improved UI mobile responsiveness across all pages
- *  - Attendance table updated: UNIQUE KEY now per face+date+shift combo
- */
-
 'use strict';
 
 require('dotenv').config();
@@ -983,8 +968,18 @@ app.post('/api/admin/scan', authMiddleware('admin'), async (req, res) => {
   );
   const assignedPeriodIds = assignedPeriods.map(p => p.shift_id);
 
-  // Auto-select: only pending shifts that are in the student's assigned periods
-  const autoSelectShifts = pendingShifts.filter(s => assignedPeriodIds.includes(s.id));
+  const nowMinutes = now.getHours() * 60 + now.getMinutes();
+
+  const autoSelectShifts = pendingShifts.filter(s => {
+    if (!assignedPeriodIds.includes(s.id)) return false;
+    const [startH, startM] = s.start_time.split(':').map(Number);
+    const [endH, endM] = s.end_time.split(':').map(Number);
+    const startMinutes = startH * 60 + startM;
+    const endMinutes = endH * 60 + endM;
+    const bufferBefore = 15; // allow scan 15 min before shift starts
+    const bufferAfter = 30;  // allow scan up to 30 min after shift ends
+    return nowMinutes >= (startMinutes - bufferBefore) && nowMinutes <= (endMinutes + bufferAfter);
+  });
 
   // Return face info + pending shifts for the frontend to display multiselect
   return res.json({
@@ -2142,19 +2137,34 @@ async function doScan(){
     }
 
     // ── ALL assigned periods already marked today ──────────────────────────────
-    if(r.assigned_period_ids&&r.assigned_period_ids.length>0 && autoIds.length===0){
+   if (r.assigned_period_ids && r.assigned_period_ids.length > 0 && autoIds.length === 0) {
+      // Check if there's a pending shift that just doesn't match current time
+      const pendingAssigned = (r.pending_shifts || []).filter(s => r.assigned_period_ids.includes(s.id));
+      const allDone = pendingAssigned.length === 0;
       // All assigned periods are already done
       const markedNames=(r.marked_shift_ids||[]).map(id=>{
         const s=allShifts.find(x=>x.id===id);
         return s?s.name:'';
       }).filter(Boolean);
-      document.getElementById('resultBody').innerHTML=\`
-        <div style="text-align:center;padding:10px">
-          <div style="font-size:2rem">✅</div>
-          <div style="font-size:1rem;font-weight:700;color:var(--green);margin:6px 0">\${r.name}</div>
-          <div style="font-size:0.8rem;color:var(--muted);margin-top:4px">All assigned periods already marked today.</div>
-          \${markedNames.length?'<div style="margin-top:8px">'+markedNames.map(n=>'<span class="chip chip-green" style="margin:1px">✅ '+n+'</span>').join('')+'</div>':''}
-        </div>\`;
+     // REPLACE the innerHTML inside that block with:
+    document.getElementById('resultBody').innerHTML = `
+      <div style="text-align:center;padding:10px">
+        <div style="font-size:2rem">${allDone ? '✅' : '⏰'}</div>
+        <div style="font-size:1rem;font-weight:700;color:${allDone ? 'var(--green)' : 'var(--yellow)'};margin:6px 0">${r.name}</div>
+        <div style="font-size:0.8rem;color:var(--muted);margin-top:4px">
+          ${allDone
+            ? 'All assigned periods already marked today.'
+            : 'No active period right now. Please scan during your assigned period time.'}
+        </div>
+        ${(r.marked_shift_ids || []).length
+          ? '<div style="margin-top:8px">' +
+            (r.all_shifts || [])
+              .filter(s => r.marked_shift_ids.includes(s.id))
+              .map(s => `<span class="chip chip-green" style="margin:1px">✅ ${s.name}</span>`)
+              .join('') +
+            '</div>'
+          : ''}
+      </div>`;
       loadScanTab();
       return;
     }
