@@ -2616,44 +2616,48 @@ async function enableNotif(){
   }
   try{
     showToast('⏳ Setting up notifications...');
-    // Always use the ready registration — guaranteed to be active
-    const reg = await Promise.race([
-      navigator.serviceWorker.ready,
-      new Promise((_,rej) => setTimeout(()=>rej(new Error('Service worker timed out — try refreshing page')), 6000))
-    ]);
 
     const vapid = await fetch('/api/vapid-public').then(x=>x.json());
     if(!vapid.key){
-      showToast('⚠️ Push keys not configured on server. Add VAPID_PUBLIC / VAPID_PRIVATE to .env');
+      showToast('⚠️ Push keys not configured on server.');
       return;
     }
 
-    // Clear any stale subscription
-    const existing = await reg.pushManager.getSubscription();
-    if(existing) await existing.unsubscribe();
+    // Same pattern as working RFID project
+    const reg = await navigator.serviceWorker.register('/sw.js');
+    await navigator.serviceWorker.ready;
 
-    const sub = await reg.pushManager.subscribe({
-      userVisibleOnly: true,
-      applicationServerKey: urlBase64ToUint8Array(vapid.key)
-    });
+    // Reuse existing subscription if valid, only create new if none
+    let sub = await reg.pushManager.getSubscription();
+    if(!sub){
+      sub = await reg.pushManager.subscribe({
+        userVisibleOnly: true,
+        applicationServerKey: urlBase64ToUint8Array(vapid.key)
+      });
+    }
+
+    // Always save to DB
     const result = await fetch('/api/user/push-subscribe',{
       method: 'POST',
       headers: {'Content-Type':'application/json','x-token':userToken},
       body: JSON.stringify({subscription: sub.toJSON()})
     }).then(x=>x.json());
 
-    if(result.ok) showToast('✅ Notifications enabled! You will be alerted for attendance & account changes.');
+    if(result.ok) showToast('✅ Notifications enabled!');
     else showToast('❌ Subscription failed: '+(result.error||'unknown error'));
   } catch(e){
     showToast('❌ '+e.message);
     console.error('enableNotif error:', e);
-  }
-}
+  }}
 
 function dismissNotifModal(){
   document.getElementById('notifModal').classList.remove('open');
 }
 function openNotifModal(){
+  if(typeof Notification === 'undefined' || !('PushManager' in navigator)){
+    showToast('⚠️ Please open in Chrome or Edge browser to enable notifications.');
+    return;
+  }
   document.getElementById('notifModal').classList.add('open');
 }
 
