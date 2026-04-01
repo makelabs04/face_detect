@@ -983,13 +983,8 @@ app.post('/api/admin/scan', authMiddleware('admin'), async (req, res) => {
   );
   const assignedPeriodIds = assignedPeriods.map(p => p.shift_id);
 
-  // Auto-select: only pending shifts that are assigned AND currently active (within time window)
-  const autoSelectShifts = pendingShifts.filter(s => {
-    if (!assignedPeriodIds.includes(s.id)) return false;
-    const st = String(s.start_time).slice(0,8); // HH:MM:SS
-    const et = String(s.end_time).slice(0,8);
-    return timeStr >= st && timeStr <= et;
-  });
+  // Auto-select: only pending shifts that are in the student's assigned periods
+  const autoSelectShifts = pendingShifts.filter(s => assignedPeriodIds.includes(s.id));
 
   // Return face info + pending shifts for the frontend to display multiselect
   return res.json({
@@ -2586,7 +2581,7 @@ async function showUserDash(r){
   renderCalendar();
 
   // Show notification modal after short delay — independent of SW registration
-  if(typeof Notification !== 'undefined' && 'PushManager' in navigator){
+  if(typeof Notification !== 'undefined'){
     const alreadyEnabled = r.notifications_enabled;
     const perm = Notification.permission;
     if(!alreadyEnabled && perm !== 'denied'){
@@ -2606,10 +2601,10 @@ async function showUserDash(r){
 
 async function enableNotif(){
   dismissNotifModal();
-  if(typeof Notification === 'undefined' || !('PushManager' in navigator)){
-    showToast('⚠️ Push notifications not supported in this browser.');
-    return;
-  }
+  if(typeof Notification === 'undefined'){
+  showToast('⚠️ Notifications not supported in this browser.');
+  return;
+}
   const perm = await Notification.requestPermission();
   if(perm === 'denied'){
     showToast('⚠️ Notifications blocked. Go to Site Settings → Notifications → Allow, then re-login.');
@@ -2660,8 +2655,8 @@ function dismissNotifModal(){
   document.getElementById('notifModal').classList.remove('open');
 }
 function openNotifModal(){
-  if(typeof Notification === 'undefined' || !('PushManager' in navigator)){
-    showToast('⚠️ Please open in Chrome or Edge browser to enable notifications.');
+  if(typeof Notification === 'undefined'){
+    showToast('⚠️ Notifications not supported in this browser.');
     return;
   }
   document.getElementById('notifModal').classList.add('open');
