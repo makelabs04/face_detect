@@ -2575,7 +2575,7 @@ async function showUserDash(r){
   document.getElementById('navRight').innerHTML=\`
     <span style="font-size:0.72rem;color:var(--muted)">\${r.name||''}</span>
     <span class="badge badge-user">Student</span>
-    <button class="btn btn-sm btn-outline" id="notifNavBtn" onclick="fModal()" title="Enable notifications">🔔</button>
+<button class="btn btn-sm btn-outline" id="notifNavBtn" onclick="openNotifModal()" title="Enable notifications">🔔</button>
     <button class="btn btn-sm btn-outline" onclick="userLogout()">Logout</button>\`;
 
   renderCalendar();
