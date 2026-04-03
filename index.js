@@ -82,26 +82,42 @@ if (webpush && VAPID.public && VAPID.private) {
 async function sendPushToUser(userId, title, body, adminId) {
   if (!pushEnabled || !webpush) return;
   try {
-    const rows = await dbQuery(
-      'SELECT push_subscription FROM users WHERE id=? AND admin_id=? AND notifications_enabled=1 AND push_subscription IS NOT NULL',
-      [userId, adminId]
+    // Get ALL active subscriptions for this user from dedicated table
+    const subs = await dbQuery(
+      'SELECT id, subscription FROM push_subscriptions WHERE user_id=? AND is_active=1',
+      [userId]
     );
-    if (!rows.length || !rows[0].push_subscription) return;
-    const sub = JSON.parse(rows[0].push_subscription);
-    await webpush.sendNotification(sub, JSON.stringify({
-      title, body,
-      icon: '/icon-192.png',
-      badge: '/icon-192.png'
-    }));
-    await dbQuery(
-      'INSERT INTO push_log (admin_id,user_id,title,body) VALUES (?,?,?,?)',
-      [adminId, userId, title, body]
-    );
-  } catch(e) {
-    if (e.statusCode === 410 || e.statusCode === 404) {
-      await dbQuery('UPDATE users SET push_subscription=NULL, notifications_enabled=0 WHERE id=?', [userId]);
+    if (!subs.length) return;
+
+    for (const row of subs) {
+      try {
+        const sub = JSON.parse(row.subscription);
+        await webpush.sendNotification(sub, JSON.stringify({
+          title, body,
+          icon: '/icon-192.png',
+          badge: '/icon-192.png'
+        }));
+        await dbQuery(
+          'INSERT INTO push_log (admin_id,user_id,title,body) VALUES (?,?,?,?)',
+          [adminId, userId, title, body]
+        );
+      } catch(e) {
+        if (e.statusCode === 410 || e.statusCode === 404) {
+          // Subscription expired — deactivate this specific subscription
+          await dbQuery('UPDATE push_subscriptions SET is_active=0 WHERE id=?', [row.id]);
+          // If no active subs left, update users table flag
+          const remaining = await dbQuery(
+            'SELECT COUNT(*) AS c FROM push_subscriptions WHERE user_id=? AND is_active=1', [userId]
+          );
+          if (remaining[0].c === 0) {
+            await dbQuery('UPDATE users SET notifications_enabled=0 WHERE id=?', [userId]);
+          }
+        }
+        console.warn('Push error for sub', row.id, ':', e.message);
+      }
     }
-    console.warn('Push error:', e.message);
+  } catch(e) {
+    console.warn('sendPushToUser error:', e.message);
   }
 }
 
@@ -304,6 +320,20 @@ async function initTables() {
       UNIQUE KEY uq_face_period (face_id, shift_id),
       FOREIGN KEY (face_id) REFERENCES faces(id) ON DELETE CASCADE,
       FOREIGN KEY (shift_id) REFERENCES shifts(id) ON DELETE CASCADE
+    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+
+    CREATE TABLE IF NOT EXISTS push_subscriptions (
+      id INT AUTO_INCREMENT PRIMARY KEY,
+      user_id INT NOT NULL,
+      admin_id INT NOT NULL,
+      subscription LONGTEXT NOT NULL,
+      endpoint_hash VARCHAR(64) NOT NULL,
+      is_active TINYINT(1) DEFAULT 1,
+      created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+      updated_at DATETIME DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+      UNIQUE KEY uq_endpoint (user_id, endpoint_hash),
+      FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE,
+      FOREIGN KEY (admin_id) REFERENCES admins(id) ON DELETE CASCADE
     ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
   `;
   try {
@@ -1089,19 +1119,54 @@ app.post('/api/user/login', async (req, res) => {
 app.post('/api/user/push-subscribe', authMiddleware('user'), async (req, res) => {
   const { subscription } = req.body;
   if (!subscription) return res.json({ error: 'No subscription data' });
-  await dbQuery(
-    'UPDATE users SET push_subscription=?, notifications_enabled=1 WHERE id=? AND admin_id=?',
-    [JSON.stringify(subscription), req.user.id, req.user.admin_id]
-  );
-  res.json({ ok: true });
+  try {
+    const subStr = JSON.stringify(subscription);
+    // Create a hash of the endpoint to use as unique key
+    const endpoint = subscription.endpoint || '';
+    const crypto = require('crypto');
+    const endpointHash = crypto.createHash('sha256').update(endpoint).digest('hex');
+
+    // Upsert: insert new or reactivate existing subscription for this endpoint
+    await dbQuery(
+      `INSERT INTO push_subscriptions (user_id, admin_id, subscription, endpoint_hash, is_active)
+       VALUES (?, ?, ?, ?, 1)
+       ON DUPLICATE KEY UPDATE subscription=VALUES(subscription), is_active=1, updated_at=NOW()`,
+      [req.user.id, req.user.admin_id, subStr, endpointHash]
+    );
+    // Mark user as notifications enabled
+    await dbQuery(
+      'UPDATE users SET notifications_enabled=1 WHERE id=? AND admin_id=?',
+      [req.user.id, req.user.admin_id]
+    );
+    res.json({ ok: true });
+  } catch(e) {
+    console.error('push-subscribe error:', e.message);
+    res.json({ error: e.message });
+  }
 });
 
 app.post('/api/user/push-unsubscribe', authMiddleware('user'), async (req, res) => {
-  await dbQuery(
-    'UPDATE users SET push_subscription=NULL, notifications_enabled=0 WHERE id=? AND admin_id=?',
-    [req.user.id, req.user.admin_id]
-  );
+  // Deactivate all subscriptions for this user
+  await dbQuery('UPDATE push_subscriptions SET is_active=0 WHERE user_id=? AND admin_id=?',
+    [req.user.id, req.user.admin_id]);
+  await dbQuery('UPDATE users SET notifications_enabled=0 WHERE id=? AND admin_id=?',
+    [req.user.id, req.user.admin_id]);
   res.json({ ok: true });
+});
+
+// ── Debug endpoint: check push status ─────────────────────────────────────────
+app.get('/api/user/push-debug', authMiddleware('user'), async (req, res) => {
+  const subs = await dbQuery(
+    'SELECT id, endpoint_hash, is_active, created_at, updated_at FROM push_subscriptions WHERE user_id=?',
+    [req.user.id]
+  );
+  const user = await dbQuery('SELECT notifications_enabled FROM users WHERE id=?', [req.user.id]);
+  res.json({
+    pushEnabled,
+    vapidConfigured: !!(VAPID.public && VAPID.private),
+    user_notifications_enabled: user[0]?.notifications_enabled,
+    subscriptions: subs
+  });
 });
 
 app.get('/api/user/attendance', authMiddleware('user'), async (req, res) => {
@@ -2722,12 +2787,12 @@ async function showUserDash(r){
 async function enableNotif(){
   dismissNotifModal();
   if(typeof Notification === 'undefined'){
-  showToast('⚠️ Notifications not supported in this browser.');
-  return;
-}
+    showToast('⚠️ Notifications not supported in this browser.');
+    return;
+  }
   const perm = await Notification.requestPermission();
   if(perm === 'denied'){
-    showToast('⚠️ Notifications blocked. Go to Site Settings → Notifications → Allow, then re-login.');
+    showToast('⚠️ Notifications blocked. Go to browser Site Settings → Notifications → Allow, then try again.');
     return;
   }
   if(perm !== 'granted'){
@@ -2739,32 +2804,38 @@ async function enableNotif(){
 
     const vapid = await fetch('/api/vapid-public').then(x=>x.json());
     if(!vapid.key){
-      showToast('⚠️ Push keys not configured on server.');
+      showToast('⚠️ Push keys not configured on server. Contact admin.');
       return;
     }
 
-    // Same pattern as working RFID project
     const reg = await navigator.serviceWorker.register('/sw.js');
     await navigator.serviceWorker.ready;
 
-    // Reuse existing subscription if valid, only create new if none
-    let sub = await reg.pushManager.getSubscription();
-    if(!sub){
-      sub = await reg.pushManager.subscribe({
-        userVisibleOnly: true,
-        applicationServerKey: urlBase64ToUint8Array(vapid.key)
-      });
-    }
+    // Always unsubscribe old subscription first to force fresh one with new VAPID keys
+    const existingSub = await reg.pushManager.getSubscription();
+    if(existingSub) await existingSub.unsubscribe();
 
-    // Always save to DB
+    // Create fresh subscription
+    const sub = await reg.pushManager.subscribe({
+      userVisibleOnly: true,
+      applicationServerKey: urlBase64ToUint8Array(vapid.key)
+    });
+
+    // Save to DB
     const result = await fetch('/api/user/push-subscribe',{
       method: 'POST',
       headers: {'Content-Type':'application/json','x-token':userToken},
       body: JSON.stringify({subscription: sub.toJSON()})
     }).then(x=>x.json());
 
-    if(result.ok) showToast('✅ Notifications enabled!');
-    else showToast('❌ Subscription failed: '+(result.error||'unknown error'));
+    if(result.ok){
+      showToast('✅ Notifications enabled! You will now receive attendance alerts.');
+      // Update nav bell button
+      const btn=document.getElementById('notifNavBtn');
+      if(btn){btn.textContent='🔔✓';btn.style.color='var(--accent)';}
+    } else {
+      showToast('❌ Subscription failed: '+(result.error||'unknown error'));
+    }
   } catch(e){
     showToast('❌ '+e.message);
     console.error('enableNotif error:', e);
