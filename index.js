@@ -1866,7 +1866,7 @@ function adminLogout(){localStorage.removeItem(TOKEN_KEY);location.reload();}
 
 async function showDashboard(r){
   document.getElementById('authSection').style.display='none';
-  document.getElementById('dashboard').style.display='block';('/api/admin/me',{headers:{'x-token':adminToken}}).then(x=>x.json()).catch(()=>null);
+  document.getElementById('dashboard').style.display='block';const me = await fetch('/api/admin/me',{headers:{'x-token':adminToken}}).then(x=>x.json()).catch(()=>null);
   if(!me||me.error){localStorage.removeItem(TOKEN_KEY);location.reload();return;}
   let logoHtml='';
   if(me.logo_base64) logoHtml=\`<img src="\${me.logo_base64}" class="logo-preview" style="height:30px;margin-right:6px">\`;
