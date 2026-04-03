@@ -187,6 +187,33 @@ function startAbsentCron() {
                 [admin.id, face.id, shift.id, face.label, dateStr, shift.end_time, 'absent']
               );
             }
+
+            // ── AUTO-CHECKOUT: if this is the last assigned period for the face
+            //    and the first-period record has no time_out, set it now ─────────
+            const allAssigned = await dbQuery(
+              `SELECT s.* FROM shifts s
+               JOIN face_periods fp ON fp.shift_id = s.id
+               WHERE fp.face_id = ? AND s.admin_id = ?
+               ORDER BY s.start_time ASC`,
+              [face.id, admin.id]
+            );
+            if (allAssigned.length > 0) {
+              const lastShiftId = allAssigned[allAssigned.length - 1].id;
+              const firstShiftId = allAssigned[0].id;
+              if (shift.id === lastShiftId) {
+                // Find the first-period check-in record with no time_out
+                const firstRec = await dbQuery(
+                  'SELECT id FROM attendance WHERE face_id=? AND date=? AND shift_id=? AND status=? AND time_out IS NULL',
+                  [face.id, dateStr, firstShiftId, 'present']
+                );
+                if (firstRec.length) {
+                  await dbQuery(
+                    'UPDATE attendance SET time_out=? WHERE id=?',
+                    [shift.end_time, firstRec[0].id]
+                  );
+                }
+              }
+            }
           }
         }
       }
@@ -1042,8 +1069,38 @@ app.post('/api/admin/mark-attendance', authMiddleware('admin'), async (req, res)
   if (!face.length) return res.json({ error: 'Face not found' });
   const f = face[0];
 
+  // ── Get all assigned periods for this face (sorted by start_time) ──────────
+  const assignedRows = await dbQuery(
+    `SELECT s.* FROM shifts s
+     JOIN face_periods fp ON fp.shift_id = s.id
+     WHERE fp.face_id = ? AND s.admin_id = ?
+     ORDER BY s.start_time ASC`,
+    [face_id, adminId]
+  );
+  const hasAssigned = assignedRows.length > 0;
+  const firstAssignedId = hasAssigned ? assignedRows[0].id : null;
+  const lastAssignedId  = hasAssigned ? assignedRows[assignedRows.length - 1].id : null;
+
+  // ── Get today's existing attendance for this face ──────────────────────────
+  const todayAtt = await dbQuery(
+    'SELECT * FROM attendance WHERE face_id=? AND date=? ORDER BY time_in ASC',
+    [face_id, dateStr]
+  );
+
+  // ── Find the first-period check-in record (used for time_out on last period) ─
+  const firstPeriodRecord = hasAssigned
+    ? todayAtt.find(a => a.shift_id === firstAssignedId && a.status === 'present')
+    : null;
+
   const results = [];
   const shiftsToMark = (shift_ids && shift_ids.length > 0) ? shift_ids : [null];
+
+  // ── Get user for push notifications ────────────────────────────────────────
+  let userId = null;
+  if (f.user_email) {
+    const userRow = await dbQuery('SELECT id FROM users WHERE email=? AND admin_id=?', [f.user_email, adminId]);
+    if (userRow.length) userId = userRow[0].id;
+  }
 
   for (const shiftId of shiftsToMark) {
     // Check duplicate
@@ -1058,20 +1115,60 @@ app.post('/api/admin/mark-attendance', authMiddleware('admin'), async (req, res)
 
     const shiftRow = shiftId ? (await dbQuery('SELECT * FROM shifts WHERE id=?', [shiftId]))[0] : null;
 
-    const r = await dbQuery(
+    const isFirstPeriod = hasAssigned && shiftId === firstAssignedId;
+    const isLastPeriod  = hasAssigned && shiftId === lastAssignedId;
+
+    // ── ABSENT BACKFILL: mark any earlier assigned periods not yet marked ──────
+    // If student scans at period N but skipped periods 1..N-1, mark those absent
+    if (hasAssigned && shiftId) {
+      const currentIdx = assignedRows.findIndex(s => s.id === shiftId);
+      for (let i = 0; i < currentIdx; i++) {
+        const prevShift = assignedRows[i];
+        const alreadyMarked = todayAtt.some(a => a.shift_id === prevShift.id);
+        if (!alreadyMarked) {
+          await dbQuery(
+            'INSERT IGNORE INTO attendance (admin_id,face_id,shift_id,name,date,time_in,status) VALUES (?,?,?,?,?,?,?)',
+            [adminId, face_id, prevShift.id, f.label, dateStr, prevShift.end_time, 'absent']
+          );
+          results.push({ shift_id: prevShift.id, shift_name: prevShift.name, absent_backfill: true });
+        }
+      }
+    }
+
+    // ── If this is the LAST period and there's already a first-period check-in:
+    //    set time_out on the first-period record instead of inserting a new row ─
+    if (isLastPeriod && !isFirstPeriod && firstPeriodRecord && !firstPeriodRecord.time_out) {
+      await dbQuery('UPDATE attendance SET time_out=? WHERE id=?', [timeStr, firstPeriodRecord.id]);
+      // Also insert a present record for this last period itself
+      const ins = await dbQuery(
+        'INSERT INTO attendance (admin_id,face_id,shift_id,name,date,time_in,status) VALUES (?,?,?,?,?,?,?)',
+        [adminId, face_id, shiftId, f.label, dateStr, timeStr, 'present']
+      );
+      if (userId) {
+        const shiftInfo = shiftRow ? ` (${shiftRow.name} period)` : '';
+        await sendPushToUser(userId, '👋 Checked Out', `${f.label}, you checked out at ${fmtTime(timeStr)}${shiftInfo}`, adminId);
+        await dbQuery('UPDATE attendance SET notification_sent=1 WHERE id=?', [ins.insertId]);
+      }
+      results.push({ shift_id: shiftId, shift_name: shiftRow?.name||null, time_in: timeStr, is_checkout: true, ok: true });
+      continue;
+    }
+
+    // ── Normal insert (present) ────────────────────────────────────────────────
+    const ins = await dbQuery(
       'INSERT INTO attendance (admin_id,face_id,shift_id,name,date,time_in,status) VALUES (?,?,?,?,?,?,?)',
       [adminId, face_id, shiftId||null, f.label, dateStr, timeStr, 'present']
     );
 
-    if (f.user_email) {
-      const user = await dbQuery('SELECT id FROM users WHERE email=? AND admin_id=?', [f.user_email, adminId]);
-      if (user.length) {
-        const shiftInfo = shiftRow ? ` (${shiftRow.name} period)` : '';
-        await sendPushToUser(user[0].id, '✅ Attendance Marked', `${f.label}, your attendance was recorded at ${fmtTime(timeStr)}${shiftInfo}`, adminId);
-        await dbQuery('UPDATE attendance SET notification_sent=1 WHERE id=?', [r.insertId]);
-      }
+    if (userId) {
+      const shiftInfo = shiftRow ? ` (${shiftRow.name} period)` : '';
+      const title = isFirstPeriod ? '✅ Checked In' : '✅ Attendance Marked';
+      const body  = isFirstPeriod
+        ? `${f.label}, you checked in at ${fmtTime(timeStr)}${shiftInfo}`
+        : `${f.label}, your attendance was recorded at ${fmtTime(timeStr)}${shiftInfo}`;
+      await sendPushToUser(userId, title, body, adminId);
+      await dbQuery('UPDATE attendance SET notification_sent=1 WHERE id=?', [ins.insertId]);
     }
-    results.push({ shift_id: shiftId, shift_name: shiftRow?.name||null, time_in: timeStr, ok: true });
+    results.push({ shift_id: shiftId, shift_name: shiftRow?.name||null, time_in: timeStr, is_checkin: isFirstPeriod, ok: true });
   }
 
   res.json({ event: 'marked', name: f.label, results, time_in: timeStr });
@@ -1840,6 +1937,14 @@ app.get('/admin', (_, res) => {
 const TOKEN_KEY='admin_token';
 let adminToken=localStorage.getItem(TOKEN_KEY);
 
+// Client-side time formatter: "14:30:00" or "14:30" → "2:30 PM"
+function fmtTimeClient(t){
+  if(!t||t==='—') return t||'—';
+  const p=String(t).split(':');
+  const h=parseInt(p[0]),m=p[1]||'00';
+  return (h%12||12)+':'+m+' '+(h>=12?'PM':'AM');
+}
+
 function showToast(msg){
   const t=document.createElement('div');
   t.style.cssText='position:fixed;bottom:24px;left:50%;transform:translateX(-50%);background:#1f2937;color:white;padding:12px 20px;border-radius:12px;font-size:0.8rem;z-index:9999;box-shadow:0 8px 24px rgba(0,0,0,0.2);transition:opacity 0.4s;max-width:90vw;text-align:center';
@@ -2090,7 +2195,7 @@ async function loadShifts(){
         <label style="display:flex;align-items:center;gap:8px;padding:5px 4px;cursor:pointer;font-size:0.82rem">
           <input type="checkbox" value="\${s.id}" class="period-reg-cb" style="accent-color:var(--accent);width:15px;height:15px">
           <span style="font-weight:600">\${s.name}</span>
-          <span style="color:var(--muted);font-size:0.7rem">\${s.start_time.slice(0,5)} – \${s.end_time.slice(0,5)}</span>
+          <span style="color:var(--muted);font-size:0.7rem">\${fmtTimeClient(s.start_time)} – \${fmtTimeClient(s.end_time)}</span>
         </label>\`).join('');
     }
   }
@@ -2099,7 +2204,7 @@ async function loadShifts(){
     <div style="display:flex;align-items:center;justify-content:space-between;padding:10px 0;border-bottom:1px solid var(--border)">
       <div>
         <span style="font-weight:600">\${s.name}</span>
-        <span style="color:var(--muted);font-size:0.73rem;margin-left:8px">\${s.start_time.slice(0,5)} – \${s.end_time.slice(0,5)}</span>
+        <span style="color:var(--muted);font-size:0.73rem;margin-left:8px">\${fmtTimeClient(s.start_time)} – \${fmtTimeClient(s.end_time)}</span>
       </div>
       <button class="btn btn-danger btn-sm" onclick="deleteShift(\${s.id})">✕</button>
     </div>\`).join('')
@@ -2369,7 +2474,7 @@ function openShiftModal(r){
       <input type="checkbox" value="\${s.id}" \${isDone?'disabled checked':''} class="shift-cb">
       <div style="flex:1">
         <span style="font-weight:600">\${s.name}</span>
-        <span class="shift-badge">\${s.start_time.slice(0,5)} – \${s.end_time.slice(0,5)}</span>
+        <span class="shift-badge">\${fmtTimeClient(s.start_time)} – \${fmtTimeClient(s.end_time)}</span>
       </div>
       \${isDone?'<span class="done-badge">✅ Done</span>':''}
     </label>\`;
@@ -2437,13 +2542,19 @@ function showMultiResult(r){
   if(!r||r.error){showResult({event:'error',message:r?.error||'Error'},'❌');return;}
   const marked=r.results?.filter(x=>x.ok)||[];
   const skipped=r.results?.filter(x=>x.skipped)||[];
-  const color='var(--green)';
+  const backfilled=r.results?.filter(x=>x.absent_backfill)||[];
+  const isCheckout=marked.some(x=>x.is_checkout);
+  const isCheckin=marked.some(x=>x.is_checkin);
+  const icon=isCheckout?'👋':'✅';
+  const label=isCheckout?'Checked Out':isCheckin?'Checked In':'Attendance Marked';
+  const color=isCheckout?'var(--accent)':'var(--green)';
   document.getElementById('resultBody').innerHTML=\`
     <div style="text-align:center;padding:10px">
-      <div style="font-size:2rem">✅</div>
+      <div style="font-size:2rem">\${icon}</div>
       <div style="font-size:1rem;font-weight:700;color:\${color};margin:6px 0">\${r.name}</div>
-      <div style="font-size:0.8rem;color:var(--muted)">⏱ In: \${r.time_in}</div>
-      \${marked.length?'<div style="margin-top:8px;font-size:0.75rem;color:var(--text)">Marked: '+marked.map(x=>'<span class="chip chip-green" style="margin:1px">'+( x.shift_name||'General Period')+'</span>').join('')+'</div>':''}
+      <div style="font-size:0.8rem;color:var(--muted)">\${isCheckout?'🚪 Out':'⏱ In'}: \${fmtTimeClient(r.time_in)}</div>
+      \${marked.length?'<div style="margin-top:8px;font-size:0.75rem;color:var(--text)">'+label+': '+marked.map(x=>'<span class="chip chip-'+(x.is_checkout?'blue':'green')+'" style="margin:1px">'+(x.is_checkout?'🚪 ':'✅ ')+(x.shift_name||'General')+'</span>').join('')+'</div>':''}
+      \${backfilled.length?'<div style="margin-top:4px;font-size:0.72rem;color:var(--muted)">Auto-absent: '+backfilled.map(x=>'<span class="chip chip-red" style="margin:1px">❌ '+x.shift_name+'</span>').join('')+'</div>':''}
       \${skipped.length?'<div style="margin-top:4px;font-size:0.73rem;color:var(--muted)">Already marked: '+skipped.map(x=>'<span class="chip chip-gray" style="margin:1px">'+(x.shift_name||'General Period')+'</span>').join('')+'</div>':''}
     </div>\`;
 }
@@ -2458,8 +2569,8 @@ function showResult(r,icon=''){
     <div style="text-align:center;padding:10px">
       <div style="font-size:2rem">\${ic}</div>
       <div style="font-size:1rem;font-weight:700;color:\${color};margin:6px 0">\${label}</div>
-      \${r.time_in?\`<div style="font-size:0.8rem;color:var(--muted)">In: \${r.time_in}</div>\`:''}
-      \${r.time_out?\`<div style="font-size:0.8rem;color:var(--muted)">Out: \${r.time_out}</div>\`:''}
+      \${r.time_in?\`<div style="font-size:0.8rem;color:var(--muted)">In: \${fmtTimeClient(r.time_in)}</div>\`:''}
+      \${r.time_out?\`<div style="font-size:0.8rem;color:var(--muted)">Out: \${fmtTimeClient(r.time_out)}</div>\`:''}
       \${r.shift?\`<div style="font-size:0.72rem;color:var(--accent)">Shift: \${r.shift}</div>\`:''}
       \${r.message?\`<div style="font-size:0.76rem;color:var(--muted);margin-top:4px">\${r.message}</div>\`:''}
     </div>\`;
@@ -2482,7 +2593,7 @@ async function loadScanTab(){
         <span style="font-weight:600">\${r.name}</span>
         \${r.shift_name?\`<span class="chip chip-blue" style="margin-left:4px;font-size:0.58rem">\${r.shift_name}</span>\`:''}
       </div>
-      <span style="color:var(--muted);font-size:0.7rem;white-space:nowrap">\${r.time_in}\${r.time_out?' → '+r.time_out:''}</span>
+      <span style="color:var(--muted);font-size:0.7rem;white-space:nowrap">\${fmtTimeClient(r.time_in)}\${r.time_out?' → '+fmtTimeClient(r.time_out):''}</span>
     </div>\`).join('')||'<p style="color:var(--muted);font-size:0.78rem;text-align:center;padding:16px 0">No attendance today</p>';
 }
 
@@ -2740,6 +2851,14 @@ let calYear=new Date().getFullYear(),calMonth=new Date().getMonth()+1;
 let calData={attendance:[],holidays:[]};
 const MONTH_NAMES=['January','February','March','April','May','June','July','August','September','October','November','December'];
 
+// Client-side time formatter: "14:30:00" or "14:30" → "2:30 PM"
+function fmtTimeClient(t){
+  if(!t||t==='—') return t||'—';
+  const p=String(t).split(':');
+  const h=parseInt(p[0]),m=p[1]||'00';
+  return (h%12||12)+':'+m+' '+(h>=12?'PM':'AM');
+}
+
 async function doUserLogin(){
   const e=document.getElementById('uEmail').value,p=document.getElementById('uPass').value;
   const r=await fetch('/api/user/login',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({email:e,password:p})}).then(x=>x.json());
@@ -2921,7 +3040,7 @@ async function renderCalendar(){
       </div>
       <div style="text-align:right;font-size:0.72rem;color:var(--muted)">
         <div>\${a._date}</div>
-        \${a.time_in?\`<div>\${a.time_in}\${a.time_out?' → '+a.time_out:''}</div>\`:''}
+        \${a.time_in?\`<div>\${fmtTimeClient(a.time_in)}\${a.time_out?' → '+fmtTimeClient(a.time_out):''}</div>\`:''}
       </div>
     </div>\`).join(''):'<p style="color:var(--muted);font-size:0.8rem">No attendance records for this month</p>';
 }
