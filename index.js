@@ -1191,73 +1191,59 @@ app.get('/portal', (_, res) => {
 <meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1">
 <title>FaceAttend — Portal</title>
 <link rel="preconnect" href="https://fonts.googleapis.com">
-<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Outfit:wght@300;400;500;600;700;800;900&family=JetBrains+Mono:wght@400;600&display=swap">
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@400;500;600;700;800&family=JetBrains+Mono:wght@400;600&display=swap">
 <style>
 *{box-sizing:border-box;margin:0;padding:0}
-:root{--b:#0a0f1e;--s:#0d1428;--c:#00adee;--c2:#0066ff;--g:#34d399;--p:#a78bfa;--t:#f0f6ff;--m:#8899bb}
-body{font-family:'Outfit',sans-serif;background:var(--b);color:var(--t);min-height:100vh;overflow-x:hidden}
-canvas#bg{position:fixed;inset:0;z-index:0;opacity:0.35}
-.wrap{position:relative;z-index:1;min-height:100vh;display:flex;flex-direction:column;align-items:center;justify-content:center;padding:60px 20px 40px}
-/* top bar */
-.topbar{position:fixed;top:0;left:0;right:0;z-index:10;display:flex;align-items:center;justify-content:space-between;padding:0 28px;height:56px;background:rgba(10,15,30,0.8);backdrop-filter:blur(20px);border-bottom:1px solid rgba(0,173,238,0.12)}
+:root{
+  --accent:#00adee;--accent2:#0066ff;--green:#059669;--purple:#7c3aed;
+  --text:#0f172a;--muted:#64748b;--border:#e2e8f0;--card:#ffffff;--bg:#f8fafc;
+}
+body{font-family:'Space Grotesk',sans-serif;background:var(--bg);color:var(--text);min-height:100vh;overflow-x:hidden}
+body::before{content:'';position:fixed;inset:0;background:radial-gradient(ellipse 70% 40% at 50% -5%,rgba(0,173,238,0.07),transparent);pointer-events:none;z-index:0}
+.topbar{position:fixed;top:0;left:0;right:0;z-index:10;display:flex;align-items:center;justify-content:space-between;padding:0 28px;height:58px;background:rgba(255,255,255,0.95);backdrop-filter:blur(16px);border-bottom:1px solid var(--border);box-shadow:0 1px 8px rgba(0,0,0,0.04)}
 .logo{display:flex;align-items:center;gap:10px;text-decoration:none}
-.logo-eye{width:34px;height:34px;border-radius:10px;background:linear-gradient(135deg,var(--c),var(--c2));display:flex;align-items:center;justify-content:center;font-size:1.1rem;box-shadow:0 0 20px rgba(0,173,238,0.4)}
-.logo-name{font-weight:800;font-size:1rem;letter-spacing:-0.5px;color:var(--t)}
-.logo-name span{color:var(--c)}
-.ver{font-family:'JetBrains Mono',monospace;font-size:0.6rem;color:var(--c);background:rgba(0,173,238,0.1);border:1px solid rgba(0,173,238,0.2);padding:3px 10px;border-radius:20px;letter-spacing:1px}
-/* hero */
-.hero{text-align:center;margin-bottom:52px}
-.hero-tag{font-family:'JetBrains Mono',monospace;font-size:0.6rem;letter-spacing:4px;text-transform:uppercase;color:var(--c);margin-bottom:18px;display:flex;align-items:center;justify-content:center;gap:10px}
-.hero-tag::before,.hero-tag::after{content:'';width:30px;height:1px;background:linear-gradient(90deg,transparent,var(--c))}
-.hero-tag::after{background:linear-gradient(90deg,var(--c),transparent)}
-.hero h1{font-size:clamp(2.2rem,6vw,4rem);font-weight:900;line-height:1.0;letter-spacing:-2.5px;margin-bottom:16px}
-.hero h1 .line2{display:block;background:linear-gradient(90deg,var(--c),var(--c2));-webkit-background-clip:text;-webkit-text-fill-color:transparent;background-clip:text}
-.hero p{font-size:0.95rem;color:var(--m);max-width:400px;margin:0 auto;line-height:1.7;font-weight:300}
-/* cards */
-.cards{display:flex;gap:16px;flex-wrap:wrap;justify-content:center}
-.card{width:220px;border-radius:22px;padding:28px 22px 22px;text-decoration:none;display:flex;flex-direction:column;align-items:center;text-align:center;position:relative;overflow:hidden;transition:transform 0.3s,box-shadow 0.3s;cursor:pointer}
-.card::before{content:'';position:absolute;inset:0;border-radius:22px;padding:1px;-webkit-mask:linear-gradient(#fff 0 0) content-box,linear-gradient(#fff 0 0);-webkit-mask-composite:xor;mask-composite:exclude;pointer-events:none;transition:opacity 0.3s}
-.card-sa{background:linear-gradient(145deg,rgba(20,12,40,0.9),rgba(10,8,25,0.95))}
-.card-sa::before{background:linear-gradient(135deg,rgba(167,139,250,0.5),rgba(100,60,200,0.2))}
-.card-admin{background:linear-gradient(145deg,rgba(0,20,40,0.9),rgba(0,12,28,0.95))}
-.card-admin::before{background:linear-gradient(135deg,rgba(0,173,238,0.5),rgba(0,100,200,0.2))}
-.card-user{background:linear-gradient(145deg,rgba(0,30,20,0.9),rgba(0,15,12,0.95))}
-.card-user::before{background:linear-gradient(135deg,rgba(52,211,153,0.5),rgba(20,150,100,0.2))}
-.card:hover{transform:translateY(-8px) scale(1.02)}
-.card-sa:hover{box-shadow:0 24px 60px rgba(167,139,250,0.2)}
-.card-admin:hover{box-shadow:0 24px 60px rgba(0,173,238,0.2)}
-.card-user:hover{box-shadow:0 24px 60px rgba(52,211,153,0.2)}
-.card-glow{position:absolute;top:-40px;left:50%;transform:translateX(-50%);width:120px;height:120px;border-radius:50%;opacity:0.15;filter:blur(30px);transition:opacity 0.3s}
-.card:hover .card-glow{opacity:0.35}
-.card-sa .card-glow{background:var(--p)}
-.card-admin .card-glow{background:var(--c)}
-.card-user .card-glow{background:var(--g)}
-.icon-ring{width:64px;height:64px;border-radius:18px;display:flex;align-items:center;justify-content:center;font-size:1.6rem;margin-bottom:16px;position:relative;z-index:1}
-.card-sa .icon-ring{background:rgba(167,139,250,0.12);box-shadow:0 0 0 1px rgba(167,139,250,0.25)}
-.card-admin .icon-ring{background:rgba(0,173,238,0.1);box-shadow:0 0 0 1px rgba(0,173,238,0.25)}
-.card-user .icon-ring{background:rgba(52,211,153,0.1);box-shadow:0 0 0 1px rgba(52,211,153,0.25)}
-.card-title{font-weight:700;font-size:1rem;margin-bottom:8px;position:relative;z-index:1}
-.card-desc{font-size:0.72rem;color:var(--m);line-height:1.6;font-weight:300;margin-bottom:18px;position:relative;z-index:1}
-.card-btn{padding:8px 20px;border-radius:10px;font-size:0.75rem;font-weight:700;letter-spacing:0.3px;position:relative;z-index:1;border:none;cursor:pointer;font-family:'Outfit',sans-serif}
-.card-sa .card-btn{background:linear-gradient(135deg,#7c3aed,#a78bfa);color:white}
-.card-admin .card-btn{background:linear-gradient(135deg,#0066ff,#00adee);color:white}
+.logo-eye{width:34px;height:34px;border-radius:10px;background:linear-gradient(135deg,var(--accent),var(--accent2));display:flex;align-items:center;justify-content:center;font-size:1.05rem;color:white;box-shadow:0 4px 12px rgba(0,173,238,0.3)}
+.logo-name{font-weight:800;font-size:1rem;letter-spacing:-0.5px;color:var(--text)}
+.logo-name span{color:var(--accent)}
+.ver{font-family:'JetBrains Mono',monospace;font-size:0.6rem;color:var(--accent);background:rgba(0,173,238,0.08);border:1px solid rgba(0,173,238,0.18);padding:3px 10px;border-radius:20px;letter-spacing:1px}
+.wrap{position:relative;z-index:1;min-height:100vh;display:flex;flex-direction:column;align-items:center;justify-content:center;padding:80px 20px 48px}
+.hero{text-align:center;margin-bottom:48px;animation:fu 0.7s ease both}
+.hero-tag{font-family:'JetBrains Mono',monospace;font-size:0.6rem;letter-spacing:3px;text-transform:uppercase;color:var(--accent);margin-bottom:16px;display:flex;align-items:center;justify-content:center;gap:10px}
+.hero-tag::before,.hero-tag::after{content:'';width:24px;height:1px;background:rgba(0,173,238,0.4)}
+.hero h1{font-size:clamp(2rem,5vw,3.4rem);font-weight:800;line-height:1.05;letter-spacing:-2px;margin-bottom:14px;color:var(--text)}
+.hero h1 span{background:linear-gradient(135deg,var(--accent),var(--accent2));-webkit-background-clip:text;-webkit-text-fill-color:transparent;background-clip:text}
+.hero p{font-size:0.94rem;color:var(--muted);max-width:400px;margin:0 auto;line-height:1.7}
+.cards{display:flex;gap:18px;flex-wrap:wrap;justify-content:center;animation:fu 0.7s 0.12s ease both}
+.card{width:220px;border-radius:20px;padding:28px 22px 22px;text-decoration:none;display:flex;flex-direction:column;align-items:center;text-align:center;background:var(--card);border:1.5px solid var(--border);position:relative;overflow:hidden;transition:transform 0.25s,box-shadow 0.25s,border-color 0.25s;box-shadow:0 2px 12px rgba(0,0,0,0.04)}
+.card::after{content:'';position:absolute;top:0;left:0;right:0;height:3px;border-radius:20px 20px 0 0;transition:opacity 0.25s}
+.card-sa::after{background:linear-gradient(90deg,#7c3aed,#a78bfa)}
+.card-admin::after{background:linear-gradient(90deg,var(--accent),var(--accent2))}
+.card-user::after{background:linear-gradient(90deg,#059669,#34d399)}
+.card:hover{transform:translateY(-6px);border-color:transparent}
+.card-sa:hover{box-shadow:0 20px 48px rgba(124,58,237,0.14)}
+.card-admin:hover{box-shadow:0 20px 48px rgba(0,173,238,0.14)}
+.card-user:hover{box-shadow:0 20px 48px rgba(52,211,153,0.14)}
+.icon-ring{width:60px;height:60px;border-radius:16px;display:flex;align-items:center;justify-content:center;font-size:1.5rem;margin-bottom:14px}
+.card-sa .icon-ring{background:rgba(124,58,237,0.08);border:1px solid rgba(124,58,237,0.15)}
+.card-admin .icon-ring{background:rgba(0,173,238,0.08);border:1px solid rgba(0,173,238,0.15)}
+.card-user .icon-ring{background:rgba(5,150,105,0.08);border:1px solid rgba(5,150,105,0.15)}
+.card-title{font-weight:700;font-size:0.98rem;color:var(--text);margin-bottom:6px}
+.card-desc{font-size:0.72rem;color:var(--muted);line-height:1.6;margin-bottom:16px}
+.card-btn{padding:8px 20px;border-radius:10px;font-size:0.73rem;font-weight:700;border:none;cursor:pointer;font-family:'Space Grotesk',sans-serif;transition:filter 0.2s}
+.card-sa .card-btn{background:linear-gradient(135deg,#7c3aed,#9b5cf6);color:white}
+.card-admin .card-btn{background:linear-gradient(135deg,var(--accent),var(--accent2));color:white}
 .card-user .card-btn{background:linear-gradient(135deg,#059669,#34d399);color:white}
-/* pills */
-.pills{display:flex;gap:8px;flex-wrap:wrap;justify-content:center;margin-top:40px}
-.pill{display:flex;align-items:center;gap:6px;padding:5px 14px;border-radius:20px;font-size:0.68rem;color:var(--m);border:1px solid rgba(255,255,255,0.06);background:rgba(255,255,255,0.03);font-weight:400}
-.pill-dot{width:5px;height:5px;border-radius:50%;background:var(--c);flex-shrink:0}
-.footer{margin-top:36px;font-size:0.64rem;color:rgba(136,153,187,0.5);display:flex;align-items:center;gap:6px}
-.footer a{color:rgba(0,173,238,0.5);text-decoration:none}
-/* animations */
-.hero{animation:fu 0.8s ease both}
-.cards{animation:fu 0.8s 0.12s ease both}
-.pills{animation:fu 0.8s 0.24s ease both}
-@keyframes fu{from{opacity:0;transform:translateY(24px)}to{opacity:1;transform:translateY(0)}}
-@media(max-width:640px){.cards{gap:12px}.card{width:100%;max-width:320px}.hero h1{font-size:2.2rem;letter-spacing:-1.5px}}
+.card:hover .card-btn{filter:brightness(1.08)}
+.pills{display:flex;gap:8px;flex-wrap:wrap;justify-content:center;margin-top:40px;animation:fu 0.7s 0.24s ease both}
+.pill{display:flex;align-items:center;gap:6px;padding:5px 14px;border-radius:20px;font-size:0.68rem;color:var(--muted);border:1px solid var(--border);background:white;font-weight:500;box-shadow:0 1px 4px rgba(0,0,0,0.04)}
+.pill-dot{width:5px;height:5px;border-radius:50%;background:var(--accent);flex-shrink:0}
+.footer{margin-top:40px;font-size:0.66rem;color:var(--muted);display:flex;align-items:center;gap:6px;animation:fu 0.7s 0.32s ease both}
+.footer a{color:var(--accent);text-decoration:none}
+@keyframes fu{from{opacity:0;transform:translateY(20px)}to{opacity:1;transform:translateY(0)}}
+@media(max-width:640px){.cards{gap:12px}.card{width:100%;max-width:300px}.hero h1{font-size:2rem;letter-spacing:-1.2px}}
 </style>
 </head>
 <body>
-<canvas id="bg"></canvas>
 <div class="topbar">
   <a class="logo" href="/portal">
     <div class="logo-eye">👁</div>
@@ -1268,26 +1254,23 @@ canvas#bg{position:fixed;inset:0;z-index:0;opacity:0.35}
 <div class="wrap">
   <div class="hero">
     <div class="hero-tag">Multi-Tenant Platform</div>
-    <h1>Face Recognition<span class="line2">Attendance System</span></h1>
-    <p>Real-time automated attendance powered by on-device AI. Select your portal below to get started.</p>
+    <h1>Face Recognition<br><span>Attendance System</span></h1>
+    <p>Real-time automated attendance powered by on-device AI. Select your portal below.</p>
   </div>
   <div class="cards">
     <a href="/super-admin" class="card card-sa">
-      <div class="card-glow"></div>
       <div class="icon-ring">🛡️</div>
       <div class="card-title">Super Admin</div>
       <div class="card-desc">Platform control, organisation approvals &amp; system-wide oversight.</div>
       <div class="card-btn">Enter Portal →</div>
     </a>
     <a href="/admin" class="card card-admin">
-      <div class="card-glow"></div>
       <div class="icon-ring">🏢</div>
       <div class="card-title">Admin</div>
       <div class="card-desc">Register people, manage periods, scan attendance &amp; export reports.</div>
       <div class="card-btn">Enter Portal →</div>
     </a>
     <a href="/user" class="card card-user">
-      <div class="card-glow"></div>
       <div class="icon-ring">👤</div>
       <div class="card-title">Student</div>
       <div class="card-desc">View your attendance calendar, records &amp; enable push notifications.</div>
@@ -1302,31 +1285,12 @@ canvas#bg{position:fixed;inset:0;z-index:0;opacity:0.35}
     <div class="pill"><div class="pill-dot"></div>Holiday Calendar</div>
     <div class="pill"><div class="pill-dot"></div>Auto Absent Marking</div>
   </div>
-  <div class="footer"><span>Powered by</span><a href="#">face-api.js</a><span>·</span><a href="#">Node.js</a><span>·</span><a href="#">MySQL</a></div>
+  <div class="footer">
+    <span>Powered by</span><a href="#">face-api.js</a><span>·</span><a href="#">Node.js</a><span>·</span><a href="#">MySQL</a>
+  </div>
 </div>
-<script>
-const c=document.getElementById('bg'),ctx=c.getContext('2d');
-let W,H,pts=[];
-function resize(){W=c.width=window.innerWidth;H=c.height=window.innerHeight;pts=Array.from({length:60},()=>({x:Math.random()*W,y:Math.random()*H,vx:(Math.random()-0.5)*0.3,vy:(Math.random()-0.5)*0.3,r:Math.random()*1.5+0.5}));}
-resize();window.addEventListener('resize',resize);
-function draw(){
-  ctx.clearRect(0,0,W,H);
-  for(let i=0;i<pts.length;i++){
-    const p=pts[i];p.x+=p.vx;p.y+=p.vy;
-    if(p.x<0||p.x>W)p.vx*=-1;if(p.y<0||p.y>H)p.vy*=-1;
-    ctx.beginPath();ctx.arc(p.x,p.y,p.r,0,Math.PI*2);ctx.fillStyle='rgba(0,173,238,0.8)';ctx.fill();
-    for(let j=i+1;j<pts.length;j++){
-      const q=pts[j],dx=p.x-q.x,dy=p.y-q.y,d=Math.sqrt(dx*dx+dy*dy);
-      if(d<120){ctx.beginPath();ctx.moveTo(p.x,p.y);ctx.lineTo(q.x,q.y);ctx.strokeStyle='rgba(0,173,238,'+(1-d/120)*0.15+')';ctx.lineWidth=0.5;ctx.stroke();}
-    }
-  }
-  requestAnimationFrame(draw);
-}
-draw();
-</script>
 </body></html>`);
 });
-
 // ═══════════════════════════════════════════════════════════════════════════════
 //  SUPER ADMIN PAGE
 // ═══════════════════════════════════════════════════════════════════════════════
