@@ -30,10 +30,10 @@ app.use('/unknown-images', express.static(UNKNOWN_IMAGES_DIR));
 
 // ── DB ────────────────────────────────────────────────────────────────────────
 const DB_CONFIG = {
-  host     : process.env.DB_HOST     || '127.0.0.1',
-  user     : process.env.DB_USER     || 'u966260443_facedetect',
-  password : process.env.DB_PASS     || 'Makelabs@123',
-  database : process.env.DB_NAME     || 'u966260443_facedetect',
+  host     : process.env.DB_HOST,
+  user     : process.env.DB_USER,
+  password : process.env.DB_PASS,
+  database : process.env.DB_NAME,
   multipleStatements: true
 };
 const db = mysql.createConnection(DB_CONFIG);
