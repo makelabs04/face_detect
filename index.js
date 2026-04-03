@@ -1191,104 +1191,139 @@ app.get('/portal', (_, res) => {
 <meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1">
 <title>FaceAttend — Portal</title>
 <link rel="preconnect" href="https://fonts.googleapis.com">
-<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Syne:wght@400;700;800&family=DM+Sans:wght@300;400;500;600&family=JetBrains+Mono:wght@400;700&display=swap">
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Outfit:wght@300;400;500;600;700;800;900&family=JetBrains+Mono:wght@400;600&display=swap">
 <style>
-  *{box-sizing:border-box;margin:0;padding:0}
-  :root{
-    --accent:#00adee;
-    --accent-dark:#0090c8;
-    --accent-glow:rgba(0,173,238,0.25);
-    --text:#0f172a;
-    --muted:#64748b;
-    --surface:#f0f9ff;
-    --border:rgba(0,173,238,0.15);
-    --card:#ffffff;
-  }
-  body{font-family:'DM Sans',sans-serif;background:#f8fcff;color:var(--text);min-height:100vh;overflow-x:hidden}
-  .bg-mesh{position:fixed;inset:0;z-index:0;background:radial-gradient(ellipse 60% 40% at 20% 10%,rgba(0,173,238,0.12) 0%,transparent 60%),radial-gradient(ellipse 50% 60% at 80% 80%,rgba(0,173,238,0.08) 0%,transparent 60%);pointer-events:none}
-  .bg-grid{position:fixed;inset:0;z-index:0;background-image:linear-gradient(rgba(0,173,238,0.04) 1px,transparent 1px),linear-gradient(90deg,rgba(0,173,238,0.04) 1px,transparent 1px);background-size:40px 40px;pointer-events:none;mask-image:radial-gradient(ellipse 80% 80% at 50% 50%,black 30%,transparent 100%)}
-  .portal-wrap{position:relative;z-index:1;min-height:100vh;display:flex;flex-direction:column;align-items:center;justify-content:center;padding:80px 20px 40px}
-  .top-bar{position:fixed;top:0;left:0;right:0;z-index:10;display:flex;align-items:center;justify-content:space-between;padding:0 24px;height:58px;background:rgba(248,252,255,0.9);backdrop-filter:blur(16px);border-bottom:1px solid rgba(0,173,238,0.1)}
-  .top-brand{display:flex;align-items:center;gap:10px;font-family:'Syne',sans-serif;font-weight:800;font-size:1.05rem;color:var(--text);text-decoration:none}
-  .brand-icon{width:32px;height:32px;border-radius:8px;background:var(--accent);display:flex;align-items:center;justify-content:center;font-size:1rem;color:white;box-shadow:0 4px 12px var(--accent-glow)}
-  .top-version{font-family:'JetBrains Mono',monospace;font-size:0.62rem;color:var(--accent);background:rgba(0,173,238,0.1);padding:3px 10px;border-radius:20px;letter-spacing:1px}
-  .hero{text-align:center;margin-bottom:48px;animation:fadeUp 0.7s ease both}
-  .hero-eyebrow{font-family:'JetBrains Mono',monospace;font-size:0.62rem;color:var(--accent);letter-spacing:3px;text-transform:uppercase;margin-bottom:14px;display:inline-flex;align-items:center;gap:8px}
-  .hero-eyebrow::before,.hero-eyebrow::after{content:'';display:block;width:20px;height:1px;background:var(--accent);opacity:0.5}
-  .hero-title{font-family:'Syne',sans-serif;font-weight:800;font-size:clamp(2rem,5vw,3.4rem);line-height:1.05;letter-spacing:-2px;color:var(--text);margin-bottom:14px}
-  .hero-title .hl{color:var(--accent)}
-  .hero-sub{font-size:0.96rem;color:var(--muted);font-weight:400;max-width:420px;margin:0 auto;line-height:1.6}
-  .cards-row{display:flex;gap:18px;flex-wrap:wrap;justify-content:center;animation:fadeUp 0.7s 0.15s ease both}
-  .portal-card{background:var(--card);border:1px solid rgba(0,173,238,0.12);border-radius:20px;padding:26px 22px;width:210px;text-align:center;text-decoration:none;cursor:pointer;position:relative;overflow:hidden;transition:transform 0.25s,box-shadow 0.25s,border-color 0.25s;box-shadow:0 2px 12px rgba(0,0,0,0.04)}
-  .portal-card::before{content:'';position:absolute;inset:0;background:radial-gradient(circle at 50% 0%,rgba(0,173,238,0.07),transparent 70%);opacity:0;transition:opacity 0.3s}
-  .portal-card:hover{transform:translateY(-6px);box-shadow:0 16px 40px rgba(0,173,238,0.15),0 4px 12px rgba(0,0,0,0.06);border-color:rgba(0,173,238,0.4)}
-  .portal-card:hover::before{opacity:1}
-  .card-icon-wrap{width:58px;height:58px;border-radius:16px;margin:0 auto 14px;display:flex;align-items:center;justify-content:center;font-size:1.5rem;transition:transform 0.25s}
-  .portal-card:hover .card-icon-wrap{transform:scale(1.1)}
-  .icon-sa{background:linear-gradient(135deg,rgba(167,139,250,0.2),rgba(139,92,246,0.12));border:1px solid rgba(139,92,246,0.2)}
-  .icon-admin{background:linear-gradient(135deg,rgba(0,173,238,0.2),rgba(0,173,238,0.08));border:1px solid rgba(0,173,238,0.2)}
-  .icon-user{background:linear-gradient(135deg,rgba(52,211,153,0.2),rgba(52,211,153,0.08));border:1px solid rgba(52,211,153,0.2)}
-  .card-title{font-family:'Syne',sans-serif;font-weight:700;font-size:0.98rem;color:var(--text);margin-bottom:6px}
-  .card-desc{font-size:0.73rem;color:var(--muted);line-height:1.5}
-  .card-cta{display:inline-flex;align-items:center;gap:5px;margin-top:14px;padding:7px 16px;border-radius:8px;font-size:0.73rem;font-weight:600;transition:all 0.2s;color:white}
-  .cta-sa{background:linear-gradient(135deg,#7c3aed,#a78bfa)}
-  .cta-admin{background:linear-gradient(135deg,#009ed8,var(--accent))}
-  .cta-user{background:linear-gradient(135deg,#059669,#34d399)}
-  .portal-card:hover .card-cta{filter:brightness(1.1)}
-  .features{display:flex;gap:8px;flex-wrap:wrap;justify-content:center;margin-top:44px;animation:fadeUp 0.7s 0.3s ease both}
-  .feat{display:flex;align-items:center;gap:6px;padding:5px 12px;border-radius:20px;background:white;border:1px solid rgba(0,173,238,0.12);font-size:0.7rem;color:var(--muted);font-weight:500;box-shadow:0 1px 4px rgba(0,0,0,0.04)}
-  .feat-dot{width:5px;height:5px;border-radius:50%;background:var(--accent)}
-  .portal-footer{margin-top:44px;font-size:0.68rem;color:var(--muted);display:flex;align-items:center;gap:6px;animation:fadeUp 0.7s 0.4s ease both}
-  .portal-footer a{color:var(--accent);text-decoration:none}
-  @keyframes fadeUp{from{opacity:0;transform:translateY(20px)}to{opacity:1;transform:translateY(0)}}
-  @media(max-width:640px){.cards-row{gap:12px}.portal-card{width:100%;max-width:300px;padding:20px 18px}.hero-title{font-size:1.9rem}}
+*{box-sizing:border-box;margin:0;padding:0}
+:root{--b:#0a0f1e;--s:#0d1428;--c:#00adee;--c2:#0066ff;--g:#34d399;--p:#a78bfa;--t:#f0f6ff;--m:#8899bb}
+body{font-family:'Outfit',sans-serif;background:var(--b);color:var(--t);min-height:100vh;overflow-x:hidden}
+canvas#bg{position:fixed;inset:0;z-index:0;opacity:0.35}
+.wrap{position:relative;z-index:1;min-height:100vh;display:flex;flex-direction:column;align-items:center;justify-content:center;padding:60px 20px 40px}
+/* top bar */
+.topbar{position:fixed;top:0;left:0;right:0;z-index:10;display:flex;align-items:center;justify-content:space-between;padding:0 28px;height:56px;background:rgba(10,15,30,0.8);backdrop-filter:blur(20px);border-bottom:1px solid rgba(0,173,238,0.12)}
+.logo{display:flex;align-items:center;gap:10px;text-decoration:none}
+.logo-eye{width:34px;height:34px;border-radius:10px;background:linear-gradient(135deg,var(--c),var(--c2));display:flex;align-items:center;justify-content:center;font-size:1.1rem;box-shadow:0 0 20px rgba(0,173,238,0.4)}
+.logo-name{font-weight:800;font-size:1rem;letter-spacing:-0.5px;color:var(--t)}
+.logo-name span{color:var(--c)}
+.ver{font-family:'JetBrains Mono',monospace;font-size:0.6rem;color:var(--c);background:rgba(0,173,238,0.1);border:1px solid rgba(0,173,238,0.2);padding:3px 10px;border-radius:20px;letter-spacing:1px}
+/* hero */
+.hero{text-align:center;margin-bottom:52px}
+.hero-tag{font-family:'JetBrains Mono',monospace;font-size:0.6rem;letter-spacing:4px;text-transform:uppercase;color:var(--c);margin-bottom:18px;display:flex;align-items:center;justify-content:center;gap:10px}
+.hero-tag::before,.hero-tag::after{content:'';width:30px;height:1px;background:linear-gradient(90deg,transparent,var(--c))}
+.hero-tag::after{background:linear-gradient(90deg,var(--c),transparent)}
+.hero h1{font-size:clamp(2.2rem,6vw,4rem);font-weight:900;line-height:1.0;letter-spacing:-2.5px;margin-bottom:16px}
+.hero h1 .line2{display:block;background:linear-gradient(90deg,var(--c),var(--c2));-webkit-background-clip:text;-webkit-text-fill-color:transparent;background-clip:text}
+.hero p{font-size:0.95rem;color:var(--m);max-width:400px;margin:0 auto;line-height:1.7;font-weight:300}
+/* cards */
+.cards{display:flex;gap:16px;flex-wrap:wrap;justify-content:center}
+.card{width:220px;border-radius:22px;padding:28px 22px 22px;text-decoration:none;display:flex;flex-direction:column;align-items:center;text-align:center;position:relative;overflow:hidden;transition:transform 0.3s,box-shadow 0.3s;cursor:pointer}
+.card::before{content:'';position:absolute;inset:0;border-radius:22px;padding:1px;-webkit-mask:linear-gradient(#fff 0 0) content-box,linear-gradient(#fff 0 0);-webkit-mask-composite:xor;mask-composite:exclude;pointer-events:none;transition:opacity 0.3s}
+.card-sa{background:linear-gradient(145deg,rgba(20,12,40,0.9),rgba(10,8,25,0.95))}
+.card-sa::before{background:linear-gradient(135deg,rgba(167,139,250,0.5),rgba(100,60,200,0.2))}
+.card-admin{background:linear-gradient(145deg,rgba(0,20,40,0.9),rgba(0,12,28,0.95))}
+.card-admin::before{background:linear-gradient(135deg,rgba(0,173,238,0.5),rgba(0,100,200,0.2))}
+.card-user{background:linear-gradient(145deg,rgba(0,30,20,0.9),rgba(0,15,12,0.95))}
+.card-user::before{background:linear-gradient(135deg,rgba(52,211,153,0.5),rgba(20,150,100,0.2))}
+.card:hover{transform:translateY(-8px) scale(1.02)}
+.card-sa:hover{box-shadow:0 24px 60px rgba(167,139,250,0.2)}
+.card-admin:hover{box-shadow:0 24px 60px rgba(0,173,238,0.2)}
+.card-user:hover{box-shadow:0 24px 60px rgba(52,211,153,0.2)}
+.card-glow{position:absolute;top:-40px;left:50%;transform:translateX(-50%);width:120px;height:120px;border-radius:50%;opacity:0.15;filter:blur(30px);transition:opacity 0.3s}
+.card:hover .card-glow{opacity:0.35}
+.card-sa .card-glow{background:var(--p)}
+.card-admin .card-glow{background:var(--c)}
+.card-user .card-glow{background:var(--g)}
+.icon-ring{width:64px;height:64px;border-radius:18px;display:flex;align-items:center;justify-content:center;font-size:1.6rem;margin-bottom:16px;position:relative;z-index:1}
+.card-sa .icon-ring{background:rgba(167,139,250,0.12);box-shadow:0 0 0 1px rgba(167,139,250,0.25)}
+.card-admin .icon-ring{background:rgba(0,173,238,0.1);box-shadow:0 0 0 1px rgba(0,173,238,0.25)}
+.card-user .icon-ring{background:rgba(52,211,153,0.1);box-shadow:0 0 0 1px rgba(52,211,153,0.25)}
+.card-title{font-weight:700;font-size:1rem;margin-bottom:8px;position:relative;z-index:1}
+.card-desc{font-size:0.72rem;color:var(--m);line-height:1.6;font-weight:300;margin-bottom:18px;position:relative;z-index:1}
+.card-btn{padding:8px 20px;border-radius:10px;font-size:0.75rem;font-weight:700;letter-spacing:0.3px;position:relative;z-index:1;border:none;cursor:pointer;font-family:'Outfit',sans-serif}
+.card-sa .card-btn{background:linear-gradient(135deg,#7c3aed,#a78bfa);color:white}
+.card-admin .card-btn{background:linear-gradient(135deg,#0066ff,#00adee);color:white}
+.card-user .card-btn{background:linear-gradient(135deg,#059669,#34d399);color:white}
+/* pills */
+.pills{display:flex;gap:8px;flex-wrap:wrap;justify-content:center;margin-top:40px}
+.pill{display:flex;align-items:center;gap:6px;padding:5px 14px;border-radius:20px;font-size:0.68rem;color:var(--m);border:1px solid rgba(255,255,255,0.06);background:rgba(255,255,255,0.03);font-weight:400}
+.pill-dot{width:5px;height:5px;border-radius:50%;background:var(--c);flex-shrink:0}
+.footer{margin-top:36px;font-size:0.64rem;color:rgba(136,153,187,0.5);display:flex;align-items:center;gap:6px}
+.footer a{color:rgba(0,173,238,0.5);text-decoration:none}
+/* animations */
+.hero{animation:fu 0.8s ease both}
+.cards{animation:fu 0.8s 0.12s ease both}
+.pills{animation:fu 0.8s 0.24s ease both}
+@keyframes fu{from{opacity:0;transform:translateY(24px)}to{opacity:1;transform:translateY(0)}}
+@media(max-width:640px){.cards{gap:12px}.card{width:100%;max-width:320px}.hero h1{font-size:2.2rem;letter-spacing:-1.5px}}
 </style>
 </head>
 <body>
-  <div class="bg-mesh"></div>
-  <div class="bg-grid"></div>
-  <div class="top-bar">
-    <a class="top-brand" href="/portal"><div class="brand-icon">👁</div>FaceAttend</a>
-    <span class="top-version">SaaS v4.0</span>
+<canvas id="bg"></canvas>
+<div class="topbar">
+  <a class="logo" href="/portal">
+    <div class="logo-eye">👁</div>
+    <div class="logo-name">Face<span>Attend</span></div>
+  </a>
+  <span class="ver">v4.0 SaaS</span>
+</div>
+<div class="wrap">
+  <div class="hero">
+    <div class="hero-tag">Multi-Tenant Platform</div>
+    <h1>Face Recognition<span class="line2">Attendance System</span></h1>
+    <p>Real-time automated attendance powered by on-device AI. Select your portal below to get started.</p>
   </div>
-  <div class="portal-wrap">
-    <div class="hero">
-      <div class="hero-eyebrow">Multi-tenant Platform</div>
-      <h1 class="hero-title">Face Recognition<br><span class="hl">Attendance</span> System</h1>
-      <p class="hero-sub">Automated attendance tracking powered by real-time face recognition. Choose your portal to get started.</p>
-    </div>
-    <div class="cards-row">
-      <a href="/super-admin" class="portal-card">
-        <div class="card-icon-wrap icon-sa">🛡️</div>
-        <div class="card-title">Super Admin</div>
-        <div class="card-desc">Platform control, admin approvals &amp; system-wide oversight.</div>
-        <div class="card-cta cta-sa">Enter Portal →</div>
-      </a>
-      <a href="/admin" class="portal-card">
-        <div class="card-icon-wrap icon-admin">🏢</div>
-        <div class="card-title">Admin</div>
-        <div class="card-desc">Manage people, periods, scan attendance &amp; export reports.</div>
-        <div class="card-cta cta-admin">Enter Portal →</div>
-      </a>
-      <a href="/user" class="portal-card">
-        <div class="card-icon-wrap icon-user">👤</div>
-        <div class="card-title">Student</div>
-        <div class="card-desc">View your attendance calendar and enable push notifications.</div>
-        <div class="card-cta cta-user">Enter Portal →</div>
-      </a>
-    </div>
-    <div class="features">
-      <div class="feat"><div class="feat-dot"></div>Real-time Face Recognition</div>
-      <div class="feat"><div class="feat-dot"></div>Multi-period Attendance</div>
-      <div class="feat"><div class="feat-dot"></div>Web Push Notifications</div>
-      <div class="feat"><div class="feat-dot"></div>Export CSV/Excel</div>
-      <div class="feat"><div class="feat-dot"></div>Holiday Calendar</div>
-      <div class="feat"><div class="feat-dot"></div>Multi-tenant SaaS</div>
-    </div>
-    <div class="portal-footer">
-      <span>Powered by</span><a href="#">face-api.js</a><span>·</span><a href="#">Node.js</a><span>·</span><a href="#">MySQL</a>
-    </div>
+  <div class="cards">
+    <a href="/super-admin" class="card card-sa">
+      <div class="card-glow"></div>
+      <div class="icon-ring">🛡️</div>
+      <div class="card-title">Super Admin</div>
+      <div class="card-desc">Platform control, organisation approvals &amp; system-wide oversight.</div>
+      <div class="card-btn">Enter Portal →</div>
+    </a>
+    <a href="/admin" class="card card-admin">
+      <div class="card-glow"></div>
+      <div class="icon-ring">🏢</div>
+      <div class="card-title">Admin</div>
+      <div class="card-desc">Register people, manage periods, scan attendance &amp; export reports.</div>
+      <div class="card-btn">Enter Portal →</div>
+    </a>
+    <a href="/user" class="card card-user">
+      <div class="card-glow"></div>
+      <div class="icon-ring">👤</div>
+      <div class="card-title">Student</div>
+      <div class="card-desc">View your attendance calendar, records &amp; enable push notifications.</div>
+      <div class="card-btn">Enter Portal →</div>
+    </a>
   </div>
+  <div class="pills">
+    <div class="pill"><div class="pill-dot"></div>Real-time Face Recognition</div>
+    <div class="pill"><div class="pill-dot"></div>Multi-period Attendance</div>
+    <div class="pill"><div class="pill-dot"></div>Web Push Notifications</div>
+    <div class="pill"><div class="pill-dot"></div>CSV Export</div>
+    <div class="pill"><div class="pill-dot"></div>Holiday Calendar</div>
+    <div class="pill"><div class="pill-dot"></div>Auto Absent Marking</div>
+  </div>
+  <div class="footer"><span>Powered by</span><a href="#">face-api.js</a><span>·</span><a href="#">Node.js</a><span>·</span><a href="#">MySQL</a></div>
+</div>
+<script>
+const c=document.getElementById('bg'),ctx=c.getContext('2d');
+let W,H,pts=[];
+function resize(){W=c.width=window.innerWidth;H=c.height=window.innerHeight;pts=Array.from({length:60},()=>({x:Math.random()*W,y:Math.random()*H,vx:(Math.random()-0.5)*0.3,vy:(Math.random()-0.5)*0.3,r:Math.random()*1.5+0.5}));}
+resize();window.addEventListener('resize',resize);
+function draw(){
+  ctx.clearRect(0,0,W,H);
+  for(let i=0;i<pts.length;i++){
+    const p=pts[i];p.x+=p.vx;p.y+=p.vy;
+    if(p.x<0||p.x>W)p.vx*=-1;if(p.y<0||p.y>H)p.vy*=-1;
+    ctx.beginPath();ctx.arc(p.x,p.y,p.r,0,Math.PI*2);ctx.fillStyle='rgba(0,173,238,0.8)';ctx.fill();
+    for(let j=i+1;j<pts.length;j++){
+      const q=pts[j],dx=p.x-q.x,dy=p.y-q.y,d=Math.sqrt(dx*dx+dy*dy);
+      if(d<120){ctx.beginPath();ctx.moveTo(p.x,p.y);ctx.lineTo(q.x,q.y);ctx.strokeStyle='rgba(0,173,238,'+(1-d/120)*0.15+')';ctx.lineWidth=0.5;ctx.stroke();}
+    }
+  }
+  requestAnimationFrame(draw);
+}
+draw();
+</script>
 </body></html>`);
 });
 
@@ -1301,24 +1336,55 @@ app.get('/super-admin', (_, res) => {
   <a class="nav-logo" href="/portal">Face<span>Attend</span></a>
   <div class="nav-right" id="navRight"></div>
 </nav>
+<style>
+.auth-screen{display:flex;align-items:center;justify-content:center;min-height:calc(100vh - 58px);padding:20px}
+.auth-box{width:100%;max-width:420px}
+.auth-header{text-align:center;margin-bottom:28px}
+.auth-icon{width:64px;height:64px;border-radius:18px;background:linear-gradient(135deg,#7c3aed,#a78bfa);display:flex;align-items:center;justify-content:center;font-size:1.8rem;margin:0 auto 14px;box-shadow:0 8px 24px rgba(124,58,237,0.35)}
+.auth-title{font-family:'JetBrains Mono',monospace;font-size:1.1rem;font-weight:700;color:var(--text);margin-bottom:4px}
+.auth-sub{font-size:0.75rem;color:var(--muted)}
+.auth-card{background:var(--card);border:1px solid var(--border);border-radius:20px;padding:28px;box-shadow:0 4px 24px rgba(0,0,0,0.06)}
+.auth-card .form-group{margin-bottom:16px}
+.auth-card .form-group label{font-size:0.7rem;font-weight:600;color:var(--muted);text-transform:uppercase;letter-spacing:0.8px;display:block;margin-bottom:6px}
+.auth-card .form-control{width:100%;background:var(--surface);border:1.5px solid var(--border);border-radius:10px;padding:11px 14px;color:var(--text);font-family:'Space Grotesk',sans-serif;font-size:0.86rem;outline:none;transition:border-color 0.2s,box-shadow 0.2s}
+.auth-card .form-control:focus{border-color:#a78bfa;box-shadow:0 0 0 3px rgba(167,139,250,0.12)}
+.auth-submit{width:100%;padding:12px;border-radius:10px;border:none;background:linear-gradient(135deg,#7c3aed,#9b5cf6);color:white;font-family:'Space Grotesk',sans-serif;font-size:0.88rem;font-weight:700;cursor:pointer;transition:all 0.2s;margin-top:4px}
+.auth-submit:hover{transform:translateY(-1px);box-shadow:0 6px 20px rgba(124,58,237,0.35)}
+.auth-back{text-align:center;margin-top:16px;font-size:0.73rem;color:var(--muted)}
+.auth-back a{color:#a78bfa;text-decoration:none;font-weight:600}
+</style>
 <main id="app">
-  <div id="setupForm" style="display:none;max-width:440px;margin:40px auto">
-    <div class="page-title">🛡️ First-time Setup — Create Super Admin</div>
-    <div class="card">
-      <div id="setupErr" class="alert alert-error" style="display:none"></div>
-      <div class="form-group"><label>Full Name</label><input class="form-control" id="saName" placeholder="Super Admin Name"></div>
-      <div class="form-group"><label>Email</label><input class="form-control" id="saEmail" type="email" placeholder="admin@example.com"></div>
-      <div class="form-group"><label>Password</label><input class="form-control" id="saPass" type="password" placeholder="••••••••"></div>
-      <button class="btn btn-primary" style="width:100%" onclick="doSetup()">Create Super Admin Account</button>
+  <div id="setupForm" style="display:none" class="auth-screen">
+    <div class="auth-box">
+      <div class="auth-header">
+        <div class="auth-icon">🛡️</div>
+        <div class="auth-title">First-time Setup</div>
+        <div class="auth-sub">Create the Super Admin account to get started</div>
+      </div>
+      <div class="auth-card">
+        <div id="setupErr" class="alert alert-error" style="display:none"></div>
+        <div class="form-group"><label>Full Name</label><input class="form-control" id="saName" placeholder="Super Admin Name"></div>
+        <div class="form-group"><label>Email</label><input class="form-control" id="saEmail" type="email" placeholder="admin@example.com"></div>
+        <div class="form-group"><label>Password</label><input class="form-control" id="saPass" type="password" placeholder="••••••••"></div>
+        <button class="auth-submit" onclick="doSetup()">Create Super Admin Account</button>
+      </div>
+      <div class="auth-back"><a href="/portal">← Back to Portal</a></div>
     </div>
   </div>
-  <div id="loginForm" style="display:none;max-width:400px;margin:40px auto">
-    <div class="page-title">🛡️ Super Admin Login</div>
-    <div class="card">
-      <div id="loginErr" class="alert alert-error" style="display:none"></div>
-      <div class="form-group"><label>Email</label><input class="form-control" id="saLoginEmail" type="email"></div>
-      <div class="form-group"><label>Password</label><input class="form-control" id="saLoginPass" type="password"></div>
-      <button class="btn btn-primary" style="width:100%" onclick="doLogin()">Login</button>
+  <div id="loginForm" style="display:none" class="auth-screen">
+    <div class="auth-box">
+      <div class="auth-header">
+        <div class="auth-icon">🛡️</div>
+        <div class="auth-title">Super Admin</div>
+        <div class="auth-sub">Platform control &amp; organisation management</div>
+      </div>
+      <div class="auth-card">
+        <div id="loginErr" class="alert alert-error" style="display:none"></div>
+        <div class="form-group"><label>Email</label><input class="form-control" id="saLoginEmail" type="email" placeholder="admin@example.com"></div>
+        <div class="form-group"><label>Password</label><input class="form-control" id="saLoginPass" type="password" placeholder="••••••••"></div>
+        <button class="auth-submit" onclick="doLogin()">Login to Dashboard</button>
+      </div>
+      <div class="auth-back"><a href="/portal">← Back to Portal</a></div>
     </div>
   </div>
   <div id="dashboard" style="display:none">
@@ -1416,47 +1482,80 @@ app.get('/admin', (_, res) => {
   <a class="nav-logo" href="/portal" id="navLogo">Face<span>Attend</span></a>
   <div class="nav-right" id="navRight"></div>
 </nav>
+<style>
+.auth-screen{display:flex;align-items:center;justify-content:center;min-height:calc(100vh - 58px);padding:20px}
+.auth-box{width:100%;max-width:460px}
+.auth-header{text-align:center;margin-bottom:24px}
+.auth-icon{width:64px;height:64px;border-radius:18px;background:linear-gradient(135deg,#009ed8,#00adee);display:flex;align-items:center;justify-content:center;font-size:1.8rem;margin:0 auto 14px;box-shadow:0 8px 24px rgba(0,173,238,0.35)}
+.auth-title{font-family:'JetBrains Mono',monospace;font-size:1.1rem;font-weight:700;color:var(--text);margin-bottom:4px}
+.auth-sub{font-size:0.75rem;color:var(--muted)}
+.auth-tabs{display:flex;background:var(--surface);border-radius:12px;padding:4px;gap:3px;margin-bottom:18px}
+.auth-tab{flex:1;padding:8px;border-radius:9px;border:none;background:transparent;font-family:'Space Grotesk',sans-serif;font-size:0.78rem;font-weight:600;color:var(--muted);cursor:pointer;transition:all 0.2s}
+.auth-tab.active{background:var(--card);color:var(--accent);box-shadow:0 1px 6px rgba(0,0,0,0.08)}
+.auth-card{background:var(--card);border:1px solid var(--border);border-radius:20px;padding:24px;box-shadow:0 4px 24px rgba(0,0,0,0.06)}
+.auth-card .form-group{margin-bottom:14px}
+.auth-card .form-group label{font-size:0.7rem;font-weight:600;color:var(--muted);text-transform:uppercase;letter-spacing:0.8px;display:block;margin-bottom:5px}
+.auth-card .form-control{width:100%;background:var(--surface);border:1.5px solid var(--border);border-radius:10px;padding:10px 13px;color:var(--text);font-family:'Space Grotesk',sans-serif;font-size:0.84rem;outline:none;transition:border-color 0.2s,box-shadow 0.2s}
+.auth-card .form-control:focus{border-color:var(--accent);box-shadow:0 0 0 3px rgba(0,173,238,0.1)}
+.auth-submit{width:100%;padding:12px;border-radius:10px;border:none;background:linear-gradient(135deg,#009ed8,#00adee);color:white;font-family:'Space Grotesk',sans-serif;font-size:0.88rem;font-weight:700;cursor:pointer;transition:all 0.2s;margin-top:4px}
+.auth-submit:hover{transform:translateY(-1px);box-shadow:0 6px 20px rgba(0,173,238,0.35)}
+.auth-back{text-align:center;margin-top:14px;font-size:0.73rem;color:var(--muted)}
+.auth-back a{color:var(--accent);text-decoration:none;font-weight:600}
+.auth-divider{border:none;border-top:1px solid var(--border);margin:16px 0}
+.reg-section-label{font-size:0.62rem;font-weight:700;color:var(--muted);text-transform:uppercase;letter-spacing:1.5px;margin:14px 0 10px;display:flex;align-items:center;gap:8px}
+.reg-section-label::after{content:'';flex:1;height:1px;background:var(--border)}
+</style>
 <main id="app">
   <!-- Auth Section -->
-  <div id="authSection" style="max-width:460px;margin:30px auto">
-    <div class="tabs">
-      <button class="tab active" onclick="switchAuthTab('login',this)">Login</button>
-      <button class="tab" onclick="switchAuthTab('register',this)">Register Org</button>
-    </div>
-    <div id="loginPanel" class="card">
-      <div id="loginErr" class="alert alert-error" style="display:none"></div>
-      <div class="form-group"><label>Email</label><input class="form-control" id="aEmail" type="email"></div>
-      <div class="form-group"><label>Password</label><input class="form-control" id="aPass" type="password"></div>
-      <button class="btn btn-primary" style="width:100%" onclick="doAdminLogin()">Login</button>
-    </div>
-    <div id="registerPanel" class="card" style="display:none">
-      <div id="regErr" class="alert alert-error" style="display:none"></div>
-      <div id="regOk" class="alert alert-success" style="display:none"></div>
-      <div class="grid2">
-        <div class="form-group"><label>Your Name</label><input class="form-control" id="rName" placeholder="John Doe"></div>
-        <div class="form-group"><label>Email</label><input class="form-control" id="rEmail" type="email"></div>
+  <div id="authSection" class="auth-screen">
+    <div class="auth-box">
+      <div class="auth-header">
+        <div class="auth-icon">🏢</div>
+        <div class="auth-title">Admin Portal</div>
+        <div class="auth-sub">Manage attendance, people &amp; reports for your organisation</div>
       </div>
-      <div class="grid2">
-        <div class="form-group"><label>Password</label><input class="form-control" id="rPass" type="password"></div>
-        <div class="form-group"><label>Organisation Name</label><input class="form-control" id="rOrg" placeholder="ABC School"></div>
+      <div class="auth-tabs">
+        <button class="auth-tab active" onclick="switchAuthTab('login',this)">Login</button>
+        <button class="auth-tab" onclick="switchAuthTab('register',this)">Register Organisation</button>
       </div>
-      <div class="grid2">
-        <div class="form-group">
-          <label>Organisation Type</label>
-          <select class="form-control" id="rType">
-            <option value="office">Office</option><option value="school">School</option>
-            <option value="hospital">Hospital</option><option value="factory">Factory</option>
-            <option value="other">Other</option>
-          </select>
+      <div id="loginPanel" class="auth-card">
+        <div id="loginErr" class="alert alert-error" style="display:none"></div>
+        <div class="form-group"><label>Email Address</label><input class="form-control" id="aEmail" type="email" placeholder="admin@school.com" autocomplete="email"></div>
+        <div class="form-group"><label>Password</label><input class="form-control" id="aPass" type="password" placeholder="••••••••" autocomplete="current-password"></div>
+        <button class="auth-submit" onclick="doAdminLogin()">Login to Dashboard</button>
+      </div>
+      <div id="registerPanel" class="auth-card" style="display:none">
+        <div id="regErr" class="alert alert-error" style="display:none"></div>
+        <div id="regOk" class="alert alert-success" style="display:none"></div>
+        <div class="reg-section-label">Account Details</div>
+        <div class="grid2">
+          <div class="form-group"><label>Your Name</label><input class="form-control" id="rName" placeholder="John Doe"></div>
+          <div class="form-group"><label>Email</label><input class="form-control" id="rEmail" type="email" placeholder="admin@school.com"></div>
         </div>
-        <div class="form-group"><label>System Title</label><input class="form-control" id="rTitle" placeholder="Daily Attendance"></div>
+        <div class="grid2">
+          <div class="form-group"><label>Password</label><input class="form-control" id="rPass" type="password" placeholder="Min 8 chars"></div>
+          <div class="form-group"><label>Organisation Name</label><input class="form-control" id="rOrg" placeholder="ABC School"></div>
+        </div>
+        <div class="reg-section-label">Organisation Info</div>
+        <div class="grid2">
+          <div class="form-group">
+            <label>Organisation Type</label>
+            <select class="form-control" id="rType">
+              <option value="office">Office</option><option value="school">School</option>
+              <option value="hospital">Hospital</option><option value="factory">Factory</option>
+              <option value="other">Other</option>
+            </select>
+          </div>
+          <div class="form-group"><label>System Title</label><input class="form-control" id="rTitle" placeholder="Daily Attendance"></div>
+        </div>
+        <div class="form-group">
+          <label>Organisation Logo</label>
+          <input type="file" accept="image/*" id="rLogo" class="form-control" onchange="previewLogo(this)">
+          <img id="logoPreview" class="logo-preview" style="display:none;margin-top:8px">
+        </div>
+        <button class="auth-submit" onclick="doRegister()">Submit for Approval</button>
       </div>
-      <div class="form-group">
-        <label>Organisation Logo</label>
-        <input type="file" accept="image/*" id="rLogo" class="form-control" onchange="previewLogo(this)">
-        <img id="logoPreview" class="logo-preview" style="display:none;margin-top:8px">
-      </div>
-      <button class="btn btn-primary" style="width:100%" onclick="doRegister()">Submit for Approval</button>
+      <div class="auth-back"><a href="/portal">← Back to Portal</a></div>
     </div>
   </div>
 
@@ -1487,10 +1586,6 @@ app.get('/admin', (_, res) => {
                 <div class="live-dot" id="statusDot" style="background:var(--muted)"></div>
                 <span id="statusText" style="white-space:nowrap;overflow:hidden;text-overflow:ellipsis">Starting camera...</span>
               </div>
-              <select class="form-control" id="scanMode" style="width:auto;padding:6px 10px;font-size:0.75rem">
-                <option value="checkin">Check In</option>
-                <option value="checkout">Check Out</option>
-              </select>
               <button class="btn btn-checkin" id="scanBtn" onclick="doScan()" disabled>Scan</button>
               <button class="btn btn-outline btn-sm" id="autoBtn" onclick="toggleAuto()">Auto</button>
             </div>
@@ -1729,7 +1824,7 @@ let calData={attendance:[],holidays:[]},selectedCalDate=null;
 let pendingScanResult=null; // holds face_identified result waiting for shift selection
 
 function switchAuthTab(t,btn){
-  document.querySelectorAll('.tabs .tab').forEach(b=>b.classList.remove('active'));
+  document.querySelectorAll('.auth-tabs .auth-tab').forEach(b=>b.classList.remove('active'));
   btn.classList.add('active');
   document.getElementById('loginPanel').style.display=t==='login'?'block':'none';
   document.getElementById('registerPanel').style.display=t==='register'?'block':'none';
@@ -1771,8 +1866,7 @@ function adminLogout(){localStorage.removeItem(TOKEN_KEY);location.reload();}
 
 async function showDashboard(r){
   document.getElementById('authSection').style.display='none';
-  document.getElementById('dashboard').style.display='block';
-  const me=r||await fetch('/api/admin/me',{headers:{'x-token':adminToken}}).then(x=>x.json()).catch(()=>null);
+  document.getElementById('dashboard').style.display='block';('/api/admin/me',{headers:{'x-token':adminToken}}).then(x=>x.json()).catch(()=>null);
   if(!me||me.error){localStorage.removeItem(TOKEN_KEY);location.reload();return;}
   let logoHtml='';
   if(me.logo_base64) logoHtml=\`<img src="\${me.logo_base64}" class="logo-preview" style="height:30px;margin-right:6px">\`;
@@ -2062,6 +2156,42 @@ async function previewReport(){
 }
 
 // ── SCAN (multi-period) ────────────────────────────────────────────────────────
+// ── Canvas overlay: green=known, yellow=uncertain, red=unknown ────────────────
+function drawOverlay(det, type, color){
+  const canvas=document.getElementById('overlay');
+  const video=document.getElementById('video');
+  if(!canvas||!video) return;
+  const ctx=canvas.getContext('2d');
+  canvas.width=video.videoWidth||video.clientWidth;
+  canvas.height=video.videoHeight||video.clientHeight;
+  ctx.clearRect(0,0,canvas.width,canvas.height);
+  if(!det||type==='unknown'){
+    // flash red border briefly
+    ctx.strokeStyle='rgba(248,113,113,0.7)';
+    ctx.lineWidth=4;
+    ctx.strokeRect(4,4,canvas.width-8,canvas.height-8);
+    setTimeout(()=>ctx.clearRect(0,0,canvas.width,canvas.height),1200);
+    return;
+  }
+  const box=det.detection.box;
+  const colors={green:'rgba(52,211,153,0.9)',yellow:'rgba(251,191,36,0.9)',red:'rgba(248,113,113,0.9)'};
+  const bgColors={green:'rgba(52,211,153,0.08)',yellow:'rgba(251,191,36,0.08)',red:'rgba(248,113,113,0.08)'};
+  const c=colors[color]||colors['green'];
+  const bg=bgColors[color]||bgColors['green'];
+  // Background fill
+  ctx.fillStyle=bg;
+  ctx.fillRect(box.x,box.y,box.width,box.height);
+  // Corner brackets instead of full box
+  const bw=3,cs=Math.min(box.width,box.height)*0.22;
+  ctx.strokeStyle=c;ctx.lineWidth=bw;ctx.lineCap='square';
+  const drawCorner=(x,y,dx,dy)=>{ctx.beginPath();ctx.moveTo(x+dx*cs,y);ctx.lineTo(x,y);ctx.lineTo(x,y+dy*cs);ctx.stroke();};
+  drawCorner(box.x,box.y,1,1);
+  drawCorner(box.x+box.width,box.y,-1,1);
+  drawCorner(box.x,box.y+box.height,1,-1);
+  drawCorner(box.x+box.width,box.y+box.height,-1,-1);
+  setTimeout(()=>ctx.clearRect(0,0,canvas.width,canvas.height),2000);
+}
+
 let modelsLoaded=false;
 async function ensureModels(){
   if(modelsLoaded) return;
@@ -2108,10 +2238,16 @@ async function doScan(){
     return;
   }
   const det=await faceapi.detectSingleFace(v).withFaceLandmarks().withFaceDescriptor();
-  if(!det){showResult({event:'no_face',message:'No face detected'},'⚠️');return;}
-  const mode=document.getElementById('scanMode').value;
+  if(!det){
+    drawOverlay(null,'unknown');
+    showResult({event:'no_face',message:'No face detected'},'⚠️');return;
+  }
   const r=await fetch('/api/admin/scan',{method:'POST',headers:{'Content-Type':'application/json','x-token':adminToken},
-    body:JSON.stringify({descriptor:Array.from(det.descriptor),mode})}).then(x=>x.json());
+    body:JSON.stringify({descriptor:Array.from(det.descriptor),mode:'checkin'})}).then(x=>x.json());
+
+  // Draw colored overlay based on result
+  const overlayColor = r.event==='face_identified'?'green': r.event==='unknown'?'red':'yellow';
+  drawOverlay(det,'box',overlayColor);
 
   if(r.event==='face_identified'){
     const autoIds=r.auto_select_shift_ids||[];
@@ -2334,6 +2470,9 @@ function changeMonth(d){calMonth+=d;if(calMonth>12){calMonth=1;calYear++;}if(cal
 
 async function renderCalendar(){
   calData=await fetch('/api/admin/calendar?month='+calMonth+'&year='+calYear,{headers:{'x-token':adminToken}}).then(x=>x.json());
+  const normDate=d=>{if(!d)return'';const s=d+'';if(/^\d{4}-\d{2}-\d{2}/.test(s))return s.slice(0,10);const dt=new Date(d);return dt.getFullYear()+'-'+String(dt.getMonth()+1).padStart(2,'0')+'-'+String(dt.getDate()).padStart(2,'0');};
+  calData.attendance=(calData.attendance||[]).map(a=>({...a,_date:normDate(a.date)}));
+  calData.holidays=(calData.holidays||[]).map(h=>({...h,_date:normDate(h.date)}));
   document.getElementById('calTitle').textContent=MONTH_NAMES[calMonth-1]+' '+calYear;
   document.getElementById('calHead').innerHTML=['Sun','Mon','Tue','Wed','Thu','Fri','Sat'].map(d=>\`<div class="cal-head">\${d}</div>\`).join('');
   const first=new Date(calYear,calMonth-1,1).getDay(),days=new Date(calYear,calMonth,0).getDate(),today=new Date();
@@ -2341,22 +2480,21 @@ async function renderCalendar(){
   for(let i=0;i<first;i++) cells+=\`<div class="cal-day other-month"></div>\`;
   for(let d=1;d<=days;d++){
     const dateStr=calYear+'-'+String(calMonth).padStart(2,'0')+'-'+String(d).padStart(2,'0');
-    const att=calData.attendance.find(a=>a.date===dateStr||a.date?.startsWith(dateStr));
-    const hol=calData.holidays.find(h=>h.date===dateStr||h.date?.startsWith(dateStr));
+    const att=calData.attendance.find(a=>a._date===dateStr);
+    const hol=calData.holidays.find(h=>h._date===dateStr);
     const isToday=today.getDate()===d&&today.getMonth()===calMonth-1&&today.getFullYear()===calYear;
     cells+=\`<div class="cal-day\${isToday?' today':''}\${hol?' holiday':''}" onclick="openCalDay('\${dateStr}',\${!!hol})">
       <div class="cal-day-num">\${d}</div>
-      \${att?(\`<span class="cal-event cal-present">✅ \${att.present}</span>\`+(att.absent>0?\`<span class="cal-event cal-absent">❌ \${att.absent}</span>\`:'')):''} 
+      \${att?(\`<span class="cal-event cal-present">✅ \${att.present}</span>\`+(att.absent>0?\`<span class="cal-event cal-absent">❌ \${att.absent}</span>\`:'')):''}\
       \${hol?\`<span class="cal-event cal-holiday-tag">\${hol.label}</span>\`:''}
     </div>\`;
   }
   document.getElementById('calGrid').innerHTML=cells;
 }
-
 function openCalDay(date,isHoliday){
   selectedCalDate=date;
-  const hol=calData.holidays.find(h=>h.date===date||h.date?.startsWith(date));
-  const att=calData.attendance.find(a=>a.date===date||a.date?.startsWith(date));
+  const hol=calData.holidays.find(h=>h._date===date);
+  const att=calData.attendance.find(a=>a._date===date);
   document.getElementById('calModalDate').textContent=date;
   const btn=document.getElementById('holidayAddBtn');
   btn.textContent=isHoliday?'Remove Holiday':'Make Holiday';
@@ -2370,7 +2508,7 @@ function openCalDay(date,isHoliday){
 function closeCalModal(){document.getElementById('calModal').classList.remove('open');}
 
 async function toggleHoliday(){
-  const hol=calData.holidays.find(h=>h.date===selectedCalDate||h.date?.startsWith(selectedCalDate));
+  const hol=calData.holidays.find(h=>h._date===selectedCalDate);
   if(hol){
     await fetch('/api/admin/holidays/'+selectedCalDate,{method:'DELETE',headers:{'x-token':adminToken}});
   } else {
@@ -2437,11 +2575,12 @@ async function renderRecCalendar(){
   if(!recFaceId) return;
   recData=await fetch('/api/admin/person-attendance?face_id='+recFaceId+'&month='+recMonth+'&year='+recYear,
     {headers:{'x-token':adminToken}}).then(x=>x.json());
-
+  const normDate=d=>{if(!d)return'';const s=d+'';if(/^\d{4}-\d{2}-\d{2}/.test(s))return s.slice(0,10);const dt=new Date(d);return dt.getFullYear()+'-'+String(dt.getMonth()+1).padStart(2,'0')+'-'+String(dt.getDate()).padStart(2,'0');};
+  recData.attendance=(recData.attendance||[]).map(a=>({...a,_date:normDate(a.date)}));
+  recData.holidays=(recData.holidays||[]).map(h=>({...h,_date:normDate(h.date)}));
   document.getElementById('recCalTitle').textContent=recFaceName+' \u2014 '+MONTH_NAMES[recMonth-1]+' '+recYear;
-
-  const presentDays=new Set(recData.attendance.filter(a=>a.status==='present').map(a=>(a.date+'').slice(0,10))).size;
-  const absentDays=new Set(recData.attendance.filter(a=>a.status==='absent').map(a=>(a.date+'').slice(0,10))).size;
+  const presentDays=new Set(recData.attendance.filter(a=>a.status==='present').map(a=>a._date)).size;
+  const absentDays=new Set(recData.attendance.filter(a=>a.status==='absent').map(a=>a._date)).size;
   const holCount=recData.holidays.length;
   const rate=presentDays+absentDays>0?Math.round(presentDays/(presentDays+absentDays)*100):0;
   document.getElementById('recStats').innerHTML=\`
@@ -2450,32 +2589,26 @@ async function renderRecCalendar(){
     <div class="stat card-sm"><div class="stat-val yellow">\${holCount}</div><div class="stat-label">Holidays</div></div>
     <div class="stat card-sm"><div class="stat-val \${rate>=80?'green':rate>=60?'yellow':'red'}">\${rate}%</div><div class="stat-label">Rate</div></div>
   \`;
-
   document.getElementById('recCalHead').innerHTML=['Sun','Mon','Tue','Wed','Thu','Fri','Sat'].map(d=>\`<div class="cal-head">\${d}</div>\`).join('');
-
   const first=new Date(recYear,recMonth-1,1).getDay();
   const days=new Date(recYear,recMonth,0).getDate();
   const today=new Date();
   let cells='';
   for(let i=0;i<first;i++) cells+=\`<div class="cal-day other-month"></div>\`;
-
   for(let d=1;d<=days;d++){
     const dateStr=recYear+'-'+String(recMonth).padStart(2,'0')+'-'+String(d).padStart(2,'0');
-    const dayAtts=recData.attendance.filter(a=>(a.date+'').startsWith(dateStr));
-    const hol=recData.holidays.find(h=>(h.date+'').startsWith(dateStr));
+    const dayAtts=recData.attendance.filter(a=>a._date===dateStr);
+    const hol=recData.holidays.find(h=>h._date===dateStr);
     const isToday=today.getDate()===d&&today.getMonth()===recMonth-1&&today.getFullYear()===recYear;
     const presentAtts=dayAtts.filter(a=>a.status==='present');
     const isAbsent=dayAtts.some(a=>a.status==='absent');
-
     let dayStyle='';
     if(presentAtts.length) dayStyle='border-color:var(--green);background:rgba(52,211,153,0.08)';
     else if(isAbsent) dayStyle='border-color:var(--red);background:rgba(248,113,113,0.08)';
     else if(hol) dayStyle='border-color:var(--yellow);background:rgba(251,191,36,0.08)';
-
     const shiftTags=presentAtts.map(a=>
       \`<span class="cal-event cal-present" style="font-size:0.52rem">\${a.shift_name||'✅'}</span>\`
     ).join('');
-
     cells+=\`<div class="cal-day\${isToday?' today':''}" style="\${dayStyle}">
       <div class="cal-day-num" style="\${presentAtts.length?'color:var(--green)':isAbsent?'color:var(--red)':hol?'color:#92400e':''}">\${d}</div>
       \${shiftTags}
@@ -2497,18 +2630,39 @@ app.get('/user', (_, res) => {
   <a class="nav-logo" href="/portal" id="navLogo">Face<span>Attend</span></a>
   <div class="nav-right" id="navRight"></div>
 </nav>
+<style>
+.auth-screen{display:flex;align-items:center;justify-content:center;min-height:calc(100vh - 58px);padding:20px}
+.auth-box{width:100%;max-width:400px}
+.auth-header{text-align:center;margin-bottom:28px}
+.auth-icon{width:64px;height:64px;border-radius:18px;background:linear-gradient(135deg,#059669,#34d399);display:flex;align-items:center;justify-content:center;font-size:1.8rem;margin:0 auto 14px;box-shadow:0 8px 24px rgba(52,211,153,0.35)}
+.auth-title{font-family:'JetBrains Mono',monospace;font-size:1.1rem;font-weight:700;color:var(--text);margin-bottom:4px}
+.auth-sub{font-size:0.75rem;color:var(--muted)}
+.auth-card{background:var(--card);border:1px solid var(--border);border-radius:20px;padding:28px;box-shadow:0 4px 24px rgba(0,0,0,0.06)}
+.auth-card .form-group{margin-bottom:16px}
+.auth-card .form-group label{font-size:0.7rem;font-weight:600;color:var(--muted);text-transform:uppercase;letter-spacing:0.8px;display:block;margin-bottom:6px}
+.auth-card .form-control{width:100%;background:var(--surface);border:1.5px solid var(--border);border-radius:10px;padding:11px 14px;color:var(--text);font-family:'Space Grotesk',sans-serif;font-size:0.86rem;outline:none;transition:border-color 0.2s,box-shadow 0.2s}
+.auth-card .form-control:focus{border-color:#34d399;box-shadow:0 0 0 3px rgba(52,211,153,0.12)}
+.auth-submit{width:100%;padding:12px;border-radius:10px;border:none;background:linear-gradient(135deg,#059669,#34d399);color:white;font-family:'Space Grotesk',sans-serif;font-size:0.88rem;font-weight:700;cursor:pointer;transition:all 0.2s;margin-top:4px}
+.auth-submit:hover{transform:translateY(-1px);box-shadow:0 6px 20px rgba(52,211,153,0.35)}
+.auth-back{text-align:center;margin-top:16px;font-size:0.73rem;color:var(--muted)}
+.auth-back a{color:#34d399;text-decoration:none;font-weight:600}
+</style>
 <main id="app">
   <!-- Login -->
-  <div id="loginSection" style="max-width:400px;margin:50px auto">
-    <div class="page-title">👤 Student Login</div>
-    <div class="card">
-      <div id="loginErr" class="alert alert-error" style="display:none"></div>
-      <div class="form-group"><label>Email</label><input class="form-control" id="uEmail" type="email" autocomplete="email"></div>
-      <div class="form-group"><label>Password</label><input class="form-control" id="uPass" type="password" autocomplete="current-password"></div>
-      <button class="btn btn-primary" style="width:100%" onclick="doUserLogin()">Login</button>
-      <div style="text-align:center;margin-top:12px;font-size:0.75rem;color:var(--muted)">
-        <a href="/portal" style="color:var(--accent);text-decoration:none">← Back to Portal</a>
+  <div id="loginSection" class="auth-screen">
+    <div class="auth-box">
+      <div class="auth-header">
+        <div class="auth-icon">👤</div>
+        <div class="auth-title">Student Portal</div>
+        <div class="auth-sub">View your attendance calendar &amp; records</div>
       </div>
+      <div class="auth-card">
+        <div id="loginErr" class="alert alert-error" style="display:none"></div>
+        <div class="form-group"><label>Email Address</label><input class="form-control" id="uEmail" type="email" placeholder="student@school.com" autocomplete="email"></div>
+        <div class="form-group"><label>Password</label><input class="form-control" id="uPass" type="password" placeholder="••••••••" autocomplete="current-password"></div>
+        <button class="auth-submit" onclick="doUserLogin()">Login to My Portal</button>
+      </div>
+      <div class="auth-back"><a href="/portal">← Back to Portal</a></div>
     </div>
   </div>
 
@@ -2570,6 +2724,7 @@ function userLogout(){localStorage.removeItem(TOKEN_KEY);location.reload();}
 async function showUserDash(r){
   document.getElementById('loginSection').style.display='none';
   document.getElementById('userDash').style.display='block';
+  document.getElementById('userDash').style.paddingTop='20px';
   let logoHtml='';
   if(r.logo_base64) logoHtml=\`<img src="\${r.logo_base64}" style="height:30px;border-radius:6px;margin-right:6px">\`;
   document.getElementById('navLogo').innerHTML=logoHtml+'Face<span style="color:var(--accent)">Attend</span>';
@@ -2682,15 +2837,20 @@ function changeMonth(d){calMonth+=d;if(calMonth>12){calMonth=1;calYear++;}if(cal
 
 async function renderCalendar(){
   calData=await fetch('/api/user/attendance?month='+calMonth+'&year='+calYear,{headers:{'x-token':userToken}}).then(x=>x.json());
+  // Normalize all dates to YYYY-MM-DD strings to handle MySQL Date objects
+  const normDate=d=>{if(!d)return'';const s=d+'';if(/^\d{4}-\d{2}-\d{2}/.test(s))return s.slice(0,10);const dt=new Date(d);return dt.getFullYear()+'-'+String(dt.getMonth()+1).padStart(2,'0')+'-'+String(dt.getDate()).padStart(2,'0');};
+  calData.attendance=calData.attendance.map(a=>({...a,_date:normDate(a.date)}));
+  calData.holidays=(calData.holidays||[]).map(h=>({...h,_date:normDate(h.date)}));
+
   document.getElementById('calTitle').textContent=MONTH_NAMES[calMonth-1]+' '+calYear;
-  const present=calData.attendance.filter(a=>a.status==='present').length;
-  const absent=calData.attendance.filter(a=>a.status==='absent').length;
-  const total=calData.attendance.length;
-  const pct=total>0?Math.round(present/total*100):0;
+  const presentDays=new Set(calData.attendance.filter(a=>a.status==='present').map(a=>a._date)).size;
+  const absentDays=new Set(calData.attendance.filter(a=>a.status==='absent').map(a=>a._date)).size;
+  const holCount=calData.holidays.length;
+  const pct=presentDays+absentDays>0?Math.round(presentDays/(presentDays+absentDays)*100):0;
   document.getElementById('statsRow').innerHTML=\`
-    <div class="stat"><div class="stat-val green">\${present}</div><div class="stat-label">Present</div></div>
-    <div class="stat"><div class="stat-val red">\${absent}</div><div class="stat-label">Absent</div></div>
-    <div class="stat"><div class="stat-val">\${total}</div><div class="stat-label">Marked</div></div>
+    <div class="stat"><div class="stat-val green">\${presentDays}</div><div class="stat-label">Present Days</div></div>
+    <div class="stat"><div class="stat-val red">\${absentDays}</div><div class="stat-label">Absent Days</div></div>
+    <div class="stat"><div class="stat-val yellow">\${holCount}</div><div class="stat-label">Holidays</div></div>
     <div class="stat"><div class="stat-val \${pct>=80?'green':pct>=60?'yellow':'red'}">\${pct}%</div><div class="stat-label">Rate</div></div>
   \`;
   document.getElementById('calHead').innerHTML=['Sun','Mon','Tue','Wed','Thu','Fri','Sat'].map(d=>\`<div class="cal-head">\${d}</div>\`).join('');
@@ -2699,13 +2859,19 @@ async function renderCalendar(){
   for(let i=0;i<first;i++) cells+=\`<div class="cal-day other-month"></div>\`;
   for(let d=1;d<=days;d++){
     const dateStr=calYear+'-'+String(calMonth).padStart(2,'0')+'-'+String(d).padStart(2,'0');
-    const dayAtts=calData.attendance.filter(a=>(a.date+'').startsWith(dateStr));
-    const hol=calData.holidays.find(h=>(h.date+'').startsWith(dateStr));
+    const dayAtts=calData.attendance.filter(a=>a._date===dateStr);
+    const hol=calData.holidays.find(h=>h._date===dateStr);
     const isToday=today.getDate()===d&&today.getMonth()===calMonth-1&&today.getFullYear()===calYear;
     const presentAtts=dayAtts.filter(a=>a.status==='present');
-    cells+=\`<div class="cal-day\${isToday?' today':''}\${hol?' holiday':''}">
-      <div class="cal-day-num">\${d}</div>
+    const isAbsent=dayAtts.some(a=>a.status==='absent');
+    let dayStyle='';
+    if(presentAtts.length) dayStyle='border-color:var(--green);background:rgba(52,211,153,0.06)';
+    else if(isAbsent) dayStyle='border-color:var(--red);background:rgba(248,113,113,0.06)';
+    else if(hol) dayStyle='border-color:var(--yellow);background:rgba(251,191,36,0.06)';
+    cells+=\`<div class="cal-day\${isToday?' today':''}\${hol?' holiday':''}" style="\${dayStyle}">
+      <div class="cal-day-num" style="\${presentAtts.length?'color:var(--green)':isAbsent?'color:var(--red)':hol?'color:#92400e':''}">\${d}</div>
       \${presentAtts.length?\`<span class="cal-event cal-present">✅\${presentAtts.length>1?' ×'+presentAtts.length:presentAtts[0].shift_name?' '+presentAtts[0].shift_name:''}</span>\`:''}
+      \${isAbsent&&!presentAtts.length?'<span class="cal-event cal-absent">Absent</span>':''}
       \${hol?\`<span class="cal-event cal-holiday-tag">\${hol.label}</span>\`:''}
     </div>\`;
   }
@@ -2719,7 +2885,7 @@ async function renderCalendar(){
         \${a.shift_name?\`<span class="chip chip-blue" style="margin-left:4px">\${a.shift_name}</span>\`:''}
       </div>
       <div style="text-align:right;font-size:0.72rem;color:var(--muted)">
-        <div>\${(a.date+'').slice(0,10)}</div>
+        <div>\${a._date}</div>
         \${a.time_in?\`<div>\${a.time_in}\${a.time_out?' → '+a.time_out:''}</div>\`:''}
       </div>
     </div>\`).join(''):'<p style="color:var(--muted);font-size:0.8rem">No attendance records for this month</p>';
